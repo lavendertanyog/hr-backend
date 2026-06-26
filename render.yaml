@@ -3,7 +3,7 @@ services:
     name: hr-backend
     runtime: node
     plan: free
-    rootDir: hr-backend
+    rootDir: .
     buildCommand: npm install
     startCommand: npm start
     envVars:
