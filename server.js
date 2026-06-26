@@ -1264,6 +1264,9 @@ ensureOperationalTables()
     });
   })
   .catch((error) => {
-    console.error('Failed to initialize required database tables:', error.message);
+    console.error('Failed to initialize required database tables:', error?.message || error);
+    if (error?.stack) {
+      console.error(error.stack);
+    }
     process.exit(1);
   });
