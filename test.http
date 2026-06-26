@@ -1,0 +1,32 @@
+POST http://localhost:3000/api/v1/leave/apply
+Content-Type: application/json
+
+{
+  "userId": "a1f19022-7741-441b-bf31-001a923e97ba",
+  "category": "SICK",
+  "startDate": "2026-06-14T08:00:00Z", 
+  "endDate": "2026-06-16T17:00:00Z",
+  "mcFileUrl": "https://storage.company.com/mcs/abc123_medical.pdf"
+}
+
+### Manager Review Leave Request
+PATCH http://localhost:3000/api/v1/leave/review
+Content-Type: application/json
+
+{
+  "leaveId": "3f148ad5-2417-46a0-b4d1-6d1dd1fe66e6",
+  "reviewerId": "b4bcc759-5be2-45c9-9d69-fa822cac71d7",
+  "action": "APPROVED",
+  "reviewerRemarks": "Medical certificate verified. Approved for rest."
+}
+
+### Log Project Progress Milestone
+POST http://localhost:3000/api/v1/projects/progress-log
+Content-Type: application/json
+
+{
+  "projectCode": "PRJ-2026",
+  "reporterId": "a1f19022-7741-441b-bf31-001a923e97ba",
+  "completionPercentage": 45.50,
+  "progressSummary": "Database persistence tables initialized and backend routing layers verified via integration tests."
+}
