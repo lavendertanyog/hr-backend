@@ -10,6 +10,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+app.get('/', (_req, res) => {
+  res.status(200).json({
+    success: true,
+    message: 'HR backend is running.',
+    health: '/health',
+    apiBase: '/api/v1',
+  });
+});
+
+app.get('/health', (_req, res) => {
+  res.status(200).json({ success: true, status: 'ok' });
+});
+
 function normalizeRole(role) {
   return String(role || '').trim().toLowerCase();
 }
