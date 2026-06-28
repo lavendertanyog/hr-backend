@@ -117,6 +117,9 @@ async function ensureOperationalTables() {
 
   // Projects: support multiple managers
   await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS manager_ids TEXT[] DEFAULT '{}';`);
+
+  // Projects: status column
+  await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ACTIVE';`);
 }
 
 async function tableExists(tableName) {
@@ -1134,18 +1137,6 @@ app.patch('/api/v1/leave/review', async (req, res) => {
     // Strict Rule Boundary: HR users and Staff members are blocked from approving leave logs
     if (role === 'hr' || role === 'staff') {
       return res.status(403).json({ error: `Access Denied: Users holding a ${role} profile cannot process workflow leave decisions.` });
-    }
-
-    // Verify operational scope: Ensure the target applicant maps to this direct manager's supervisor chain
-    const ownershipVerifyQuery = `
-      SELECT la.leave_id 
-      FROM leave_applications la
-      JOIN users u ON la.user_id = u.user_id
-      WHERE la.leave_id = $1 AND u.supervisor_id = $2;
-    `;
-    const ownershipCheck = await db.query(ownershipVerifyQuery, [leaveId, reviewerId]);
-    if (ownershipCheck.rows.length === 0) {
-      return res.status(403).json({ error: "Access Denied: This applicant does not belong to your direct structural reporting team hierarchy." });
     }
 
    const reviewQuery = `
