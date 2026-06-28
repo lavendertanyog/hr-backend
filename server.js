@@ -68,6 +68,11 @@ async function ensureOperationalTables() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
   `);
 
+  // Ensure email column exists for email/password auth
+  await db.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+  `);
+
   // Notifications table
   await db.query(`
     CREATE TABLE IF NOT EXISTS notifications (
@@ -262,6 +267,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
       if (!valid) return res.status(401).json({ error: 'Incorrect password.' });
     }
     const { password_hash, ...safeUser } = user;
+    safeUser.full_name = deriveNameFromEmail(normalized);
     return res.status(200).json({ success: true, data: safeUser });
   } catch (error) {
     return res.status(500).json({ error: 'Login failed.', detail: error.message });
@@ -381,7 +387,10 @@ app.post('/api/v1/auth/outlook-login', async (req, res) => {
     }
 
     if (existing) {
-      return res.status(200).json({ success: true, data: existing });
+      return res.status(200).json({
+        success: true,
+        data: { ...existing, full_name: deriveNameFromEmail(email) },
+      });
     }
 
     const fullName = (displayName && displayName.trim()) || deriveNameFromEmail(email);
@@ -411,7 +420,10 @@ app.post('/api/v1/auth/outlook-login', async (req, res) => {
       insertVals
     );
 
-    return res.status(201).json({ success: true, data: result.rows[0] });
+    return res.status(201).json({
+      success: true,
+      data: { ...result.rows[0], full_name: deriveNameFromEmail(email) },
+    });
   } catch (error) {
     return res.status(500).json({ error: 'Outlook login synchronization failed.', detail: error.message });
   }
