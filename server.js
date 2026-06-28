@@ -1011,9 +1011,8 @@ app.get('/api/v1/manager/:supervisorId/leave-all', async (req, res) => {
               la.workflow_status, la.reviewer_remarks, la.is_late_submission
        FROM leave_applications la
        JOIN users u ON la.user_id = u.user_id
-       WHERE u.supervisor_id = $1 AND la.workflow_status != 'PENDING'
-       ORDER BY la.created_at DESC`,
-      [supervisorId]
+       WHERE la.workflow_status != 'PENDING'
+       ORDER BY la.created_at DESC`
     );
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
@@ -1035,11 +1034,11 @@ app.get('/api/v1/manager/:supervisorId/leave-pending', async (req, res) => {
       SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date, la.is_late_submission, la.workflow_status
       FROM leave_applications la
       JOIN users u ON la.user_id = u.user_id
-      WHERE u.supervisor_id = $1 AND la.workflow_status = 'PENDING'
+      WHERE la.workflow_status = 'PENDING'
       ORDER BY la.created_at ASC;
     `;
 
-    const result = await db.query(fetchPendingQuery, [supervisorId]);
+    const result = await db.query(fetchPendingQuery);
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch manager pending records.', detail: error.message });
@@ -1680,10 +1679,8 @@ app.get('/api/v1/manager/:managerId/attendance-logs', async (req, res) => {
          al.created_at
        FROM attendance_logs al
        JOIN users u ON u.user_id = al.user_id
-       WHERE u.supervisor_id = $1 OR u.user_id = $1
        ORDER BY al.created_at DESC
-       LIMIT 200`,
-      [managerId]
+       LIMIT 500`
     );
 
     return res.status(200).json({ success: true, data: result.rows });
