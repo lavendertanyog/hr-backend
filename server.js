@@ -51,16 +51,17 @@ async function getUsersTableColumns() {
   return new Set(result.rows.map((row) => row.column_name));
 }
 
-async function getDefaultUserRole() {
+async function getDefaultUserRole(preferredRole = 'staff') {
   const result = await db.query(
     `SELECT e.enumlabel
      FROM pg_enum e
      JOIN pg_type t ON t.oid = e.enumtypid
      WHERE t.typname = 'rbac_role'
-     ORDER BY e.enumsortorder ASC
-     LIMIT 1`
+     ORDER BY e.enumsortorder ASC`
   );
-  return result.rows[0]?.enumlabel || 'staff';
+  const labels = result.rows.map((r) => String(r.enumlabel || ''));
+  const preferred = labels.find((label) => label.toLowerCase() === String(preferredRole).toLowerCase());
+  return preferred || labels[0] || String(preferredRole);
 }
 
 async function ensureOperationalTables() {
@@ -108,6 +109,11 @@ async function ensureOperationalTables() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
   `);
+
+  await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS manager_status TEXT NOT NULL DEFAULT 'APPROVED';`);
+  await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_status TEXT NOT NULL DEFAULT 'PENDING';`);
+  await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_reviewer_id UUID REFERENCES users(user_id);`);
+  await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_reviewed_at TIMESTAMPTZ;`);
 }
 
 async function tableExists(tableName) {
@@ -201,14 +207,16 @@ app.post('/api/v1/auth/signup', async (req, res) => {
       return res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
     }
 
+    const signupRole = 'manager';
+
     const passwordHash = await bcrypt.hash(password, 10);
     const userId = randomUUID();
     const fullName = deriveNameFromEmail(normalized);
-    const userRole = await getDefaultUserRole();
+    const resolvedRole = await getDefaultUserRole(signupRole);
 
     // Match the same insertion strategy used by outlook-login to avoid schema mismatch issues
     const insertCols = ['user_id', 'full_name', 'user_role', 'email', 'password_hash'];
-    const insertVals = [userId, fullName, userRole, normalized, passwordHash];
+    const insertVals = [userId, fullName, resolvedRole, normalized, passwordHash];
     if (columns.has('phone')) {
       insertCols.push('phone');
       insertVals.push('');
@@ -333,6 +341,10 @@ app.post('/api/v1/allocations', async (req, res) => {
   if (!managerId || !userId || !projectCode || !hoursPerWeek) {
     return res.status(400).json({ error: 'managerId, userId, projectCode and hoursPerWeek are required.' });
   }
+  const numericHours = Number(hoursPerWeek);
+  if (!Number.isFinite(numericHours) || numericHours <= 0) {
+    return res.status(400).json({ error: 'hoursPerWeek must be a valid positive number.' });
+  }
   try {
     const mgrCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
     if (!mgrCheck.rows[0] || !isManagerialRole(mgrCheck.rows[0].user_role)) {
@@ -342,16 +354,20 @@ app.post('/api/v1/allocations', async (req, res) => {
     if (!userRow.rows[0]) return res.status(404).json({ error: 'Target user not found.' });
 
     const result = await db.query(
-      `INSERT INTO hour_allocations (user_id, project_code, hours_per_week, allocated_by)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [userId, projectCode, hoursPerWeek, managerId]
+      `INSERT INTO hour_allocations (
+         user_id, project_code, hours_per_week, allocated_by,
+         manager_status, account_manager_status
+       )
+       VALUES ($1, $2, $3, $4, 'APPROVED', 'PENDING')
+       RETURNING *`,
+      [userId, projectCode, numericHours, managerId]
     );
 
     const mgrRow = await db.query('SELECT full_name FROM users WHERE user_id = $1', [managerId]);
     const mgrName = mgrRow.rows[0]?.full_name || 'Manager';
     await db.query(
       'INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
-      [userId, 'Hours Allocated', `${mgrName} allocated ${hoursPerWeek} hrs/week to project ${projectCode}.`]
+      [userId, 'Allocation Submitted', `${mgrName} submitted ${numericHours} hrs/week for ${projectCode}. Waiting for Account Manager approval.`]
     );
 
     return res.status(201).json({ success: true, data: result.rows[0] });
@@ -360,12 +376,94 @@ app.post('/api/v1/allocations', async (req, res) => {
   }
 });
 
+app.get('/api/v1/allocations/pending-account-manager', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT
+         ha.*,
+         p.project_name,
+         u.full_name AS staff_name,
+         u.email AS staff_email,
+         m.full_name AS manager_name,
+         m.email AS manager_email
+       FROM hour_allocations ha
+       JOIN projects p ON p.project_code = ha.project_code
+       JOIN users u ON u.user_id = ha.user_id
+       LEFT JOIN users m ON m.user_id = ha.allocated_by
+       WHERE ha.account_manager_status = 'PENDING'
+       ORDER BY ha.created_at ASC`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch pending allocations.', detail: error.message });
+  }
+});
+
+app.patch('/api/v1/allocations/:allocationId/account-manager-review', async (req, res) => {
+  const { allocationId } = req.params;
+  const { reviewerId, action } = req.body;
+  const normalizedAction = String(action || '').toUpperCase();
+
+  if (!reviewerId || !['APPROVED', 'REJECTED'].includes(normalizedAction)) {
+    return res.status(400).json({ error: 'reviewerId and valid action (APPROVED/REJECTED) are required.' });
+  }
+
+  try {
+    const reviewer = await db.query('SELECT user_role, full_name FROM users WHERE user_id = $1 LIMIT 1', [reviewerId]);
+    if (!reviewer.rows[0]) {
+      return res.status(404).json({ error: 'Reviewer not found.' });
+    }
+
+    const reviewerRole = normalizeRole(reviewer.rows[0].user_role);
+    if (reviewerRole !== 'account_manager' && reviewerRole !== 'hr') {
+      return res.status(403).json({ error: 'Only account managers can review allocation submissions.' });
+    }
+
+    const updated = await db.query(
+      `UPDATE hour_allocations
+       SET account_manager_status = $1,
+           account_manager_reviewer_id = $2,
+           account_manager_reviewed_at = CURRENT_TIMESTAMP
+       WHERE allocation_id = $3
+       RETURNING *`,
+      [normalizedAction, reviewerId, allocationId]
+    );
+
+    if (!updated.rows[0]) {
+      return res.status(404).json({ error: 'Allocation request not found.' });
+    }
+
+    const row = updated.rows[0];
+    const reviewerName = reviewer.rows[0].full_name || 'Account Manager';
+    const statusWord = normalizedAction === 'APPROVED' ? 'approved' : 'rejected';
+
+    await db.query(
+      'INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
+      [row.user_id, `Allocation ${normalizedAction}`, `${reviewerName} ${statusWord} your allocation for ${row.project_code} (${row.hours_per_week} hrs/week).`]
+    );
+
+    if (row.allocated_by) {
+      await db.query(
+        'INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
+        [row.allocated_by, `Allocation ${normalizedAction}`, `${reviewerName} ${statusWord} your allocation request for ${row.project_code}.`]
+      );
+    }
+
+    return res.status(200).json({ success: true, data: row });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to review allocation.', detail: error.message });
+  }
+});
+
 app.get('/api/v1/allocations/:userId', async (req, res) => {
   try {
     const result = await db.query(
       `SELECT ha.*, p.project_name FROM hour_allocations ha
        JOIN projects p ON p.project_code = ha.project_code
-       WHERE ha.user_id = $1 ORDER BY ha.created_at DESC`,
+       WHERE ha.user_id = $1
+         AND ha.manager_status = 'APPROVED'
+         AND ha.account_manager_status = 'APPROVED'
+       ORDER BY ha.created_at DESC`,
       [req.params.userId]
     );
     return res.status(200).json({ success: true, data: result.rows });
@@ -410,7 +508,7 @@ app.post('/api/v1/auth/outlook-login', async (req, res) => {
     const userId = randomUUID();
 
     const insertCols = ['user_id', 'full_name', 'user_role'];
-    const insertVals = [userId, fullName, 'STAFF'];
+    const insertVals = [userId, fullName, await getDefaultUserRole('staff')];
 
     if (columns.has('email')) {
       insertCols.push('email');
