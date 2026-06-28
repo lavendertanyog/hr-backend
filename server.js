@@ -1014,8 +1014,10 @@ app.get('/api/v1/manager/:supervisorId/leave-all', async (req, res) => {
               la.workflow_status, la.reviewer_remarks, la.is_late_submission
        FROM leave_applications la
        JOIN users u ON la.user_id = u.user_id
-       WHERE la.workflow_status != 'PENDING'
-       ORDER BY la.created_at DESC`
+       WHERE (u.supervisor_id = $1 OR la.workflow_status != 'PENDING')
+         AND la.workflow_status != 'PENDING'
+       ORDER BY la.created_at DESC`,
+      [supervisorId]
     );
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
@@ -1037,11 +1039,11 @@ app.get('/api/v1/manager/:supervisorId/leave-pending', async (req, res) => {
       SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date, la.is_late_submission, la.workflow_status
       FROM leave_applications la
       JOIN users u ON la.user_id = u.user_id
-      WHERE la.workflow_status = 'PENDING'
+      WHERE u.supervisor_id = $1 AND la.workflow_status = 'PENDING'
       ORDER BY la.created_at ASC;
     `;
 
-    const result = await db.query(fetchPendingQuery);
+    const result = await db.query(fetchPendingQuery, [supervisorId]);
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch manager pending records.', detail: error.message });
@@ -1137,6 +1139,17 @@ app.patch('/api/v1/leave/review', async (req, res) => {
     // Strict Rule Boundary: HR users and Staff members are blocked from approving leave logs
     if (role === 'hr' || role === 'staff') {
       return res.status(403).json({ error: `Access Denied: Users holding a ${role} profile cannot process workflow leave decisions.` });
+    }
+
+    // Verify the leave belongs to a staff member in this manager's team
+    const ownershipCheck = await db.query(
+      `SELECT la.leave_id FROM leave_applications la
+       JOIN users u ON la.user_id = u.user_id
+       WHERE la.leave_id = $1 AND u.supervisor_id = $2`,
+      [leaveId, reviewerId]
+    );
+    if (ownershipCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'This leave request does not belong to a member of your team. Use the Approvals page to manage it, or first add this staff member to your team via My Team on the Dashboard.' });
     }
 
    const reviewQuery = `
@@ -1539,6 +1552,27 @@ app.get('/api/v1/users', async (req, res) => {
   }
 });
 
+// PATCH /api/v1/users/set-supervisor — manager claims a staff member into their team
+app.patch('/api/v1/users/set-supervisor', async (req, res) => {
+  const { managerId, staffIds } = req.body;
+  if (!managerId || !Array.isArray(staffIds) || staffIds.length === 0) {
+    return res.status(400).json({ error: 'managerId and staffIds (array) are required.' });
+  }
+  try {
+    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
+    if (managerCheck.rows.length === 0 || !isManagerialRole(managerCheck.rows[0].user_role)) {
+      return res.status(403).json({ error: 'Only manager-role users can set supervisor assignments.' });
+    }
+    await db.query(
+      `UPDATE users SET supervisor_id = $1 WHERE user_id = ANY($2::uuid[])`,
+      [managerId, staffIds]
+    );
+    res.status(200).json({ success: true, message: `${staffIds.length} staff member(s) linked to your account.` });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update supervisor assignments.', detail: error.message });
+  }
+});
+
 app.get('/api/v1/projects/assignments', async (req, res) => {
   const userId = req.query.userId;
 
@@ -1670,8 +1704,10 @@ app.get('/api/v1/manager/:managerId/attendance-logs', async (req, res) => {
          al.created_at
        FROM attendance_logs al
        JOIN users u ON u.user_id = al.user_id
+       WHERE u.supervisor_id = $1 OR u.user_id = $1
        ORDER BY al.created_at DESC
-       LIMIT 500`
+       LIMIT 500`,
+      [managerId]
     );
 
     return res.status(200).json({ success: true, data: result.rows });
