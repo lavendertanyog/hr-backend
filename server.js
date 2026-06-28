@@ -172,6 +172,10 @@ app.post('/api/v1/auth/signup', async (req, res) => {
   }
   try {
     const columns = await getUsersTableColumns();
+    if (!columns.has('email')) {
+      return res.status(500).json({ error: 'Users table is missing email column.' });
+    }
+
     const existing = columns.has('email')
       ? (await db.query('SELECT user_id, full_name, user_role, email FROM users WHERE LOWER(email) = $1 LIMIT 1', [normalized])).rows[0]
       : null;
@@ -184,9 +188,17 @@ app.post('/api/v1/auth/signup', async (req, res) => {
     const userId = randomUUID();
     const fullName = deriveNameFromEmail(normalized);
 
-    const insertCols = ['user_id', 'full_name', 'user_role', 'password_hash'];
-    const insertVals = [userId, fullName, 'STAFF', passwordHash];
-    if (columns.has('email')) { insertCols.push('email'); insertVals.push(normalized); }
+    // Match the same insertion strategy used by outlook-login to avoid schema mismatch issues
+    const insertCols = ['user_id', 'full_name', 'user_role', 'email', 'password_hash'];
+    const insertVals = [userId, fullName, 'STAFF', normalized, passwordHash];
+    if (columns.has('phone')) {
+      insertCols.push('phone');
+      insertVals.push('');
+    }
+    if (columns.has('home_office_country')) {
+      insertCols.push('home_office_country');
+      insertVals.push('SG');
+    }
 
     const placeholders = insertVals.map((_, i) => `$${i + 1}`).join(', ');
     const result = await db.query(
@@ -196,6 +208,34 @@ app.post('/api/v1/auth/signup', async (req, res) => {
     return res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error) {
     return res.status(500).json({ error: 'Signup failed.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: RESET PASSWORD (email + new password)
+// ========================================================================
+app.post('/api/v1/auth/reset-password', async (req, res) => {
+  const { email, newPassword } = req.body;
+  if (!email || !newPassword) {
+    return res.status(400).json({ error: 'Email and newPassword are required.' });
+  }
+  const normalized = email.trim().toLowerCase();
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'New password must be at least 6 characters.' });
+  }
+
+  try {
+    const userRes = await db.query('SELECT user_id FROM users WHERE LOWER(email) = $1 LIMIT 1', [normalized]);
+    const user = userRes.rows[0];
+    if (!user) {
+      return res.status(404).json({ error: 'No account found for this email.' });
+    }
+
+    const hash = await bcrypt.hash(newPassword, 10);
+    await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, user.user_id]);
+    return res.status(200).json({ success: true, message: 'Password has been reset. Please sign in.' });
+  } catch (error) {
+    return res.status(500).json({ error: 'Password reset failed.', detail: error.message });
   }
 });
 

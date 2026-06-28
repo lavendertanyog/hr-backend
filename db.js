@@ -2,11 +2,13 @@ require('dotenv').config();
 const { Pool } = require('pg');
 
 const hasDatabaseUrl = Boolean(process.env.DATABASE_URL);
+const databaseUrl = process.env.DATABASE_URL || '';
+const isLocalDatabaseUrl = /localhost|127\.0\.0\.1/i.test(databaseUrl);
 
 const poolConfig = hasDatabaseUrl
   ? {
-      connectionString: process.env.DATABASE_URL,
-      ssl: process.env.DB_SSL === 'false' ? false : { rejectUnauthorized: false },
+      connectionString: databaseUrl,
+      ssl: process.env.DB_SSL === 'false' || isLocalDatabaseUrl ? false : { rejectUnauthorized: false },
     }
   : {
       user: process.env.DB_USER,
