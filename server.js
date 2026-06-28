@@ -114,6 +114,9 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_status TEXT NOT NULL DEFAULT 'PENDING';`);
   await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_reviewer_id UUID REFERENCES users(user_id);`);
   await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_reviewed_at TIMESTAMPTZ;`);
+
+  // Projects: support multiple managers
+  await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS manager_ids TEXT[] DEFAULT '{}';`);
 }
 
 async function tableExists(tableName) {
@@ -995,6 +998,29 @@ app.post('/api/v1/projects/budget-request', async (req, res) => {
 // ========================================================================
 // ROUTE: FETCH MANAGER'S DIRECT TEAM PENDING LEAVE REQUESTS 
 // ========================================================================
+// GET all leave (not just pending) for history view
+app.get('/api/v1/manager/:supervisorId/leave-all', async (req, res) => {
+  const { supervisorId } = req.params;
+  try {
+    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [supervisorId]);
+    if (managerCheck.rows.length === 0 || normalizeRole(managerCheck.rows[0].user_role) === 'staff') {
+      return res.status(403).json({ error: 'Unauthorized.' });
+    }
+    const result = await db.query(
+      `SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date,
+              la.workflow_status, la.reviewer_remarks, la.is_late_submission
+       FROM leave_applications la
+       JOIN users u ON la.user_id = u.user_id
+       WHERE u.supervisor_id = $1 AND la.workflow_status != 'PENDING'
+       ORDER BY la.created_at DESC`,
+      [supervisorId]
+    );
+    res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch leave history.', detail: error.message });
+  }
+});
+
 app.get('/api/v1/manager/:supervisorId/leave-pending', async (req, res) => {
   const { supervisorId } = req.params;
 
@@ -1061,6 +1087,35 @@ app.post('/api/v1/leave/apply', async (req, res) => {
 // ========================================================================
 // ROUTE: UNIFIED LEAVE WORKFLOW REVIEW (Manager Restrictions Enforced) 
 // ========================================================================
+// PATCH /api/v1/leave/re-review - re-review an already-reviewed leave request
+app.patch('/api/v1/leave/re-review', async (req, res) => {
+  const { leaveId, reviewerId, action, reviewerRemarks } = req.body;
+  const validActions = ['APPROVED', 'REJECTED'];
+  if (!validActions.includes(action?.toUpperCase())) {
+    return res.status(400).json({ error: 'Invalid action. Must be APPROVED or REJECTED.' });
+  }
+  try {
+    const reviewerProfile = await db.query('SELECT user_role FROM users WHERE user_id = $1', [reviewerId]);
+    if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
+    const role = normalizeRole(reviewerProfile.rows[0].user_role);
+    if (role === 'staff') return res.status(403).json({ error: 'Staff users cannot review leave.' });
+    const result = await db.query(
+      `UPDATE leave_applications SET workflow_status = $1, reviewer_remarks = $2 WHERE leave_id = $3 RETURNING *`,
+      [action.toUpperCase(), reviewerRemarks || '', leaveId]
+    );
+    const updated = result.rows[0];
+    if (!updated) return res.status(404).json({ error: 'Leave request not found.' });
+    try {
+      const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Decision Updated (Approved)' : 'Leave Decision Updated (Rejected)';
+      const notifBody = `Your leave request has been re-reviewed and is now ${action.toLowerCase()}${reviewerRemarks ? ': ' + reviewerRemarks : '.'}`;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updated.user_id, notifTitle, notifBody]);
+    } catch (_) {}
+    res.status(200).json({ success: true, data: updated });
+  } catch (error) {
+    res.status(500).json({ error: 'Re-review failed.', detail: error.message });
+  }
+});
+
 app.patch('/api/v1/leave/review', async (req, res) => {
   const { leaveId, reviewerId, action, reviewerRemarks } = req.body;
 
@@ -1322,9 +1377,14 @@ app.post('/api/v1/projects/progress-baseline/apply', async (req, res) => {
 // FETCH ALL PROJECTS AND CODES
 app.get('/api/v1/projects', async (req, res) => {
   try {
-    const result = await db.query(
-      'SELECT project_code, project_name, account_manager_id, budget_hours, total_tracked_hours FROM projects ORDER BY project_code ASC'
-    );
+    const result = await db.query(`
+      SELECT p.project_code, p.project_name, p.account_manager_id, p.manager_ids,
+             p.budget_hours, p.total_tracked_hours, p.status,
+             u.full_name AS account_manager_name
+      FROM projects p
+      LEFT JOIN users u ON u.user_id = p.account_manager_id
+      ORDER BY p.project_code ASC
+    `);
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch project codes.', detail: error.message });
@@ -1345,7 +1405,7 @@ app.get('/api/v1/projects/suggestions', async (req, res) => {
 });
 
 app.post('/api/v1/projects/create', async (req, res) => {
-  const { creatorId, projectCode, projectName, accountManagerId } = req.body;
+  const { creatorId, projectCode, projectName, accountManagerId, managerIds } = req.body;
 
   if (!creatorId || !projectCode || !projectName) {
     return res.status(400).json({ error: 'creatorId, projectCode and projectName are required.' });
@@ -1357,16 +1417,50 @@ app.post('/api/v1/projects/create', async (req, res) => {
       return res.status(403).json({ error: 'Access Denied: Only authorized HR or manager users may issue new project codes.' });
     }
 
+    const primaryManager = (Array.isArray(managerIds) && managerIds.length > 0) ? managerIds[0] : (accountManagerId || creatorId);
+    const allManagerIds = Array.isArray(managerIds) && managerIds.length > 0 ? managerIds : [primaryManager];
+
     const insertResult = await db.query(
-      `INSERT INTO projects (project_code, project_name, account_manager_id, budget_hours, total_tracked_hours, created_at)
-       VALUES ($1, $2, $3, 0.00, 0.00, CURRENT_TIMESTAMP)
+      `INSERT INTO projects (project_code, project_name, account_manager_id, manager_ids, budget_hours, total_tracked_hours, created_at)
+       VALUES ($1, $2, $3, $4, 0.00, 0.00, CURRENT_TIMESTAMP)
        RETURNING *;`,
-      [projectCode.toUpperCase().trim(), projectName.trim(), accountManagerId || creatorId]
+      [projectCode.toUpperCase().trim(), projectName.trim(), primaryManager, allManagerIds]
     );
 
     res.status(201).json({ success: true, data: insertResult.rows[0] });
   } catch (error) {
     res.status(500).json({ error: 'Failed to create project code.', detail: error.message });
+  }
+});
+
+// PATCH /api/v1/projects/:projectCode - edit an existing project
+app.patch('/api/v1/projects/:projectCode', async (req, res) => {
+  const { projectCode } = req.params;
+  const { projectName, managerIds, editorId } = req.body;
+  if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
+  try {
+    const editorCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [editorId]);
+    if (editorCheck.rows.length === 0 || normalizeRole(editorCheck.rows[0].user_role) === 'staff') {
+      return res.status(403).json({ error: 'Access Denied.' });
+    }
+    const updates = [];
+    const values = [];
+    let idx = 1;
+    if (projectName !== undefined) { updates.push(`project_name = $${idx++}`); values.push(projectName.trim()); }
+    if (Array.isArray(managerIds) && managerIds.length > 0) {
+      updates.push(`account_manager_id = $${idx++}`); values.push(managerIds[0]);
+      updates.push(`manager_ids = $${idx++}`); values.push(managerIds);
+    }
+    if (updates.length === 0) return res.status(400).json({ error: 'No fields to update.' });
+    values.push(projectCode.toUpperCase().trim());
+    const result = await db.query(
+      `UPDATE projects SET ${updates.join(', ')} WHERE project_code = $${idx} RETURNING *`,
+      values
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
+    res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update project.', detail: error.message });
   }
 });
 
@@ -1481,6 +1575,41 @@ app.get('/api/v1/projects/assignments', async (req, res) => {
     return res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch project assignments.', detail: error.message });
+  }
+});
+
+// POST /api/v1/projects/assign-bulk - assign multiple staff to a project at once
+app.post('/api/v1/projects/assign-bulk', async (req, res) => {
+  const { managerId, userIds, projectCode } = req.body;
+  if (!managerId || !Array.isArray(userIds) || userIds.length === 0 || !projectCode) {
+    return res.status(400).json({ error: 'managerId, userIds (array) and projectCode are required.' });
+  }
+  try {
+    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
+    if (managerCheck.rows.length === 0 || !isManagerialRole(managerCheck.rows[0].user_role)) {
+      return res.status(403).json({ error: 'Only managers can assign projects.' });
+    }
+    const projectCheck = await db.query('SELECT project_code FROM projects WHERE project_code = $1 LIMIT 1', [projectCode]);
+    if (projectCheck.rows.length === 0) return res.status(404).json({ error: 'Project code not found.' });
+    const results = [];
+    for (const userId of userIds) {
+      const r = await db.query(
+        `INSERT INTO project_assignments (assignment_id, user_id, project_code, assigned_by)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id, project_code) DO UPDATE SET assigned_by = EXCLUDED.assigned_by
+         RETURNING *`,
+        [randomUUID(), userId, projectCode, managerId]
+      );
+      results.push(r.rows[0]);
+      // Notify staff
+      try {
+        await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
+          [userId, 'Project Assigned', `You have been assigned to project ${projectCode}.`]);
+      } catch (_) {}
+    }
+    return res.status(201).json({ success: true, data: results, count: results.length });
+  } catch (error) {
+    return res.status(500).json({ error: 'Bulk assignment failed.', detail: error.message });
   }
 });
 
