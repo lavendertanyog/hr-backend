@@ -51,6 +51,18 @@ async function getUsersTableColumns() {
   return new Set(result.rows.map((row) => row.column_name));
 }
 
+async function getDefaultUserRole() {
+  const result = await db.query(
+    `SELECT e.enumlabel
+     FROM pg_enum e
+     JOIN pg_type t ON t.oid = e.enumtypid
+     WHERE t.typname = 'rbac_role'
+     ORDER BY e.enumsortorder ASC
+     LIMIT 1`
+  );
+  return result.rows[0]?.enumlabel || 'staff';
+}
+
 async function ensureOperationalTables() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS project_assignments (
@@ -192,10 +204,11 @@ app.post('/api/v1/auth/signup', async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
     const userId = randomUUID();
     const fullName = deriveNameFromEmail(normalized);
+    const userRole = await getDefaultUserRole();
 
     // Match the same insertion strategy used by outlook-login to avoid schema mismatch issues
     const insertCols = ['user_id', 'full_name', 'user_role', 'email', 'password_hash'];
-    const insertVals = [userId, fullName, 'STAFF', normalized, passwordHash];
+    const insertVals = [userId, fullName, userRole, normalized, passwordHash];
     if (columns.has('phone')) {
       insertCols.push('phone');
       insertVals.push('');
