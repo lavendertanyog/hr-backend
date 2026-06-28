@@ -2,6 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const { randomUUID } = require('crypto');
+const bcrypt = require('bcryptjs');
 const db = require('./db');
 require('dotenv').config();
 
@@ -59,6 +60,35 @@ async function ensureOperationalTables() {
       assigned_by UUID REFERENCES users(user_id),
       created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE (user_id, project_code)
+    );
+  `);
+
+  // Ensure password_hash column exists on users
+  await db.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+  `);
+
+  // Notifications table
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      notification_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      is_read BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  // Hour allocations table
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS hour_allocations (
+      allocation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      project_code TEXT NOT NULL REFERENCES projects(project_code) ON DELETE CASCADE,
+      hours_per_week NUMERIC(6,2) NOT NULL,
+      allocated_by UUID REFERENCES users(user_id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
   `);
 }
@@ -129,6 +159,161 @@ async function applyDailyProgressBaselineForManagerTeam(managerId) {
     await applyDailyProgressBaselineForReporter(reporter.user_id);
   }
 }
+
+// ========================================================================
+// ROUTE: EMAIL/PASSWORD SIGNUP
+// ========================================================================
+app.post('/api/v1/auth/signup', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
+  const normalized = email.trim().toLowerCase();
+  if (!normalized.endsWith('@nextan.com.sg')) {
+    return res.status(403).json({ error: 'Only @nextan.com.sg emails are allowed.' });
+  }
+  try {
+    const columns = await getUsersTableColumns();
+    const existing = columns.has('email')
+      ? (await db.query('SELECT user_id, full_name, user_role, email FROM users WHERE LOWER(email) = $1 LIMIT 1', [normalized])).rows[0]
+      : null;
+
+    if (existing) {
+      return res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const userId = randomUUID();
+    const fullName = deriveNameFromEmail(normalized);
+
+    const insertCols = ['user_id', 'full_name', 'user_role', 'password_hash'];
+    const insertVals = [userId, fullName, 'STAFF', passwordHash];
+    if (columns.has('email')) { insertCols.push('email'); insertVals.push(normalized); }
+
+    const placeholders = insertVals.map((_, i) => `$${i + 1}`).join(', ');
+    const result = await db.query(
+      `INSERT INTO users (${insertCols.join(', ')}) VALUES (${placeholders}) RETURNING user_id, full_name, user_role, email`,
+      insertVals
+    );
+    return res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ error: 'Signup failed.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: EMAIL/PASSWORD LOGIN
+// ========================================================================
+app.post('/api/v1/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
+  const normalized = email.trim().toLowerCase();
+  try {
+    const result = await db.query(
+      'SELECT user_id, full_name, user_role, email, password_hash FROM users WHERE LOWER(email) = $1 LIMIT 1',
+      [normalized]
+    );
+    const user = result.rows[0];
+    if (!user) return res.status(401).json({ error: 'No account found for this email. Please sign up first.' });
+    if (!user.password_hash) {
+      // Legacy user - set password now
+      const hash = await bcrypt.hash(password, 10);
+      await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, user.user_id]);
+    } else {
+      const valid = await bcrypt.compare(password, user.password_hash);
+      if (!valid) return res.status(401).json({ error: 'Incorrect password.' });
+    }
+    const { password_hash, ...safeUser } = user;
+    return res.status(200).json({ success: true, data: safeUser });
+  } catch (error) {
+    return res.status(500).json({ error: 'Login failed.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: NOTIFICATIONS
+// ========================================================================
+app.get('/api/v1/notifications/:userId', async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
+      [req.params.userId]
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch notifications.', detail: error.message });
+  }
+});
+
+app.post('/api/v1/notifications', async (req, res) => {
+  const { userId, title, body } = req.body;
+  if (!userId || !title || !body) return res.status(400).json({ error: 'userId, title and body are required.' });
+  try {
+    const result = await db.query(
+      'INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3) RETURNING *',
+      [userId, title, body]
+    );
+    return res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to create notification.', detail: error.message });
+  }
+});
+
+app.patch('/api/v1/notifications/:notifId/read', async (req, res) => {
+  try {
+    await db.query('UPDATE notifications SET is_read = TRUE WHERE notification_id = $1', [req.params.notifId]);
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to mark notification read.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: HOUR ALLOCATIONS
+// ========================================================================
+app.post('/api/v1/allocations', async (req, res) => {
+  const { managerId, userId, projectCode, hoursPerWeek } = req.body;
+  if (!managerId || !userId || !projectCode || !hoursPerWeek) {
+    return res.status(400).json({ error: 'managerId, userId, projectCode and hoursPerWeek are required.' });
+  }
+  try {
+    const mgrCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
+    if (!mgrCheck.rows[0] || !isManagerialRole(mgrCheck.rows[0].user_role)) {
+      return res.status(403).json({ error: 'Only managers can allocate hours.' });
+    }
+    const userRow = await db.query('SELECT user_id, full_name FROM users WHERE user_id = $1', [userId]);
+    if (!userRow.rows[0]) return res.status(404).json({ error: 'Target user not found.' });
+
+    const result = await db.query(
+      `INSERT INTO hour_allocations (user_id, project_code, hours_per_week, allocated_by)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [userId, projectCode, hoursPerWeek, managerId]
+    );
+
+    const mgrRow = await db.query('SELECT full_name FROM users WHERE user_id = $1', [managerId]);
+    const mgrName = mgrRow.rows[0]?.full_name || 'Manager';
+    await db.query(
+      'INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
+      [userId, 'Hours Allocated', `${mgrName} allocated ${hoursPerWeek} hrs/week to project ${projectCode}.`]
+    );
+
+    return res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ error: 'Allocation failed.', detail: error.message });
+  }
+});
+
+app.get('/api/v1/allocations/:userId', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT ha.*, p.project_name FROM hour_allocations ha
+       JOIN projects p ON p.project_code = ha.project_code
+       WHERE ha.user_id = $1 ORDER BY ha.created_at DESC`,
+      [req.params.userId]
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch allocations.', detail: error.message });
+  }
+});
 
 // ========================================================================
 // ROUTE: OUTLOOK LOGIN HANDSHAKE + USER UPSERT
@@ -762,6 +947,13 @@ app.patch('/api/v1/leave/review', async (req, res) => {
 
     await auditInterceptor('leave_applications', leaveId, reviewerId, updatedLeave);
 
+    // Notify the leave applicant
+    try {
+      const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Approved' : action.toUpperCase() === 'REJECTED' ? 'Leave Rejected' : 'Leave Forwarded';
+      const notifBody = `Your leave request has been ${action.toUpperCase().toLowerCase()}${reviewerRemarks ? ': ' + reviewerRemarks : '.'}` ;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updatedLeave.user_id, notifTitle, notifBody]);
+    } catch (_) {}
+
     res.status(200).json({ success: true, message: `Workflow state updated successfully.`, data: updatedLeave });
   } catch (error) {
   // This will print the exact line and file that is failing
@@ -1058,6 +1250,15 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
 
     // 3. Audit the change
     await auditInterceptor('budget_requests', requestId, reviewerId, result.rows[0]);
+
+    // Notify the requester
+    try {
+      const budgetRow = result.rows[0];
+      if (budgetRow.user_id) {
+        const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Budget Request Approved' : action.toUpperCase() === 'REJECTED' ? 'Budget Request Rejected' : 'Budget Request Referred';
+        await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [budgetRow.user_id, notifTitle, `Your budget request for ${budgetRow.project_code} has been ${action.toLowerCase()}.`]);
+      }
+    } catch (_) {}
 
     res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
