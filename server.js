@@ -5,6 +5,18 @@ const { randomUUID } = require('crypto');
 const bcrypt = require('bcryptjs');
 const db = require('./db');
 require('dotenv').config();
+const { Expo } = require('expo-server-sdk');
+const expo = new Expo();
+
+// Send push notification to a user via their stored Expo push token
+async function sendPushToUser(userId, title, body) {
+  try {
+    const tokenResult = await db.query('SELECT push_token FROM users WHERE user_id = $1', [userId]);
+    const token = tokenResult.rows[0]?.push_token;
+    if (!token || !Expo.isExpoPushToken(token)) return;
+    await expo.sendPushNotificationsAsync([{ to: token, title, body, sound: 'default' }]);
+  } catch (_) {}
+}
 
 const app = express();
 
@@ -22,6 +34,19 @@ app.get('/', (_req, res) => {
 
 app.get('/health', (_req, res) => {
   res.status(200).json({ success: true, status: 'ok' });
+});
+
+// Save / update Expo push token for a user
+app.post('/api/v1/users/:userId/push-token', async (req, res) => {
+  const { userId } = req.params;
+  const { pushToken } = req.body;
+  if (!pushToken) return res.status(400).json({ error: 'pushToken is required.' });
+  try {
+    await db.query('UPDATE users SET push_token = $1 WHERE user_id = $2', [pushToken, userId]);
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to save push token.', detail: error.message });
+  }
 });
 
 function normalizeRole(role) {
@@ -1240,6 +1265,14 @@ app.post('/api/v1/projects/budget-request', async (req, res) => {
       [userId, projectCode, requestedNumber, justification || null, 'PENDING']
     );
 
+    // Notify the requester
+    try {
+      const notifTitle = 'Hours Request Submitted';
+      const notifBody = `You have just requested for additional hours of ${requestedNumber}hrs for project ${projectCode}. It will be reviewed by your manager and account manager.`;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, notifTitle, notifBody]);
+      await sendPushToUser(userId, notifTitle, notifBody);
+    } catch (_) {}
+
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: 'Budget request submission failed.', detail: error.message });
@@ -1327,6 +1360,14 @@ app.post('/api/v1/leave/apply', async (req, res) => {
       category.toUpperCase() === 'SICK' ? mcFileUrl : null,
       isLateSubmission, reason || null
     ]);
+
+    // Notify the requester
+    try {
+      const notifTitle = 'Leave Request Submitted';
+      const notifBody = `You have just submitted a ${category.toLowerCase()} leave request from ${startDate} to ${endDate}. It is pending manager review.`;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, notifTitle, notifBody]);
+      await sendPushToUser(userId, notifTitle, notifBody);
+    } catch (_) {}
 
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error) {
@@ -1416,9 +1457,12 @@ app.patch('/api/v1/leave/review', async (req, res) => {
 
     // Notify the leave applicant
     try {
-      const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Approved' : action.toUpperCase() === 'REJECTED' ? 'Leave Rejected' : 'Leave Forwarded';
-      const notifBody = `Your leave request has been ${action.toUpperCase().toLowerCase()}${reviewerRemarks ? ': ' + reviewerRemarks : '.'}` ;
+      const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Application Approved' : 'Leave Application Rejected';
+      const notifBody = action.toUpperCase() === 'APPROVED'
+        ? `Your leave application has been approved!${reviewerRemarks ? ' Note: ' + reviewerRemarks : ''}`
+        : `Your leave application has been rejected.${reviewerRemarks ? ' Reason: ' + reviewerRemarks : ''}`;
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updatedLeave.user_id, notifTitle, notifBody]);
+      await sendPushToUser(updatedLeave.user_id, notifTitle, notifBody);
     } catch (_) {}
 
     res.status(200).json({ success: true, message: `Workflow state updated successfully.`, data: updatedLeave });
@@ -1804,12 +1848,13 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
     try {
       if (budgetRow.user_id) {
         const notifTitle = action.toUpperCase() === 'MANAGER_APPROVED'
-          ? 'Budget Request Approved by Manager'
-          : 'Budget Request Rejected';
+          ? 'Request for Additional Hours — Manager Approved'
+          : 'Request for Additional Hours Rejected';
         const notifBody = action.toUpperCase() === 'MANAGER_APPROVED'
-          ? `Your budget request for ${budgetRow.project_code} (${budgetRow.requested_hours} hrs) has been approved by your manager and is now pending Account Manager final approval.`
-          : `Your budget request for ${budgetRow.project_code} has been rejected by the manager.`;
+          ? `Your request for additional hours of ${budgetRow.requested_hours}hrs for project ${budgetRow.project_code} has been approved by your manager, and is pending Account Manager approval.`
+          : `Your request for additional hours for project ${budgetRow.project_code} has been rejected by the manager.`;
         await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [budgetRow.user_id, notifTitle, notifBody]);
+        await sendPushToUser(budgetRow.user_id, notifTitle, notifBody);
       }
     } catch (_) {}
 
@@ -1869,11 +1914,12 @@ app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
 
     try {
       if (budgetRow.user_id) {
-        const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Budget Request Fully Approved' : 'Budget Request Rejected by Account Manager';
+        const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Request for Additional Hours — Fully Approved!' : 'Request for Additional Hours Rejected';
         const notifBody = action.toUpperCase() === 'APPROVED'
-          ? `Your budget request for ${budgetRow.project_code} (${budgetRow.requested_hours} hrs) has been fully approved by the Account Manager. Project budget has been updated.`
-          : `Your budget request for ${budgetRow.project_code} has been rejected by the Account Manager.`;
+          ? `Your request for additional hours of ${budgetRow.requested_hours}hrs for project ${budgetRow.project_code} has been fully approved!`
+          : `Your request for additional hours for project ${budgetRow.project_code} has been rejected by the Account Manager.`;
         await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [budgetRow.user_id, notifTitle, notifBody]);
+        await sendPushToUser(budgetRow.user_id, notifTitle, notifBody);
       }
     } catch (_) {}
 
