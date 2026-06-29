@@ -120,6 +120,24 @@ async function ensureOperationalTables() {
 
   // Projects: status column
   await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ACTIVE';`);
+
+  // Account approval system
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status TEXT NOT NULL DEFAULT 'pending';`);
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;`);
+
+  // Password reset requests table
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS password_reset_requests (
+      request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      email TEXT NOT NULL,
+      new_password_hash TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      requested_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      reviewed_at TIMESTAMPTZ,
+      reviewed_by UUID REFERENCES users(user_id)
+    );
+  `);
 }
 
 async function tableExists(tableName) {
@@ -213,16 +231,18 @@ app.post('/api/v1/auth/signup', async (req, res) => {
       return res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
     }
 
-    const signupRole = 'manager';
+    // Use role sent by the portal, fallback to 'staff'
+    const requestedRole = String(req.body.userRole || 'staff').trim().toLowerCase();
+    const allowedSignupRoles = ['manager', 'account_manager', 'hr', 'staff'];
+    const signupRole = allowedSignupRoles.includes(requestedRole) ? requestedRole : 'staff';
 
     const passwordHash = await bcrypt.hash(password, 10);
     const userId = randomUUID();
     const fullName = deriveNameFromEmail(normalized);
     const resolvedRole = await getDefaultUserRole(signupRole);
 
-    // Match the same insertion strategy used by outlook-login to avoid schema mismatch issues
-    const insertCols = ['user_id', 'full_name', 'user_role', 'email', 'password_hash'];
-    const insertVals = [userId, fullName, resolvedRole, normalized, passwordHash];
+    const insertCols = ['user_id', 'full_name', 'user_role', 'email', 'password_hash', 'account_status'];
+    const insertVals = [userId, fullName, resolvedRole, normalized, passwordHash, 'pending'];
     if (columns.has('phone')) {
       insertCols.push('phone');
       insertVals.push('');
@@ -237,14 +257,19 @@ app.post('/api/v1/auth/signup', async (req, res) => {
       `INSERT INTO users (${insertCols.join(', ')}) VALUES (${placeholders}) RETURNING user_id, full_name, user_role, email`,
       insertVals
     );
-    return res.status(201).json({ success: true, data: result.rows[0] });
+    return res.status(201).json({
+      success: true,
+      pending: true,
+      message: 'Account created. Awaiting admin approval before you can sign in.',
+      data: result.rows[0],
+    });
   } catch (error) {
     return res.status(500).json({ error: 'Signup failed.', detail: error.message });
   }
 });
 
 // ========================================================================
-// ROUTE: RESET PASSWORD (email + new password)
+// ROUTE: RESET PASSWORD REQUEST (queued for admin approval)
 // ========================================================================
 app.post('/api/v1/auth/reset-password', async (req, res) => {
   const { email, newPassword } = req.body;
@@ -264,10 +289,19 @@ app.post('/api/v1/auth/reset-password', async (req, res) => {
     }
 
     const hash = await bcrypt.hash(newPassword, 10);
-    await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, user.user_id]);
-    return res.status(200).json({ success: true, message: 'Password has been reset. Please sign in.' });
+    // Cancel any previous pending request for this user
+    await db.query(`DELETE FROM password_reset_requests WHERE user_id = $1 AND status = 'pending'`, [user.user_id]);
+    await db.query(
+      `INSERT INTO password_reset_requests (user_id, email, new_password_hash) VALUES ($1, $2, $3)`,
+      [user.user_id, normalized, hash]
+    );
+    return res.status(200).json({
+      success: true,
+      pending: true,
+      message: 'Reset request submitted. An admin will approve it shortly.',
+    });
   } catch (error) {
-    return res.status(500).json({ error: 'Password reset failed.', detail: error.message });
+    return res.status(500).json({ error: 'Password reset request failed.', detail: error.message });
   }
 });
 
@@ -280,24 +314,122 @@ app.post('/api/v1/auth/login', async (req, res) => {
   const normalized = email.trim().toLowerCase();
   try {
     const result = await db.query(
-      'SELECT user_id, full_name, user_role, email, password_hash FROM users WHERE LOWER(email) = $1 LIMIT 1',
+      'SELECT user_id, full_name, user_role, email, password_hash, account_status FROM users WHERE LOWER(email) = $1 LIMIT 1',
       [normalized]
     );
     const user = result.rows[0];
     if (!user) return res.status(401).json({ error: 'No account found for this email. Please sign up first.' });
+    // Check approval status (allow null/missing = legacy active users)
+    const status = String(user.account_status || 'active').toLowerCase();
+    if (status === 'pending') {
+      return res.status(403).json({ error: 'Your account is pending admin approval. Please wait for Rebecca Lau or hr.admin@nextan.com.sg to approve your account.' });
+    }
+    if (status === 'rejected') {
+      return res.status(403).json({ error: 'Your account registration was not approved. Please contact hr.admin@nextan.com.sg.' });
+    }
     if (!user.password_hash) {
-      // Legacy user - set password now
       const hash = await bcrypt.hash(password, 10);
       await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, user.user_id]);
     } else {
       const valid = await bcrypt.compare(password, user.password_hash);
       if (!valid) return res.status(401).json({ error: 'Incorrect password.' });
     }
-    const { password_hash, ...safeUser } = user;
+    const { password_hash, account_status, ...safeUser } = user;
     safeUser.full_name = deriveNameFromEmail(normalized);
     return res.status(200).json({ success: true, data: safeUser });
   } catch (error) {
     return res.status(500).json({ error: 'Login failed.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ADMIN ROUTES (is_admin = true required)
+// ========================================================================
+
+// Helper: verify requester is admin
+async function requireAdmin(adminId, res) {
+  if (!adminId) { res.status(400).json({ error: 'adminId is required.' }); return false; }
+  const r = await db.query('SELECT is_admin FROM users WHERE user_id = $1 LIMIT 1', [adminId]);
+  if (!r.rows[0]?.is_admin) { res.status(403).json({ error: 'Admin access required.' }); return false; }
+  return true;
+}
+
+// GET pending accounts
+app.get('/api/v1/admin/pending-accounts', async (req, res) => {
+  const { adminId } = req.query;
+  if (!await requireAdmin(adminId, res)) return;
+  try {
+    const result = await db.query(
+      `SELECT user_id, full_name, email, user_role, account_status, created_at
+       FROM users
+       WHERE account_status = 'pending'
+       ORDER BY created_at ASC`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch pending accounts.', detail: err.message });
+  }
+});
+
+// PATCH approve/reject account
+app.patch('/api/v1/admin/approve-account', async (req, res) => {
+  const { adminId, userId, action } = req.body; // action: 'approve' | 'reject'
+  if (!await requireAdmin(adminId, res)) return;
+  if (!userId || !['approve', 'reject'].includes(action)) {
+    return res.status(400).json({ error: 'userId and action (approve|reject) are required.' });
+  }
+  try {
+    const newStatus = action === 'approve' ? 'active' : 'rejected';
+    await db.query('UPDATE users SET account_status = $1 WHERE user_id = $2', [newStatus, userId]);
+    return res.status(200).json({ success: true, message: `Account ${newStatus}.` });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update account status.', detail: err.message });
+  }
+});
+
+// GET pending password reset requests
+app.get('/api/v1/admin/pending-resets', async (req, res) => {
+  const { adminId } = req.query;
+  if (!await requireAdmin(adminId, res)) return;
+  try {
+    const result = await db.query(
+      `SELECT r.request_id, r.email, r.status, r.requested_at, u.full_name, u.user_role
+       FROM password_reset_requests r
+       JOIN users u ON u.user_id = r.user_id
+       WHERE r.status = 'pending'
+       ORDER BY r.requested_at ASC`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch pending resets.', detail: err.message });
+  }
+});
+
+// PATCH approve/reject password reset
+app.patch('/api/v1/admin/approve-reset', async (req, res) => {
+  const { adminId, requestId, action } = req.body;
+  if (!await requireAdmin(adminId, res)) return;
+  if (!requestId || !['approve', 'reject'].includes(action)) {
+    return res.status(400).json({ error: 'requestId and action (approve|reject) are required.' });
+  }
+  try {
+    const reqRes = await db.query(
+      `SELECT user_id, new_password_hash FROM password_reset_requests WHERE request_id = $1 AND status = 'pending' LIMIT 1`,
+      [requestId]
+    );
+    const row = reqRes.rows[0];
+    if (!row) return res.status(404).json({ error: 'Reset request not found or already processed.' });
+
+    if (action === 'approve') {
+      await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [row.new_password_hash, row.user_id]);
+    }
+    await db.query(
+      `UPDATE password_reset_requests SET status = $1, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = $2 WHERE request_id = $3`,
+      [action === 'approve' ? 'approved' : 'rejected', adminId, requestId]
+    );
+    return res.status(200).json({ success: true, message: `Password reset ${action === 'approve' ? 'approved' : 'rejected'}.` });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to process reset request.', detail: err.message });
   }
 });
 
