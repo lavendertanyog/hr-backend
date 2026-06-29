@@ -570,6 +570,29 @@ app.get('/api/v1/allocations/pending-account-manager', async (req, res) => {
   }
 });
 
+app.get('/api/v1/allocations/history-account-manager', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT
+         ha.*,
+         p.project_name,
+         u.full_name AS staff_name,
+         u.email AS staff_email,
+         m.full_name AS manager_name,
+         m.email AS manager_email
+       FROM hour_allocations ha
+       JOIN projects p ON p.project_code = ha.project_code
+       JOIN users u ON u.user_id = ha.user_id
+       LEFT JOIN users m ON m.user_id = ha.allocated_by
+       WHERE ha.account_manager_status IN ('APPROVED','REJECTED')
+       ORDER BY ha.account_manager_reviewed_at DESC NULLS LAST`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch allocation history.', detail: error.message });
+  }
+});
+
 app.patch('/api/v1/allocations/:allocationId/account-manager-review', async (req, res) => {
   const { allocationId } = req.params;
   const { reviewerId, action } = req.body;
