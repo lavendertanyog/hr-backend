@@ -1408,7 +1408,7 @@ app.get('/api/v1/projects/suggestions', async (req, res) => {
 });
 
 app.post('/api/v1/projects/create', async (req, res) => {
-  const { creatorId, projectCode, projectName, accountManagerId, managerIds } = req.body;
+  const { creatorId, projectCode, projectName, accountManagerId, managerIds, budgetHours } = req.body;
 
   if (!creatorId || !projectCode || !projectName) {
     return res.status(400).json({ error: 'creatorId, projectCode and projectName are required.' });
@@ -1425,9 +1425,9 @@ app.post('/api/v1/projects/create', async (req, res) => {
 
     const insertResult = await db.query(
       `INSERT INTO projects (project_code, project_name, account_manager_id, manager_ids, budget_hours, total_tracked_hours, created_at)
-       VALUES ($1, $2, $3, $4, 0.00, 0.00, CURRENT_TIMESTAMP)
+       VALUES ($1, $2, $3, $4, $5, 0.00, CURRENT_TIMESTAMP)
        RETURNING *;`,
-      [projectCode.toUpperCase().trim(), projectName.trim(), primaryManager, allManagerIds]
+      [projectCode.toUpperCase().trim(), projectName.trim(), primaryManager, allManagerIds, parseFloat(budgetHours) || 0]
     );
 
     res.status(201).json({ success: true, data: insertResult.rows[0] });
@@ -1439,7 +1439,7 @@ app.post('/api/v1/projects/create', async (req, res) => {
 // PATCH /api/v1/projects/:projectCode - edit an existing project
 app.patch('/api/v1/projects/:projectCode', async (req, res) => {
   const { projectCode } = req.params;
-  const { projectName, managerIds, editorId } = req.body;
+  const { projectName, managerIds, budgetHours, editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
   try {
     const editorCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [editorId]);
@@ -1450,6 +1450,7 @@ app.patch('/api/v1/projects/:projectCode', async (req, res) => {
     const values = [];
     let idx = 1;
     if (projectName !== undefined) { updates.push(`project_name = $${idx++}`); values.push(projectName.trim()); }
+    if (budgetHours !== undefined) { updates.push(`budget_hours = $${idx++}`); values.push(parseFloat(budgetHours) || 0); }
     if (Array.isArray(managerIds) && managerIds.length > 0) {
       updates.push(`account_manager_id = $${idx++}`); values.push(managerIds[0]);
       updates.push(`manager_ids = $${idx++}`); values.push(managerIds);
@@ -1532,9 +1533,9 @@ app.get('/api/v1/users', async (req, res) => {
   try {
     if (role) {
       const filtered = await db.query(
-        `SELECT user_id, full_name, email, user_role, supervisor_id
+        `SELECT user_id, full_name, email, user_role::text AS user_role, supervisor_id
          FROM users
-         WHERE LOWER(user_role) = $1
+         WHERE LOWER(user_role::text) = $1
          ORDER BY full_name ASC`,
         [role]
       );
