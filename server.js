@@ -1573,6 +1573,27 @@ app.patch('/api/v1/users/set-supervisor', async (req, res) => {
   }
 });
 
+// PATCH /api/v1/users/remove-from-team — unlink a staff member from a manager's team
+app.patch('/api/v1/users/remove-from-team', async (req, res) => {
+  const { managerId, staffId } = req.body;
+  if (!managerId || !staffId) {
+    return res.status(400).json({ error: 'managerId and staffId are required.' });
+  }
+  try {
+    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
+    if (managerCheck.rows.length === 0 || !isManagerialRole(managerCheck.rows[0].user_role)) {
+      return res.status(403).json({ error: 'Only manager-role users can modify team assignments.' });
+    }
+    await db.query(
+      `UPDATE users SET supervisor_id = NULL WHERE user_id = $1 AND supervisor_id = $2`,
+      [staffId, managerId]
+    );
+    res.status(200).json({ success: true, message: 'Staff member removed from your team.' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to remove staff from team.', detail: error.message });
+  }
+});
+
 app.get('/api/v1/projects/assignments', async (req, res) => {
   const userId = req.query.userId;
 
