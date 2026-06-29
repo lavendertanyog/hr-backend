@@ -1043,7 +1043,8 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
           attendance_id,
           clock_in_time,
           CURRENT_TIMESTAMP AS current_out,
-          EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - clock_in_time)) / 3600 AS raw_hours
+          EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - clock_in_time)) / 3600 AS raw_hours,
+          EXTRACT(HOUR FROM CURRENT_TIMESTAMP) AS out_hour
         FROM attendance_logs
         WHERE attendance_id = $1
       )
@@ -1055,7 +1056,7 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
           ELSE ROUND(TC.raw_hours::numeric, 2)
         END,
         ot_hours_accrued = CASE 
-          WHEN TC.raw_hours > 9.00 THEN ROUND((TC.raw_hours - 9.00)::numeric, 2)
+          WHEN TC.raw_hours > 9.50 AND TC.out_hour >= 18 THEN ROUND((TC.raw_hours - 9.50)::numeric, 2)
           ELSE 0.00
         END
       FROM TimeCalculations TC
@@ -1706,7 +1707,12 @@ app.get('/api/v1/projects/budget-requests', async (req, res) => {
     }
 
     const result = await db.query(
-      "SELECT br.*, p.project_name FROM budget_requests br JOIN projects p ON br.project_code = p.project_code WHERE br.status = 'PENDING' ORDER BY br.created_at ASC"
+      `SELECT br.*, p.project_name, u.full_name AS requester_name, u.email AS requester_email
+       FROM budget_requests br
+       JOIN projects p ON br.project_code = p.project_code
+       LEFT JOIN users u ON u.user_id = br.user_id
+       WHERE br.status = 'PENDING'
+       ORDER BY br.created_at ASC`
     );
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
@@ -1714,11 +1720,32 @@ app.get('/api/v1/projects/budget-requests', async (req, res) => {
   }
 });
 
+// FETCH BUDGET REQUEST HISTORY (non-pending)
+app.get('/api/v1/projects/budget-requests/history', async (req, res) => {
+  try {
+    const hasBudgetRequestsTable = await tableExists('public.budget_requests');
+    if (!hasBudgetRequestsTable) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    const result = await db.query(
+      `SELECT br.*, p.project_name, u.full_name AS requester_name, u.email AS requester_email
+       FROM budget_requests br
+       JOIN projects p ON br.project_code = p.project_code
+       LEFT JOIN users u ON u.user_id = br.user_id
+       WHERE br.status != 'PENDING'
+       ORDER BY br.reviewed_at DESC NULLS LAST, br.created_at DESC`
+    );
+    res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch budget request history.', detail: error.message });
+  }
+});
+
 // UPDATED: APPROVE/REJECT/REFER BUDGET REQUEST
 app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
   const { requestId, reviewerId, action } = req.body; 
   
-  // 1. Validate the new action
   const validActions = ['APPROVED', 'REJECTED', 'REFER_TO_AM'];
   if (!validActions.includes(action?.toUpperCase())) {
     return res.status(400).json({ error: "Invalid action." });
@@ -1730,29 +1757,63 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
       return res.status(503).json({ error: 'budget_requests table is not initialized in this environment.' });
     }
 
-    // 2. Update status
     const result = await db.query(
-      "UPDATE budget_requests SET status = $1 WHERE request_id = $2 RETURNING *",
-      [action.toUpperCase(), requestId]
+      "UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP WHERE request_id = $3 RETURNING *",
+      [action.toUpperCase(), reviewerId, requestId]
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: "Request not found" });
 
-    // 3. Audit the change
-    await auditInterceptor('budget_requests', requestId, reviewerId, result.rows[0]);
+    const budgetRow = result.rows[0];
 
-    // Notify the requester
+    // If APPROVED, automatically increase project budget_hours
+    if (action.toUpperCase() === 'APPROVED') {
+      await db.query(
+        'UPDATE projects SET budget_hours = budget_hours + $1 WHERE project_code = $2',
+        [budgetRow.requested_hours, budgetRow.project_code]
+      );
+    }
+
+    await auditInterceptor('budget_requests', requestId, reviewerId, budgetRow);
+
     try {
-      const budgetRow = result.rows[0];
       if (budgetRow.user_id) {
         const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Budget Request Approved' : action.toUpperCase() === 'REJECTED' ? 'Budget Request Rejected' : 'Budget Request Referred';
-        await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [budgetRow.user_id, notifTitle, `Your budget request for ${budgetRow.project_code} has been ${action.toLowerCase()}.`]);
+        const notifBody = action.toUpperCase() === 'APPROVED'
+          ? `Your budget request for ${budgetRow.project_code} (${budgetRow.requested_hours} hrs) has been approved. Project budget updated.`
+          : `Your budget request for ${budgetRow.project_code} has been ${action.toLowerCase()}.`;
+        await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [budgetRow.user_id, notifTitle, notifBody]);
       }
     } catch (_) {}
 
-    res.status(200).json({ success: true, data: result.rows[0] });
+    res.status(200).json({ success: true, data: budgetRow });
   } catch (error) {
     res.status(500).json({ error: 'Review process failed', detail: error.message });
+  }
+});
+
+// DEACTIVATE PROJECT (sets INACTIVE, removes assignments)
+app.patch('/api/v1/projects/:projectCode/deactivate', async (req, res) => {
+  const { projectCode } = req.params;
+  const { editorId } = req.body;
+  if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
+  try {
+    const editorCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [editorId]);
+    if (editorCheck.rows.length === 0 || normalizeRole(editorCheck.rows[0].user_role) === 'staff') {
+      return res.status(403).json({ error: 'Access Denied.' });
+    }
+    const code = projectCode.toUpperCase().trim();
+    // Remove all project assignments
+    await db.query('DELETE FROM project_assignments WHERE project_code = $1', [code]);
+    // Set project status to INACTIVE
+    const result = await db.query(
+      `UPDATE projects SET status = 'INACTIVE' WHERE project_code = $1 RETURNING *`,
+      [code]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
+    res.status(200).json({ success: true, message: `Project ${code} deactivated and assignments removed.`, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to deactivate project.', detail: error.message });
   }
 });
 
