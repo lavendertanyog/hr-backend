@@ -129,6 +129,24 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS mc_file_url TEXT;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS is_late_submission BOOLEAN NOT NULL DEFAULT FALSE;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reviewer_remarks TEXT;`);
+  await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS workflow_status TEXT NOT NULL DEFAULT 'PENDING';`);
+  await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reason TEXT;`);
+
+  // Budget requests table
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS budget_requests (
+      request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      project_code TEXT NOT NULL REFERENCES projects(project_code) ON DELETE CASCADE,
+      requested_hours NUMERIC(6,2) NOT NULL,
+      justification TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      reviewed_by UUID REFERENCES users(user_id),
+      reviewed_at TIMESTAMPTZ,
+      reviewer_remarks TEXT
+    );
+  `);
 
   // Password reset requests table
   await db.query(`
