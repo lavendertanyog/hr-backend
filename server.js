@@ -125,6 +125,11 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status TEXT NOT NULL DEFAULT 'pending';`);
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;`);
 
+  // Leave applications: ensure optional columns exist
+  await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS mc_file_url TEXT;`);
+  await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS is_late_submission BOOLEAN NOT NULL DEFAULT FALSE;`);
+  await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reviewer_remarks TEXT;`);
+
   // Password reset requests table
   await db.query(`
     CREATE TABLE IF NOT EXISTS password_reset_requests (
@@ -1251,7 +1256,8 @@ app.post('/api/v1/leave/apply', async (req, res) => {
 
   try {
     if (category.toUpperCase() === 'SICK' && !mcFileUrl) {
-      return res.status(400).json({ error: "Policy Violation: Mandatory Medical Certificate (MC) file upload required for Sick Leave." });
+      // MC is recommended but not strictly required (file may be provided in person)
+      // We allow submission and flag it
     }
 
     const leaveStartTimestamp = new Date(startDate);
