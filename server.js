@@ -1883,7 +1883,8 @@ app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
   }
 });
 
-// DEACTIVATE PROJECT (sets INACTIVE, removes assignments)app.patch('/api/v1/projects/:projectCode/deactivate', async (req, res) => {
+// DEACTIVATE PROJECT (sets INACTIVE, removes assignments)
+app.patch('/api/v1/projects/:projectCode/deactivate', async (req, res) => {
   const { projectCode } = req.params;
   const { editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
