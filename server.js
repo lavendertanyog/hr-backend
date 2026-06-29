@@ -433,6 +433,39 @@ app.patch('/api/v1/admin/approve-reset', async (req, res) => {
   }
 });
 
+// GET account history (approved/rejected)
+app.get('/api/v1/admin/account-history', async (req, res) => {
+  const { adminId } = req.query;
+  if (!await requireAdmin(adminId, res)) return;
+  try {
+    const result = await db.query(
+      `SELECT user_id, full_name, email, user_role, account_status, created_at
+       FROM users WHERE account_status IN ('active','rejected')
+       ORDER BY created_at DESC LIMIT 100`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch account history.', detail: err.message });
+  }
+});
+
+// GET reset history (approved/rejected)
+app.get('/api/v1/admin/reset-history', async (req, res) => {
+  const { adminId } = req.query;
+  if (!await requireAdmin(adminId, res)) return;
+  try {
+    const result = await db.query(
+      `SELECT r.request_id, r.email, r.status, r.requested_at, r.reviewed_at, u.full_name, u.user_role
+       FROM password_reset_requests r JOIN users u ON u.user_id = r.user_id
+       WHERE r.status IN ('approved','rejected')
+       ORDER BY r.reviewed_at DESC LIMIT 100`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch reset history.', detail: err.message });
+  }
+});
+
 // ========================================================================
 // ROUTE: NOTIFICATIONS
 // ========================================================================
