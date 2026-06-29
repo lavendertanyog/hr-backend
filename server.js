@@ -125,7 +125,22 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status TEXT NOT NULL DEFAULT 'pending';`);
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;`);
 
-  // Leave applications: ensure optional columns exist
+  // Leave applications: ensure table and all columns exist
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS leave_applications (
+      leave_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      category TEXT NOT NULL,
+      start_date DATE NOT NULL,
+      end_date DATE NOT NULL,
+      mc_file_url TEXT,
+      is_late_submission BOOLEAN NOT NULL DEFAULT FALSE,
+      reviewer_remarks TEXT,
+      workflow_status TEXT NOT NULL DEFAULT 'PENDING',
+      reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS mc_file_url TEXT;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS is_late_submission BOOLEAN NOT NULL DEFAULT FALSE;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reviewer_remarks TEXT;`);
@@ -812,7 +827,8 @@ app.patch('/api/v1/users/:userId/profile', async (req, res) => {
 });
 
 // ========================================================================
-// ROUTE: USER INBOX FEED (LEAVE + BUDGET UPDATES)
+// ========================================================================
+// ROUTE: USER INBOX FEED (LEAVE + BUDGET + NOTIFICATIONS)
 // ========================================================================
 app.get('/api/v1/users/:userId/inbox', async (req, res) => {
   const { userId } = req.params;
@@ -825,7 +841,13 @@ app.get('/api/v1/users/:userId/inbox', async (req, res) => {
 
          SELECT
            'BUDGET' AS category,
-           CONCAT('Budget request ', br.status) AS title,
+           CASE br.status
+             WHEN 'PENDING' THEN 'Budget request submitted'
+             WHEN 'MANAGER_APPROVED' THEN 'Budget request approved by Manager'
+             WHEN 'APPROVED' THEN 'Budget request fully approved'
+             WHEN 'REJECTED' THEN 'Budget request rejected'
+             ELSE CONCAT('Budget request ', br.status)
+           END AS title,
            CONCAT(br.project_code, ' • ', br.requested_hours, ' hrs') AS subtitle,
            br.status AS status,
            br.created_at AS created_at
@@ -838,13 +860,27 @@ app.get('/api/v1/users/:userId/inbox', async (req, res) => {
       `SELECT * FROM (
          SELECT
            'LEAVE' AS category,
-           CONCAT('Leave request ', la.workflow_status) AS title,
-           CONCAT(la.category, ' leave ', TO_CHAR(la.start_date, 'DD Mon YYYY'), ' - ', TO_CHAR(la.end_date, 'DD Mon YYYY')) AS subtitle,
+           CASE la.workflow_status
+             WHEN 'PENDING' THEN 'Leave request submitted'
+             WHEN 'APPROVED' THEN 'Leave request approved'
+             WHEN 'REJECTED' THEN 'Leave request rejected'
+             ELSE CONCAT('Leave request ', la.workflow_status)
+           END AS title,
+           CONCAT(la.category, ' leave • ', TO_CHAR(la.start_date, 'DD Mon YYYY'), ' → ', TO_CHAR(la.end_date, 'DD Mon YYYY')) AS subtitle,
            la.workflow_status AS status,
            la.created_at AS created_at
          FROM leave_applications la
          WHERE la.user_id = $1
          ${budgetUnion}
+         UNION ALL
+         SELECT
+           'NOTIFICATION' AS category,
+           n.title AS title,
+           n.body AS subtitle,
+           CASE WHEN n.is_read THEN 'READ' ELSE 'UNREAD' END AS status,
+           n.created_at AS created_at
+         FROM notifications n
+         WHERE n.user_id = $1
        ) q
        ORDER BY created_at DESC
        LIMIT 100`,
@@ -1266,7 +1302,7 @@ app.get('/api/v1/manager/:supervisorId/leave-pending', async (req, res) => {
 // ROUTE: SUBMIT LEAVE REQUEST (Staff Interface Core Endpoint) 
 // ========================================================================
 app.post('/api/v1/leave/apply', async (req, res) => {
-  const { userId, category, startDate, endDate, mcFileUrl } = req.body;
+  const { userId, category, startDate, endDate, mcFileUrl, reason } = req.body;
 
   const validCategories = ['ANNUAL', 'EMERGENCY', 'SICK'];
   if (!validCategories.includes(category?.toUpperCase())) {
@@ -1274,11 +1310,6 @@ app.post('/api/v1/leave/apply', async (req, res) => {
   }
 
   try {
-    if (category.toUpperCase() === 'SICK' && !mcFileUrl) {
-      // MC is recommended but not strictly required (file may be provided in person)
-      // We allow submission and flag it
-    }
-
     const leaveStartTimestamp = new Date(startDate);
     const currentTimestamp = new Date();
     const hoursPastStart = (currentTimestamp.getTime() - leaveStartTimestamp.getTime()) / (1000 * 60 * 60);
@@ -1286,13 +1317,15 @@ app.post('/api/v1/leave/apply', async (req, res) => {
 
     const leaveInsertQuery = `
       INSERT INTO leave_applications (
-        user_id, category, start_date, end_date, mc_file_url, is_late_submission, workflow_status, reviewer_remarks, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', NULL, CURRENT_TIMESTAMP)
+        user_id, category, start_date, end_date, mc_file_url, is_late_submission, workflow_status, reviewer_remarks, reason, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', NULL, $7, CURRENT_TIMESTAMP)
       RETURNING leave_id, user_id, category, start_date, end_date, is_late_submission, workflow_status;
     `;
 
     const result = await db.query(leaveInsertQuery, [
-      userId, category.toUpperCase(), startDate, endDate, category.toUpperCase() === 'SICK' ? mcFileUrl : null, isLateSubmission
+      userId, category.toUpperCase(), startDate, endDate,
+      category.toUpperCase() === 'SICK' ? mcFileUrl : null,
+      isLateSubmission, reason || null
     ]);
 
     res.status(201).json({ success: true, data: result.rows[0] });
@@ -1742,13 +1775,13 @@ app.get('/api/v1/projects/budget-requests/history', async (req, res) => {
   }
 });
 
-// UPDATED: APPROVE/REJECT/REFER BUDGET REQUEST
+// UPDATED: APPROVE/REJECT BUDGET REQUEST (Manager step — sets MANAGER_APPROVED, not final)
 app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
   const { requestId, reviewerId, action } = req.body; 
   
-  const validActions = ['APPROVED', 'REJECTED', 'REFER_TO_AM'];
+  const validActions = ['MANAGER_APPROVED', 'REJECTED', 'REFER_TO_AM'];
   if (!validActions.includes(action?.toUpperCase())) {
-    return res.status(400).json({ error: "Invalid action." });
+    return res.status(400).json({ error: "Invalid action. Must be MANAGER_APPROVED or REJECTED." });
   }
 
   try {
@@ -1758,30 +1791,24 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
     }
 
     const result = await db.query(
-      "UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP WHERE request_id = $3 RETURNING *",
+      "UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP WHERE request_id = $3 AND status = 'PENDING' RETURNING *",
       [action.toUpperCase(), reviewerId, requestId]
     );
 
-    if (result.rows.length === 0) return res.status(404).json({ error: "Request not found" });
+    if (result.rows.length === 0) return res.status(404).json({ error: "Request not found or already processed." });
 
     const budgetRow = result.rows[0];
-
-    // If APPROVED, automatically increase project budget_hours
-    if (action.toUpperCase() === 'APPROVED') {
-      await db.query(
-        'UPDATE projects SET budget_hours = budget_hours + $1 WHERE project_code = $2',
-        [budgetRow.requested_hours, budgetRow.project_code]
-      );
-    }
 
     await auditInterceptor('budget_requests', requestId, reviewerId, budgetRow);
 
     try {
       if (budgetRow.user_id) {
-        const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Budget Request Approved' : action.toUpperCase() === 'REJECTED' ? 'Budget Request Rejected' : 'Budget Request Referred';
-        const notifBody = action.toUpperCase() === 'APPROVED'
-          ? `Your budget request for ${budgetRow.project_code} (${budgetRow.requested_hours} hrs) has been approved. Project budget updated.`
-          : `Your budget request for ${budgetRow.project_code} has been ${action.toLowerCase()}.`;
+        const notifTitle = action.toUpperCase() === 'MANAGER_APPROVED'
+          ? 'Budget Request Approved by Manager'
+          : 'Budget Request Rejected';
+        const notifBody = action.toUpperCase() === 'MANAGER_APPROVED'
+          ? `Your budget request for ${budgetRow.project_code} (${budgetRow.requested_hours} hrs) has been approved by your manager and is now pending Account Manager final approval.`
+          : `Your budget request for ${budgetRow.project_code} has been rejected by the manager.`;
         await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [budgetRow.user_id, notifTitle, notifBody]);
       }
     } catch (_) {}
@@ -1792,8 +1819,71 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
   }
 });
 
-// DEACTIVATE PROJECT (sets INACTIVE, removes assignments)
-app.patch('/api/v1/projects/:projectCode/deactivate', async (req, res) => {
+// GET budget requests pending Account Manager final approval (status = MANAGER_APPROVED)
+app.get('/api/v1/projects/budget-requests/pending-am', async (req, res) => {
+  try {
+    const hasBudgetRequestsTable = await tableExists('public.budget_requests');
+    if (!hasBudgetRequestsTable) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+    const result = await db.query(
+      `SELECT br.*, p.project_name, u.full_name AS requester_name, u.email AS requester_email
+       FROM budget_requests br
+       JOIN projects p ON br.project_code = p.project_code
+       LEFT JOIN users u ON u.user_id = br.user_id
+       WHERE br.status = 'MANAGER_APPROVED'
+       ORDER BY br.created_at ASC`
+    );
+    res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch pending AM budget requests.', detail: error.message });
+  }
+});
+
+// Account Manager final approval of budget requests (MANAGER_APPROVED → APPROVED/REJECTED)
+app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
+  const { requestId, reviewerId, action } = req.body;
+  const validActions = ['APPROVED', 'REJECTED'];
+  if (!validActions.includes(action?.toUpperCase())) {
+    return res.status(400).json({ error: "Invalid action. Must be APPROVED or REJECTED." });
+  }
+  try {
+    const reviewerProfile = await db.query('SELECT user_role FROM users WHERE user_id = $1', [reviewerId]);
+    if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
+    const role = normalizeRole(reviewerProfile.rows[0].user_role);
+    if (role !== 'account_manager') return res.status(403).json({ error: 'Only Account Managers can perform final budget approval.' });
+
+    const result = await db.query(
+      "UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP WHERE request_id = $3 AND status = 'MANAGER_APPROVED' RETURNING *",
+      [action.toUpperCase(), reviewerId, requestId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Budget request not found or not awaiting AM approval.' });
+
+    const budgetRow = result.rows[0];
+
+    if (action.toUpperCase() === 'APPROVED') {
+      await db.query('UPDATE projects SET budget_hours = budget_hours + $1 WHERE project_code = $2', [budgetRow.requested_hours, budgetRow.project_code]);
+    }
+
+    await auditInterceptor('budget_requests', requestId, reviewerId, budgetRow);
+
+    try {
+      if (budgetRow.user_id) {
+        const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Budget Request Fully Approved' : 'Budget Request Rejected by Account Manager';
+        const notifBody = action.toUpperCase() === 'APPROVED'
+          ? `Your budget request for ${budgetRow.project_code} (${budgetRow.requested_hours} hrs) has been fully approved by the Account Manager. Project budget has been updated.`
+          : `Your budget request for ${budgetRow.project_code} has been rejected by the Account Manager.`;
+        await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [budgetRow.user_id, notifTitle, notifBody]);
+      }
+    } catch (_) {}
+
+    res.status(200).json({ success: true, data: budgetRow });
+  } catch (error) {
+    res.status(500).json({ error: 'AM review failed', detail: error.message });
+  }
+});
+
+// DEACTIVATE PROJECT (sets INACTIVE, removes assignments)app.patch('/api/v1/projects/:projectCode/deactivate', async (req, res) => {
   const { projectCode } = req.params;
   const { editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
