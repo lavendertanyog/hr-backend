@@ -1468,6 +1468,23 @@ app.patch('/api/v1/projects/:projectCode', async (req, res) => {
   }
 });
 
+// DELETE /api/v1/projects/:projectCode - delete a project (HR/manager only)
+app.delete('/api/v1/projects/:projectCode', async (req, res) => {
+  const { projectCode } = req.params;
+  const { editorId } = req.body;
+  if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
+  try {
+    const editorCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [editorId]);
+    if (editorCheck.rows.length === 0 || normalizeRole(editorCheck.rows[0].user_role) === 'staff') {
+      return res.status(403).json({ error: 'Access Denied.' });
+    }
+    await db.query('DELETE FROM projects WHERE project_code = $1', [projectCode.toUpperCase().trim()]);
+    res.status(200).json({ success: true, message: `Project ${projectCode} deleted.` });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete project.', detail: error.message });
+  }
+});
+
 // FETCH ALL PENDING BUDGET REQUESTS
 app.get('/api/v1/projects/budget-requests', async (req, res) => {
   try {
