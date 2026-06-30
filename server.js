@@ -176,6 +176,7 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE leave_applications ALTER COLUMN leave_id SET DEFAULT gen_random_uuid();`);
   await db.query(`ALTER TABLE notifications ALTER COLUMN notification_id SET DEFAULT gen_random_uuid();`);
   await db.query(`ALTER TABLE budget_requests ALTER COLUMN request_id SET DEFAULT gen_random_uuid();`);
+  await db.query(`ALTER TABLE password_reset_requests ALTER COLUMN request_id SET DEFAULT gen_random_uuid();`);
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS push_token TEXT;`);
 
   // Budget requests table
@@ -361,7 +362,7 @@ app.post('/api/v1/auth/reset-password', async (req, res) => {
     // Cancel any previous pending request for this user
     await db.query(`DELETE FROM password_reset_requests WHERE user_id = $1 AND status = 'pending'`, [user.user_id]);
     await db.query(
-      `INSERT INTO password_reset_requests (user_id, email, new_password_hash) VALUES ($1, $2, $3)`,
+      `INSERT INTO password_reset_requests (request_id, user_id, email, new_password_hash) VALUES (gen_random_uuid(), $1, $2, $3)`,
       [user.user_id, normalized, hash]
     );
     return res.status(200).json({
