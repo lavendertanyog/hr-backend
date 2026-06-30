@@ -172,6 +172,12 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS workflow_status TEXT NOT NULL DEFAULT 'PENDING';`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reason TEXT;`);
 
+  // Ensure gen_random_uuid() defaults on primary key columns (in case tables were created externally without defaults)
+  await db.query(`ALTER TABLE leave_applications ALTER COLUMN leave_id SET DEFAULT gen_random_uuid();`);
+  await db.query(`ALTER TABLE notifications ALTER COLUMN notification_id SET DEFAULT gen_random_uuid();`);
+  await db.query(`ALTER TABLE budget_requests ALTER COLUMN request_id SET DEFAULT gen_random_uuid();`);
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS push_token TEXT;`);
+
   // Budget requests table
   await db.query(`
     CREATE TABLE IF NOT EXISTS budget_requests (
@@ -1261,7 +1267,7 @@ app.post('/api/v1/projects/budget-request', async (req, res) => {
     }
 
     const result = await db.query(
-      'INSERT INTO budget_requests (user_id, project_code, requested_hours, justification, status, created_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) RETURNING *',
+      'INSERT INTO budget_requests (request_id, user_id, project_code, requested_hours, justification, status, created_at) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, CURRENT_TIMESTAMP) RETURNING *',
       [userId, projectCode, requestedNumber, justification || null, 'PENDING']
     );
 
@@ -1350,8 +1356,8 @@ app.post('/api/v1/leave/apply', async (req, res) => {
 
     const leaveInsertQuery = `
       INSERT INTO leave_applications (
-        user_id, category, start_date, end_date, mc_file_url, is_late_submission, workflow_status, reviewer_remarks, reason, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', NULL, $7, CURRENT_TIMESTAMP)
+        leave_id, user_id, category, start_date, end_date, mc_file_url, is_late_submission, workflow_status, reviewer_remarks, reason, created_at
+      ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'PENDING', NULL, $7, CURRENT_TIMESTAMP)
       RETURNING leave_id, user_id, category, start_date, end_date, is_late_submission, workflow_status;
     `;
 
