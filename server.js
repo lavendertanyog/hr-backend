@@ -891,14 +891,14 @@ app.get('/api/v1/users/:userId/inbox', async (req, res) => {
       `SELECT * FROM (
          SELECT
            'LEAVE' AS category,
-           CASE la.workflow_status
+           CASE la.workflow_status::TEXT
              WHEN 'PENDING' THEN 'Leave request submitted'
              WHEN 'APPROVED' THEN 'Leave request approved'
              WHEN 'REJECTED' THEN 'Leave request rejected'
-             ELSE CONCAT('Leave request ', la.workflow_status)
+             ELSE CONCAT('Leave request ', la.workflow_status::TEXT)
            END AS title,
-           CONCAT(la.category, ' leave • ', TO_CHAR(la.start_date, 'DD Mon YYYY'), ' → ', TO_CHAR(la.end_date, 'DD Mon YYYY')) AS subtitle,
-           la.workflow_status AS status,
+           CONCAT(la.category::TEXT, ' leave • ', TO_CHAR(la.start_date, 'DD Mon YYYY'), ' → ', TO_CHAR(la.end_date, 'DD Mon YYYY'), ' • ', CASE la.workflow_status::TEXT WHEN 'PENDING' THEN 'Pending manager approval' WHEN 'APPROVED' THEN 'Approved' WHEN 'REJECTED' THEN 'Rejected' ELSE la.workflow_status::TEXT END) AS subtitle,
+           la.workflow_status::TEXT AS status,
            la.created_at AS created_at
          FROM leave_applications la
          WHERE la.user_id = $1
