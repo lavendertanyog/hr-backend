@@ -1383,6 +1383,30 @@ app.post('/api/v1/leave/apply', async (req, res) => {
 });
 
 // ========================================================================
+// ========================================================================
+// ROUTE: LEAVE BALANCE FOR A USER
+// ========================================================================
+app.get('/api/v1/leave/balance/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await db.query(
+      `SELECT COALESCE(SUM(end_date - start_date + 1), 0) AS used_days
+       FROM leave_applications
+       WHERE user_id = $1
+         AND category::TEXT IN ('ANNUAL', 'EMERGENCY')
+         AND workflow_status::TEXT = 'APPROVED'`,
+      [userId]
+    );
+    const usedDays = parseInt(result.rows[0]?.used_days || 0);
+    const totalDays = 12;
+    const remainingDays = Math.max(0, totalDays - usedDays);
+    return res.status(200).json({ success: true, data: { totalDays, usedDays, remainingDays } });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to calculate leave balance.', detail: error.message });
+  }
+});
+
+// ========================================================================
 // ROUTE: UNIFIED LEAVE WORKFLOW REVIEW (Manager Restrictions Enforced) 
 // ========================================================================
 // PATCH /api/v1/leave/re-review - re-review an already-reviewed leave request
