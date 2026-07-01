@@ -1650,6 +1650,7 @@ app.get('/api/v1/projects/active-list', async (req, res) => {
            CASE WHEN p.account_manager_id = $1 THEN true ELSE false END AS is_assigned_manager,
            false AS is_direct_assignment
          FROM projects p
+         WHERE COALESCE(p.status, 'ACTIVE') != 'INACTIVE'
          ORDER BY p.project_code ASC`,
         [userId]
       );
@@ -1682,6 +1683,7 @@ app.get('/api/v1/projects/active-list', async (req, res) => {
          ON pa.project_code = p.project_code
         AND pa.user_id = $1
        WHERE pa.assignment_id IS NOT NULL
+              AND COALESCE(p.status, 'ACTIVE') != 'INACTIVE'
           ${budgetRequestsClause}
        ORDER BY p.project_code ASC`,
       [userId]
@@ -1702,6 +1704,7 @@ app.get('/api/v1/projects/active-list', async (req, res) => {
          false AS is_assigned_manager,
          false AS is_direct_assignment
        FROM projects
+       WHERE COALESCE(status, 'ACTIVE') != 'INACTIVE'
        ORDER BY project_code ASC`
     );
 
@@ -1782,7 +1785,7 @@ app.get('/api/v1/projects/suggestions', async (req, res) => {
   const query = `%${(req.query.q || '').trim()}%`;
   try {
     const result = await db.query(
-      'SELECT project_code, project_name FROM projects WHERE project_code ILIKE $1 OR project_name ILIKE $1 ORDER BY project_code ASC LIMIT 20',
+      'SELECT project_code, project_name FROM projects WHERE (project_code ILIKE $1 OR project_name ILIKE $1) AND COALESCE(status, \'ACTIVE\') != \'INACTIVE\' ORDER BY project_code ASC LIMIT 20',
       [query]
     );
     res.status(200).json({ success: true, data: result.rows });
@@ -2235,8 +2238,8 @@ app.post('/api/v1/projects/assign-bulk', async (req, res) => {
     if (managerCheck.rows.length === 0 || !isManagerialRole(managerCheck.rows[0].user_role)) {
       return res.status(403).json({ error: 'Only managers can assign projects.' });
     }
-    const projectCheck = await db.query('SELECT project_code FROM projects WHERE project_code = $1 LIMIT 1', [projectCode]);
-    if (projectCheck.rows.length === 0) return res.status(404).json({ error: 'Project code not found.' });
+    const projectCheck = await db.query('SELECT project_code FROM projects WHERE project_code = $1 AND COALESCE(status, \'ACTIVE\') != \'INACTIVE\' LIMIT 1', [projectCode]);
+    if (projectCheck.rows.length === 0) return res.status(404).json({ error: 'Project code not found or is inactive.' });
     const results = [];
     for (const userId of userIds) {
       const r = await db.query(
