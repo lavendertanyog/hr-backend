@@ -1488,10 +1488,18 @@ app.patch('/api/v1/leave/review', async (req, res) => {
 
     // Notify the leave applicant
     try {
+      const startStr = updatedLeave.start_date
+        ? new Date(updatedLeave.start_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+        : '';
+      const endStr = updatedLeave.end_date
+        ? new Date(updatedLeave.end_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+        : '';
+      const category = updatedLeave.category || 'ANNUAL';
+      const hasCustomRemark = reviewerRemarks && reviewerRemarks !== 'Processed via Manager Dashboard.';
       const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Application Approved' : 'Leave Application Rejected';
       const notifBody = action.toUpperCase() === 'APPROVED'
-        ? `Your leave application has been approved!${reviewerRemarks ? ' Note: ' + reviewerRemarks : ''}`
-        : `Your leave application has been rejected.${reviewerRemarks ? ' Reason: ' + reviewerRemarks : ''}`;
+        ? `${category} • ${startStr} → ${endStr} • Approved${hasCustomRemark ? '\nNote: ' + reviewerRemarks : ''}`
+        : `${category} • ${startStr} → ${endStr} • Rejected${hasCustomRemark ? '\nReason: ' + reviewerRemarks : ''}`;
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updatedLeave.user_id, notifTitle, notifBody]);
       await sendPushToUser(updatedLeave.user_id, notifTitle, notifBody);
     } catch (_) {}
