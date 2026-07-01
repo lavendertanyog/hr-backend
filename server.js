@@ -882,7 +882,8 @@ app.get('/api/v1/users/:userId/inbox', async (req, res) => {
            END AS title,
            CONCAT(br.project_code, ' • ', br.requested_hours, ' hrs') AS subtitle,
            br.status AS status,
-           br.created_at AS created_at
+           br.created_at AS created_at,
+           NULL::UUID AS notification_id
          FROM budget_requests br
          WHERE br.user_id = $1
       `
@@ -898,9 +899,10 @@ app.get('/api/v1/users/:userId/inbox', async (req, res) => {
              WHEN 'REJECTED' THEN 'Leave request rejected'
              ELSE CONCAT('Leave request ', la.workflow_status::TEXT)
            END AS title,
-           CONCAT(la.category::TEXT, ' leave • ', TO_CHAR(la.start_date, 'DD Mon YYYY'), ' → ', TO_CHAR(la.end_date, 'DD Mon YYYY'), ' • ', CASE la.workflow_status::TEXT WHEN 'PENDING' THEN 'Pending manager approval' WHEN 'APPROVED' THEN 'Approved' WHEN 'REJECTED' THEN 'Rejected' ELSE la.workflow_status::TEXT END) AS subtitle,
+           CONCAT(la.category::TEXT, ' leave \u2022 ', TO_CHAR(la.start_date, 'DD Mon YYYY'), ' \u2192 ', TO_CHAR(la.end_date, 'DD Mon YYYY'), ' \u2022 ', CASE la.workflow_status::TEXT WHEN 'PENDING' THEN 'Pending manager approval' WHEN 'APPROVED' THEN 'Approved' WHEN 'REJECTED' THEN 'Rejected' ELSE la.workflow_status::TEXT END) AS subtitle,
            la.workflow_status::TEXT AS status,
-           la.created_at AS created_at
+           la.created_at AS created_at,
+           NULL::UUID AS notification_id
          FROM leave_applications la
          WHERE la.user_id = $1
          ${budgetUnion}
@@ -910,7 +912,8 @@ app.get('/api/v1/users/:userId/inbox', async (req, res) => {
            n.title AS title,
            n.body AS subtitle,
            CASE WHEN n.is_read THEN 'READ' ELSE 'UNREAD' END AS status,
-           n.created_at AS created_at
+           n.created_at AS created_at,
+           n.notification_id AS notification_id
          FROM notifications n
          WHERE n.user_id = $1
        ) q
@@ -1355,6 +1358,19 @@ app.post('/api/v1/leave/apply', async (req, res) => {
     const hoursPastStart = (currentTimestamp.getTime() - leaveStartTimestamp.getTime()) / (1000 * 60 * 60);
     const isLateSubmission = hoursPastStart > 24;
 
+    // Check for overlapping dates (exclude REJECTED leaves)
+    const overlapCheck = await db.query(
+      `SELECT leave_id FROM leave_applications
+       WHERE user_id = $1
+         AND workflow_status::TEXT NOT IN ('REJECTED')
+         AND start_date <= $3::date
+         AND end_date >= $2::date`,
+      [userId, startDate, endDate]
+    );
+    if (overlapCheck.rows.length > 0) {
+      return res.status(409).json({ error: 'You already have a leave application that overlaps with these dates. Please check your existing requests.' });
+    }
+
     const leaveInsertQuery = `
       INSERT INTO leave_applications (
         leave_id, user_id, category, start_date, end_date, mc_file_url, is_late_submission, workflow_status, reviewer_remarks, reason, created_at
@@ -1383,6 +1399,45 @@ app.post('/api/v1/leave/apply', async (req, res) => {
 });
 
 // ========================================================================
+// ========================================================================
+// ROUTE: EDIT PENDING LEAVE APPLICATION
+// ========================================================================
+app.patch('/api/v1/leave/:leaveId', async (req, res) => {
+  const { leaveId } = req.params;
+  const { userId, category, startDate, endDate, reason } = req.body;
+  if (!userId || !category || !startDate || !endDate) {
+    return res.status(400).json({ error: 'userId, category, startDate, and endDate are required.' });
+  }
+  try {
+    const check = await db.query(
+      'SELECT * FROM leave_applications WHERE leave_id = $1 AND user_id = $2',
+      [leaveId, userId]
+    );
+    if (!check.rows[0]) return res.status(404).json({ error: 'Leave not found.' });
+    if (check.rows[0].workflow_status !== 'PENDING') {
+      return res.status(400).json({ error: 'Only pending leave requests can be edited.' });
+    }
+    // Check for overlapping dates (excluding this leave itself)
+    const overlapCheck = await db.query(
+      `SELECT leave_id FROM leave_applications
+       WHERE user_id = $1 AND leave_id != $2
+         AND workflow_status::TEXT NOT IN ('REJECTED')
+         AND start_date <= $4::date AND end_date >= $3::date`,
+      [userId, leaveId, startDate, endDate]
+    );
+    if (overlapCheck.rows.length > 0) {
+      return res.status(409).json({ error: 'These dates overlap with another existing leave application.' });
+    }
+    await db.query(
+      'UPDATE leave_applications SET category = $1, start_date = $2, end_date = $3, reason = $4 WHERE leave_id = $5',
+      [category.toUpperCase(), startDate, endDate, reason || null, leaveId]
+    );
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to update leave application.', detail: error.message });
+  }
+});
+
 // ========================================================================
 // ROUTE: LEAVE BALANCE FOR A USER
 // ========================================================================
