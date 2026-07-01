@@ -2119,31 +2119,29 @@ app.patch('/api/v1/users/remove-from-team', async (req, res) => {
   }
 });
 
-app.get('/api/v1/projects/assignments', async (req, res) => {
-  const userId = req.query.userId;
-
 // GET /api/v1/projects/utilisation-detail - weighted utilisation per project (for HR/manager portals)
 app.get('/api/v1/projects/utilisation-detail', async (req, res) => {
   try {
     // For each project, get each assigned user's latest completion% and their total allocated hours
     const result = await db.query(`
       WITH latest_progress AS (
-        SELECT DISTINCT ON (user_id, project_code)
-          user_id, project_code, completion_percentage
-        FROM progress_logs
-        ORDER BY user_id, project_code, logged_at DESC
+        SELECT DISTINCT ON (reporter_id, project_code)
+          reporter_id AS user_id, project_code, completion_percentage
+        FROM project_progress_logs
+        ORDER BY reporter_id, project_code, logged_at DESC
       ),
       user_hours AS (
         SELECT pa.project_code, pa.user_id,
-               COALESCE(ha.hours_per_week, p.budget_hours, 0) AS allocated_hours
+               COALESCE(
+                 (SELECT SUM(CASE WHEN ha2.manager_status='APPROVED' AND ha2.account_manager_status='APPROVED'
+                              THEN ha2.hours_requested ELSE 0 END) + MIN(ha2.hours_per_week)
+                  FROM hour_allocations ha2
+                  WHERE ha2.user_id = pa.user_id AND ha2.project_code = pa.project_code),
+                 p.budget_hours,
+                 0
+               ) AS allocated_hours
         FROM project_assignments pa
         JOIN projects p ON p.project_code = pa.project_code
-        LEFT JOIN (
-          SELECT user_id, project_code,
-                 SUM(CASE WHEN manager_status='APPROVED' AND account_manager_status='APPROVED' THEN hours_requested ELSE 0 END) + MIN(hours_per_week) AS hours_per_week
-          FROM hour_allocations
-          GROUP BY user_id, project_code
-        ) ha ON ha.user_id = pa.user_id AND ha.project_code = pa.project_code
       )
       SELECT
         p.project_code,
@@ -2182,8 +2180,8 @@ app.get('/api/v1/manager/:managerId/team-assignments', async (req, res) => {
         p.status AS project_status,
         (
           SELECT completion_percentage
-          FROM progress_logs pl
-          WHERE pl.user_id = u.user_id AND pl.project_code = pa.project_code
+          FROM project_progress_logs pl
+          WHERE pl.reporter_id = u.user_id AND pl.project_code = pa.project_code
           ORDER BY pl.logged_at DESC LIMIT 1
         ) AS latest_progress
       FROM users u
@@ -2358,7 +2356,7 @@ app.get('/api/v1/manager/:managerId/progress-logs', async (req, res) => {
          ppl.project_code,
          p.project_name,
          ppl.reporter_id,
-         u.full_name,
+         u.full_name AS reporter_name,
          ppl.completion_percentage,
          ppl.progress_summary,
          ppl.logged_at
