@@ -2345,6 +2345,18 @@ app.patch('/api/v1/users/set-supervisor', async (req, res) => {
   }
 });
 
+// PATCH /api/v1/users/unset-supervisor — remove a staff member from any team (HR action)
+app.patch('/api/v1/users/unset-supervisor', async (req, res) => {
+  const { staffId } = req.body;
+  if (!staffId) return res.status(400).json({ error: 'staffId is required.' });
+  try {
+    await db.query('UPDATE users SET supervisor_id = NULL WHERE user_id = $1', [staffId]);
+    res.status(200).json({ success: true, message: 'Staff member unassigned from team.' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to unset supervisor.', detail: error.message });
+  }
+});
+
 // PATCH /api/v1/users/remove-from-team — unlink a staff member from a manager's team
 app.patch('/api/v1/users/remove-from-team', async (req, res) => {
   const { managerId, staffId } = req.body;
@@ -2618,7 +2630,8 @@ app.post('/api/v1/projects/assign', async (req, res) => {
 });
 
 // REMOVE a project assignment from a staff member (manager only)
-app.delete('/api/v1/projects/unassign', async (req, res) => {
+// Note: uses /assignments/ path to avoid conflict with DELETE /projects/:projectCode
+app.delete('/api/v1/assignments/remove', async (req, res) => {
   const { managerId, userId, projectCode } = req.body;
   if (!managerId || !userId || !projectCode) {
     return res.status(400).json({ error: 'managerId, userId and projectCode are required.' });
