@@ -58,6 +58,24 @@ function isManagerialRole(role) {
   return normalized === 'manager' || normalized === 'account_manager' || normalized === 'hr';
 }
 
+// Multi-role helper: checks both legacy user_role and new user_roles[]
+function userHasRole(userRow, role) {
+  const normalized = normalizeRole(role);
+  if (normalizeRole(userRow.user_role) === normalized) return true;
+  if (Array.isArray(userRow.user_roles) && userRow.user_roles.length > 0) {
+    return userRow.user_roles.some((r) => normalizeRole(r) === normalized);
+  }
+  return false;
+}
+
+function userIsManagerial(userRow) {
+  if (isManagerialRole(userRow.user_role)) return true;
+  if (Array.isArray(userRow.user_roles) && userRow.user_roles.length > 0) {
+    return userRow.user_roles.some((r) => isManagerialRole(r));
+  }
+  return false;
+}
+
 function deriveNameFromEmail(email) {
   const local = (email || '').split('@')[0] || '';
   return local
@@ -178,6 +196,9 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE budget_requests ALTER COLUMN request_id SET DEFAULT gen_random_uuid();`);
   await db.query(`ALTER TABLE password_reset_requests ALTER COLUMN request_id SET DEFAULT gen_random_uuid();`);
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS push_token TEXT;`);
+
+  // Multi-role support: additive roles array alongside legacy single role
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS user_roles TEXT[] DEFAULT '{}';`);
 
   // Budget requests table
   await db.query(`
@@ -301,18 +322,21 @@ app.post('/api/v1/auth/signup', async (req, res) => {
       return res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
     }
 
-    // Use role sent by the portal, fallback to 'staff'
-    const requestedRole = String(req.body.userRole || 'staff').trim().toLowerCase();
+    // Support both single userRole and multi-role userRoles array
     const allowedSignupRoles = ['manager', 'account_manager', 'hr', 'staff'];
-    const signupRole = allowedSignupRoles.includes(requestedRole) ? requestedRole : 'staff';
+    const rawRoles = Array.isArray(req.body.userRoles)
+      ? req.body.userRoles.map((r) => String(r).trim().toLowerCase()).filter((r) => allowedSignupRoles.includes(r))
+      : [String(req.body.userRole || 'staff').trim().toLowerCase()].filter((r) => allowedSignupRoles.includes(r));
+    const allRoles = rawRoles.length > 0 ? rawRoles : ['staff'];
+    const signupRole = allRoles[0]; // primary role
 
     const passwordHash = await bcrypt.hash(password, 10);
     const userId = randomUUID();
     const fullName = deriveNameFromEmail(normalized);
     const resolvedRole = await getDefaultUserRole(signupRole);
 
-    const insertCols = ['user_id', 'full_name', 'user_role', 'email', 'password_hash', 'account_status'];
-    const insertVals = [userId, fullName, resolvedRole, normalized, passwordHash, 'pending'];
+    const insertCols = ['user_id', 'full_name', 'user_role', 'user_roles', 'email', 'password_hash', 'account_status'];
+    const insertVals = [userId, fullName, resolvedRole, allRoles, normalized, passwordHash, 'pending'];
     if (columns.has('phone')) {
       insertCols.push('phone');
       insertVals.push('');
@@ -324,7 +348,7 @@ app.post('/api/v1/auth/signup', async (req, res) => {
 
     const placeholders = insertVals.map((_, i) => `$${i + 1}`).join(', ');
     const result = await db.query(
-      `INSERT INTO users (${insertCols.join(', ')}) VALUES (${placeholders}) RETURNING user_id, full_name, user_role, email`,
+      `INSERT INTO users (${insertCols.join(', ')}) VALUES (${placeholders}) RETURNING user_id, full_name, user_role, user_roles, email`,
       insertVals
     );
     return res.status(201).json({
@@ -384,7 +408,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
   const normalized = email.trim().toLowerCase();
   try {
     const result = await db.query(
-      'SELECT user_id, full_name, user_role, email, password_hash, account_status FROM users WHERE LOWER(email) = $1 LIMIT 1',
+      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status FROM users WHERE LOWER(email) = $1 LIMIT 1',
       [normalized]
     );
     const user = result.rows[0];
@@ -406,6 +430,10 @@ app.post('/api/v1/auth/login', async (req, res) => {
     }
     const { password_hash, account_status, ...safeUser } = user;
     safeUser.full_name = deriveNameFromEmail(normalized);
+    // Ensure user_roles is always an array in the response
+    safeUser.user_roles = Array.isArray(safeUser.user_roles) && safeUser.user_roles.length > 0
+      ? safeUser.user_roles
+      : [safeUser.user_role].filter(Boolean);
     return res.status(200).json({ success: true, data: safeUser });
   } catch (error) {
     return res.status(500).json({ error: 'Login failed.', detail: error.message });
@@ -509,13 +537,113 @@ app.get('/api/v1/admin/account-history', async (req, res) => {
   if (!await requireAdmin(adminId, res)) return;
   try {
     const result = await db.query(
-      `SELECT user_id, full_name, email, user_role, account_status, created_at
+      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at
        FROM users WHERE account_status IN ('active','rejected')
        ORDER BY created_at DESC LIMIT 100`
     );
     return res.status(200).json({ success: true, data: result.rows });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch account history.', detail: err.message });
+  }
+});
+
+// ========================================================================
+// ROLE-SCOPED REGISTRATION APPROVAL ROUTES
+// ========================================================================
+
+// Helper: verify requester holds a given role (supports multi-role)
+async function requireRoleCheck(requesterId, role, res) {
+  if (!requesterId) { res.status(400).json({ error: 'requesterId is required.' }); return null; }
+  const r = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1 LIMIT 1', [requesterId]);
+  if (!r.rows[0]) { res.status(403).json({ error: 'Requester not found.' }); return null; }
+  const row = r.rows[0];
+  if (!userHasRole(row, role) && !row.is_admin) {
+    res.status(403).json({ error: `This action requires the ${role} role.` }); return null;
+  }
+  return row;
+}
+
+// HR: get pending Manager & Account Manager registrations
+app.get('/api/v1/hr/pending-registrations', async (req, res) => {
+  const { requesterId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  try {
+    const result = await db.query(
+      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at
+       FROM users
+       WHERE account_status = 'pending'
+         AND (LOWER(user_role::text) IN ('manager', 'account_manager')
+              OR user_roles && ARRAY['manager','account_manager'])
+       ORDER BY created_at ASC`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch pending registrations.', detail: err.message });
+  }
+});
+
+// HR: approve or reject a Manager or Account Manager registration
+app.patch('/api/v1/hr/approve-registration', async (req, res) => {
+  const { requesterId, userId, action } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!userId || !['approve', 'reject'].includes(action)) {
+    return res.status(400).json({ error: 'userId and action (approve|reject) are required.' });
+  }
+  try {
+    // Verify target is a manager or account_manager
+    const target = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    if (!target.rows[0]) return res.status(404).json({ error: 'User not found.' });
+    const targetRow = target.rows[0];
+    const isManagerOrAM = userHasRole(targetRow, 'manager') || userHasRole(targetRow, 'account_manager');
+    if (!isManagerOrAM) {
+      return res.status(403).json({ error: 'HR can only approve Manager or Account Manager registrations.' });
+    }
+    const newStatus = action === 'approve' ? 'active' : 'rejected';
+    await db.query('UPDATE users SET account_status = $1 WHERE user_id = $2', [newStatus, userId]);
+    return res.status(200).json({ success: true, message: `Account ${newStatus}.` });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update registration status.', detail: err.message });
+  }
+});
+
+// Account Manager: get pending Staff registrations
+app.get('/api/v1/account-manager/pending-staff-registrations', async (req, res) => {
+  const { requesterId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'account_manager', res)) return;
+  try {
+    const result = await db.query(
+      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at
+       FROM users
+       WHERE account_status = 'pending'
+         AND (LOWER(user_role::text) = 'staff'
+              OR (user_roles @> ARRAY['staff'] AND NOT (user_roles && ARRAY['manager','account_manager','hr'])))
+       ORDER BY created_at ASC`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch pending staff registrations.', detail: err.message });
+  }
+});
+
+// Account Manager: approve or reject a Staff registration
+app.patch('/api/v1/account-manager/approve-staff-registration', async (req, res) => {
+  const { requesterId, userId, action } = req.body;
+  if (!await requireRoleCheck(requesterId, 'account_manager', res)) return;
+  if (!userId || !['approve', 'reject'].includes(action)) {
+    return res.status(400).json({ error: 'userId and action (approve|reject) are required.' });
+  }
+  try {
+    const target = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    if (!target.rows[0]) return res.status(404).json({ error: 'User not found.' });
+    const targetRow = target.rows[0];
+    if (!userHasRole(targetRow, 'staff')) {
+      return res.status(403).json({ error: 'Account Managers can only approve Staff registrations.' });
+    }
+    const newStatus = action === 'approve' ? 'active' : 'rejected';
+    await db.query('UPDATE users SET account_status = $1 WHERE user_id = $2', [newStatus, userId]);
+    return res.status(200).json({ success: true, message: `Staff account ${newStatus}.` });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update staff registration status.', detail: err.message });
   }
 });
 
@@ -587,8 +715,8 @@ app.post('/api/v1/allocations', async (req, res) => {
     return res.status(400).json({ error: 'hoursPerWeek must be a valid positive number.' });
   }
   try {
-    const mgrCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
-    if (!mgrCheck.rows[0] || !isManagerialRole(mgrCheck.rows[0].user_role)) {
+    const mgrCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
+    if (!mgrCheck.rows[0] || !userIsManagerial(mgrCheck.rows[0])) {
       return res.status(403).json({ error: 'Only managers can allocate hours.' });
     }
     const userRow = await db.query('SELECT user_id, full_name FROM users WHERE user_id = $1', [userId]);
@@ -673,13 +801,12 @@ app.patch('/api/v1/allocations/:allocationId/account-manager-review', async (req
   }
 
   try {
-    const reviewer = await db.query('SELECT user_role, full_name FROM users WHERE user_id = $1 LIMIT 1', [reviewerId]);
+    const reviewer = await db.query('SELECT user_role, user_roles, full_name FROM users WHERE user_id = $1 LIMIT 1', [reviewerId]);
     if (!reviewer.rows[0]) {
       return res.status(404).json({ error: 'Reviewer not found.' });
     }
 
-    const reviewerRole = normalizeRole(reviewer.rows[0].user_role);
-    if (reviewerRole !== 'account_manager' && reviewerRole !== 'hr') {
+    if (!userHasRole(reviewer.rows[0], 'account_manager') && !userHasRole(reviewer.rows[0], 'hr')) {
       return res.status(403).json({ error: 'Only account managers can review allocation submissions.' });
     }
 
@@ -1187,14 +1314,14 @@ app.post('/api/v1/hr/projects/create', async (req, res) => {
 
   try {
     // RBAC Check: Ensure requesting client belongs to HR classification rules
-    const hrCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [hrUserId]);
-    if (hrCheck.rows.length === 0 || normalizeRole(hrCheck.rows[0].user_role) !== 'hr') {
+    const hrCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [hrUserId]);
+    if (hrCheck.rows.length === 0 || !userHasRole(hrCheck.rows[0], 'hr')) {
       return res.status(403).json({ error: "Access Denied: Only HR personnel can issue new project configurations." });
     }
 
     // Verify assigned Account Manager exists in database before establishing link
-    const amCheck = await db.query("SELECT user_role FROM users WHERE user_id = $1", [accountManagerId]);
-    if (amCheck.rows.length === 0 || normalizeRole(amCheck.rows[0].user_role) !== 'account_manager') {
+    const amCheck = await db.query("SELECT user_role, user_roles FROM users WHERE user_id = $1", [accountManagerId]);
+    if (amCheck.rows.length === 0 || !userHasRole(amCheck.rows[0], 'account_manager')) {
       return res.status(400).json({ error: "Validation Error: Assigned Account Manager must hold an ACCOUNT_MANAGER system profile role." });
     }
 
@@ -1296,7 +1423,7 @@ app.post('/api/v1/projects/budget-request', async (req, res) => {
 app.get('/api/v1/manager/:supervisorId/leave-all', async (req, res) => {
   const { supervisorId } = req.params;
   try {
-    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [supervisorId]);
+    const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [supervisorId]);
     if (managerCheck.rows.length === 0 || normalizeRole(managerCheck.rows[0].user_role) === 'staff') {
       return res.status(403).json({ error: 'Unauthorized.' });
     }
@@ -1321,8 +1448,8 @@ app.get('/api/v1/manager/:supervisorId/leave-pending', async (req, res) => {
 
   try {
     // Assert reviewer is a manager
-    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [supervisorId]);
-    if (managerCheck.rows.length === 0 || normalizeRole(managerCheck.rows[0].user_role) === 'staff') {
+    const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [supervisorId]);
+    if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
       return res.status(403).json({ error: "Unauthorized access path." });
     }
 
@@ -1472,7 +1599,7 @@ app.patch('/api/v1/leave/re-review', async (req, res) => {
     return res.status(400).json({ error: 'Invalid action. Must be APPROVED or REJECTED.' });
   }
   try {
-    const reviewerProfile = await db.query('SELECT user_role FROM users WHERE user_id = $1', [reviewerId]);
+    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
     if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
     const role = normalizeRole(reviewerProfile.rows[0].user_role);
     if (role === 'staff') return res.status(403).json({ error: 'Staff users cannot review leave.' });
@@ -1502,16 +1629,14 @@ app.patch('/api/v1/leave/review', async (req, res) => {
   }
 
   try {
-    const reviewerProfile = await db.query('SELECT user_role FROM users WHERE user_id = $1', [reviewerId]);
+    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
     if (reviewerProfile.rows.length === 0) {
       return res.status(404).json({ error: 'Reviewer profile not found in system directory.' });
     }
 
-    const role = normalizeRole(reviewerProfile.rows[0].user_role);
-
-    // Strict Rule Boundary: HR users and Staff members are blocked from approving leave logs
-    if (role === 'hr' || role === 'staff') {
-      return res.status(403).json({ error: `Access Denied: Users holding a ${role} profile cannot process workflow leave decisions.` });
+    // Block staff from approving leave; HR staff may not approve direct leave either
+    if (!userIsManagerial(reviewerProfile.rows[0])) {
+      return res.status(403).json({ error: `Access Denied: Only manager-level users can process workflow leave decisions.` });
     }
 
     // Verify the leave belongs to a staff member in this manager's team
@@ -1628,7 +1753,7 @@ app.get('/api/v1/projects/active-list', async (req, res) => {
 
   try {
     const userRoleResult = await db.query(
-      `SELECT user_role FROM users WHERE user_id = $1 LIMIT 1`,
+      `SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1`,
       [userId]
     );
 
@@ -1636,9 +1761,8 @@ app.get('/api/v1/projects/active-list', async (req, res) => {
       return res.status(404).json({ error: 'User not found.' });
     }
 
-    const normalizedRole = normalizeRole(userRoleResult.rows[0].user_role);
-
-    if (isManagerialRole(normalizedRole)) {
+    const userRow = userRoleResult.rows[0];
+    if (userIsManagerial(userRow)) {
       const managerialProjects = await db.query(
         `SELECT
            p.project_code,
@@ -1802,8 +1926,8 @@ app.post('/api/v1/projects/create', async (req, res) => {
   }
 
   try {
-    const creatorCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [creatorId]);
-    if (creatorCheck.rows.length === 0 || normalizeRole(creatorCheck.rows[0].user_role) === 'staff') {
+    const creatorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [creatorId]);
+    if (creatorCheck.rows.length === 0 || !userIsManagerial(creatorCheck.rows[0])) {
       return res.status(403).json({ error: 'Access Denied: Only authorized HR or manager users may issue new project codes.' });
     }
 
@@ -1829,8 +1953,8 @@ app.patch('/api/v1/projects/:projectCode', async (req, res) => {
   const { projectName, managerIds, budgetHours, editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
   try {
-    const editorCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [editorId]);
-    if (editorCheck.rows.length === 0 || normalizeRole(editorCheck.rows[0].user_role) === 'staff') {
+    const editorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [editorId]);
+    if (editorCheck.rows.length === 0 || !userIsManagerial(editorCheck.rows[0])) {
       return res.status(403).json({ error: 'Access Denied.' });
     }
     const updates = [];
@@ -1861,8 +1985,8 @@ app.delete('/api/v1/projects/:projectCode', async (req, res) => {
   const { editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
   try {
-    const editorCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [editorId]);
-    if (editorCheck.rows.length === 0 || normalizeRole(editorCheck.rows[0].user_role) === 'staff') {
+    const editorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [editorId]);
+    if (editorCheck.rows.length === 0 || !userIsManagerial(editorCheck.rows[0])) {
       return res.status(403).json({ error: 'Access Denied.' });
     }
     await db.query('DELETE FROM projects WHERE project_code = $1', [projectCode.toUpperCase().trim()]);
@@ -1982,6 +2106,54 @@ app.get('/api/v1/projects/budget-requests/pending-am', async (req, res) => {
   }
 });
 
+// HR: update user roles (multi-role assignment)
+app.patch('/api/v1/hr/update-user-roles', async (req, res) => {
+  const { requesterId, userId, roles } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!userId || !Array.isArray(roles) || roles.length === 0) {
+    return res.status(400).json({ error: 'userId and a non-empty roles array are required.' });
+  }
+  const ALLOWED = ['hr', 'account_manager', 'manager', 'staff'];
+  const cleaned = roles.map((r) => String(r).trim().toLowerCase()).filter((r) => ALLOWED.includes(r));
+  if (cleaned.length === 0) {
+    return res.status(400).json({ error: 'No valid roles provided. Allowed: hr, account_manager, manager, staff.' });
+  }
+  // Determine primary role by highest privilege: hr > account_manager > manager > staff
+  const PRIORITY = ['hr', 'account_manager', 'manager', 'staff'];
+  const primaryRole = PRIORITY.find((r) => cleaned.includes(r)) || cleaned[0];
+  try {
+    const resolvedPrimary = await getDefaultUserRole(primaryRole);
+    await db.query(
+      'UPDATE users SET user_role = $1, user_roles = $2 WHERE user_id = $3',
+      [resolvedPrimary, cleaned, userId]
+    );
+    const updated = await db.query(
+      'SELECT user_id, full_name, email, user_role, user_roles, account_status FROM users WHERE user_id = $1 LIMIT 1',
+      [userId]
+    );
+    return res.status(200).json({ success: true, data: updated.rows[0] });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update user roles.', detail: err.message });
+  }
+});
+
+// HR: get all active users for role management
+app.get('/api/v1/hr/active-users', async (req, res) => {
+  const { requesterId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  try {
+    const result = await db.query(
+      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at
+       FROM users
+       WHERE account_status = 'active'
+       ORDER BY full_name ASC`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch active users.', detail: err.message });
+  }
+});
+
 // Account Manager final approval of budget requests (MANAGER_APPROVED → APPROVED/REJECTED)
 app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
   const { requestId, reviewerId, action } = req.body;
@@ -1990,10 +2162,9 @@ app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
     return res.status(400).json({ error: "Invalid action. Must be APPROVED or REJECTED." });
   }
   try {
-    const reviewerProfile = await db.query('SELECT user_role FROM users WHERE user_id = $1', [reviewerId]);
+    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
     if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
-    const role = normalizeRole(reviewerProfile.rows[0].user_role);
-    if (role !== 'account_manager') return res.status(403).json({ error: 'Only Account Managers can perform final budget approval.' });
+    if (!userHasRole(reviewerProfile.rows[0], 'account_manager')) return res.status(403).json({ error: 'Only Account Managers can perform final budget approval.' });
 
     const result = await db.query(
       "UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP WHERE request_id = $3 AND status = 'MANAGER_APPROVED' RETURNING *",
@@ -2032,8 +2203,8 @@ app.patch('/api/v1/projects/:projectCode/deactivate', async (req, res) => {
   const { editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
   try {
-    const editorCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [editorId]);
-    if (editorCheck.rows.length === 0 || normalizeRole(editorCheck.rows[0].user_role) === 'staff') {
+    const editorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [editorId]);
+    if (editorCheck.rows.length === 0 || !userIsManagerial(editorCheck.rows[0])) {
       return res.status(403).json({ error: 'Access Denied.' });
     }
     const code = projectCode.toUpperCase().trim();
@@ -2084,8 +2255,8 @@ app.patch('/api/v1/users/set-supervisor', async (req, res) => {
     return res.status(400).json({ error: 'managerId and staffIds (array) are required.' });
   }
   try {
-    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
-    if (managerCheck.rows.length === 0 || !isManagerialRole(managerCheck.rows[0].user_role)) {
+    const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
+    if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
       return res.status(403).json({ error: 'Only manager-role users can set supervisor assignments.' });
     }
     await db.query(
@@ -2105,8 +2276,8 @@ app.patch('/api/v1/users/remove-from-team', async (req, res) => {
     return res.status(400).json({ error: 'managerId and staffId are required.' });
   }
   try {
-    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
-    if (managerCheck.rows.length === 0 || !isManagerialRole(managerCheck.rows[0].user_role)) {
+    const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
+    if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
       return res.status(403).json({ error: 'Only manager-role users can modify team assignments.' });
     }
     await db.query(
@@ -2232,8 +2403,8 @@ app.post('/api/v1/projects/assign-bulk', async (req, res) => {
     return res.status(400).json({ error: 'managerId, userIds (array) and projectCode are required.' });
   }
   try {
-    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
-    if (managerCheck.rows.length === 0 || !isManagerialRole(managerCheck.rows[0].user_role)) {
+    const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
+    if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
       return res.status(403).json({ error: 'Only managers can assign projects.' });
     }
     const projectCheck = await db.query('SELECT project_code FROM projects WHERE project_code = $1 AND COALESCE(status, \'ACTIVE\') != \'INACTIVE\' LIMIT 1', [projectCode]);
@@ -2268,8 +2439,8 @@ app.post('/api/v1/projects/assign', async (req, res) => {
   }
 
   try {
-    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
-    if (managerCheck.rows.length === 0 || !isManagerialRole(managerCheck.rows[0].user_role)) {
+    const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
+    if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
       return res.status(403).json({ error: 'Only manager-level users can assign project codes.' });
     }
 
@@ -2302,8 +2473,8 @@ app.get('/api/v1/manager/:managerId/attendance-logs', async (req, res) => {
   const { managerId } = req.params;
 
   try {
-    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
-    if (managerCheck.rows.length === 0 || !isManagerialRole(managerCheck.rows[0].user_role)) {
+    const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
+    if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
       return res.status(403).json({ error: 'Unauthorized manager access.' });
     }
 
@@ -2343,8 +2514,8 @@ app.get('/api/v1/manager/:managerId/progress-logs', async (req, res) => {
   const { managerId } = req.params;
 
   try {
-    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
-    if (managerCheck.rows.length === 0 || !isManagerialRole(managerCheck.rows[0].user_role)) {
+    const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
+    if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
       return res.status(403).json({ error: 'Unauthorized manager access.' });
     }
 
@@ -2379,8 +2550,8 @@ app.get('/api/v1/manager/:managerId/audit-logs', async (req, res) => {
   const { managerId } = req.params;
 
   try {
-    const managerCheck = await db.query('SELECT user_role FROM users WHERE user_id = $1', [managerId]);
-    if (managerCheck.rows.length === 0 || !isManagerialRole(managerCheck.rows[0].user_role)) {
+    const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
+    if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
       return res.status(403).json({ error: 'Unauthorized manager access.' });
     }
 
