@@ -1207,9 +1207,21 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
   const { userId, projectCode, latitude, longitude, isManualLocation, manualLocationText } = req.body;
 
   try {
-    const userProfile = await db.query('SELECT home_office_country FROM users WHERE user_id = $1', [userId]);
+    const userProfile = await db.query('SELECT home_office_country, user_role, user_roles FROM users WHERE user_id = $1', [userId]);
     if (userProfile.rows.length === 0) {
       return res.status(404).json({ error: 'User profile not found' });
+    }
+
+    // Non-managerial staff must be assigned to the project to clock in
+    const userRow = userProfile.rows[0];
+    if (!userIsManagerial(userRow)) {
+      const assignCheck = await db.query(
+        'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
+        [userId, projectCode]
+      );
+      if (assignCheck.rows.length === 0) {
+        return res.status(403).json({ error: `You are not assigned to project ${projectCode}. Please ask your manager to assign you first.` });
+      }
     }
     
     const homeCountry = userProfile.rows[0].home_office_country;
@@ -1423,6 +1435,18 @@ app.post('/api/v1/projects/budget-request', async (req, res) => {
     const projectCheck = await db.query('SELECT project_code FROM projects WHERE project_code = $1', [projectCode]);
     if (projectCheck.rows.length === 0) {
       return res.status(404).json({ error: `Project reference lookup failed for code: ${projectCode}` });
+    }
+
+    // Staff must be assigned to the project to make a budget request
+    const requesterRow = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    if (requesterRow.rows[0] && !userIsManagerial(requesterRow.rows[0])) {
+      const assignCheck = await db.query(
+        'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
+        [userId, projectCode]
+      );
+      if (assignCheck.rows.length === 0) {
+        return res.status(403).json({ error: `You are not assigned to project ${projectCode}. Budget requests can only be made for projects you are assigned to.` });
+      }
     }
 
     const result = await db.query(
@@ -1736,6 +1760,18 @@ app.post('/api/v1/projects/progress-log', async (req, res) => {
     const projectCheck = await db.query('SELECT project_code FROM projects WHERE project_code = $1', [projectCode]);
     if (projectCheck.rows.length === 0) {
       return res.status(404).json({ error: `Routing Error: Project with code '${projectCode}' does not exist.` });
+    }
+
+    // Non-managerial staff must be assigned to log progress
+    const reporterRow = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [reporterId]);
+    if (reporterRow.rows[0] && !userIsManagerial(reporterRow.rows[0])) {
+      const assignCheck = await db.query(
+        'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
+        [reporterId, projectCode]
+      );
+      if (assignCheck.rows.length === 0) {
+        return res.status(403).json({ error: `You are not assigned to project ${projectCode}. You cannot log progress for a project you are not assigned to.` });
+      }
     }
 
     await applyDailyProgressBaselineForReporter(reporterId, projectCode);
@@ -2506,6 +2542,35 @@ app.post('/api/v1/projects/assign', async (req, res) => {
     return res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to assign project code.', detail: error.message });
+  }
+});
+
+// REMOVE a project assignment from a staff member (manager only)
+app.delete('/api/v1/projects/unassign', async (req, res) => {
+  const { managerId, userId, projectCode } = req.body;
+  if (!managerId || !userId || !projectCode) {
+    return res.status(400).json({ error: 'managerId, userId and projectCode are required.' });
+  }
+  try {
+    const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
+    if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
+      return res.status(403).json({ error: 'Only manager-level users can remove project assignments.' });
+    }
+    const result = await db.query(
+      'DELETE FROM project_assignments WHERE user_id = $1 AND project_code = $2 RETURNING *',
+      [userId, projectCode.toUpperCase().trim()]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Assignment not found.' });
+    }
+    // Also clear any pending/approved allocations for this user+project
+    await db.query(
+      'DELETE FROM hour_allocations WHERE user_id = $1 AND project_code = $2',
+      [userId, projectCode.toUpperCase().trim()]
+    );
+    return res.status(200).json({ success: true, message: `Assignment removed for ${projectCode}.` });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to remove assignment.', detail: error.message });
   }
 });
 
