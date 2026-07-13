@@ -2203,7 +2203,17 @@ app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
     const budgetRow = result.rows[0];
 
     if (action.toUpperCase() === 'APPROVED') {
+      // Increase the project's total budget hours
       await db.query('UPDATE projects SET budget_hours = budget_hours + $1 WHERE project_code = $2', [budgetRow.requested_hours, budgetRow.project_code]);
+      // Also increase the specific staff member's individual hour allocation for this project
+      // so their personal budget and the utilisation calculation both reflect the extra hours
+      await db.query(
+        `UPDATE hour_allocations
+         SET hours_per_week = hours_per_week + $1
+         WHERE user_id = $2 AND project_code = $3
+           AND account_manager_status = 'APPROVED'`,
+        [budgetRow.requested_hours, budgetRow.user_id, budgetRow.project_code]
+      );
     }
 
     await auditInterceptor('budget_requests', requestId, reviewerId, budgetRow);
