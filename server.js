@@ -2369,7 +2369,6 @@ app.patch('/api/v1/users/remove-from-team', async (req, res) => {
 // GET /api/v1/projects/utilisation-detail - weighted utilisation per project (for HR/manager portals)
 app.get('/api/v1/projects/utilisation-detail', async (req, res) => {
   try {
-    // For each project, get each assigned user's latest completion% and their total allocated hours
     const result = await db.query(`
       WITH latest_progress AS (
         SELECT DISTINCT ON (reporter_id, project_code)
@@ -2377,18 +2376,32 @@ app.get('/api/v1/projects/utilisation-detail', async (req, res) => {
         FROM project_progress_logs
         ORDER BY reporter_id, project_code, logged_at DESC
       ),
+      latest_allocation AS (
+        -- Latest approved allocation per user per project (fixes hours_requested bug)
+        SELECT DISTINCT ON (user_id, project_code)
+          user_id, project_code, hours_per_week
+        FROM hour_allocations
+        WHERE account_manager_status = 'APPROVED'
+        ORDER BY user_id, project_code, created_at DESC
+      ),
+      staff_count AS (
+        SELECT project_code, COUNT(*) AS cnt
+        FROM project_assignments
+        GROUP BY project_code
+      ),
       user_hours AS (
         SELECT pa.project_code, pa.user_id,
                COALESCE(
-                 (SELECT SUM(CASE WHEN ha2.manager_status='APPROVED' AND ha2.account_manager_status='APPROVED'
-                              THEN ha2.hours_requested ELSE 0 END) + MIN(ha2.hours_per_week)
-                  FROM hour_allocations ha2
-                  WHERE ha2.user_id = pa.user_id AND ha2.project_code = pa.project_code),
-                 p.budget_hours,
+                 -- Use approved allocation if it exists and is > 0
+                 NULLIF((SELECT la.hours_per_week FROM latest_allocation la
+                         WHERE la.user_id = pa.user_id AND la.project_code = pa.project_code LIMIT 1), 0),
+                 -- Fallback: split project budget equally among all assigned staff
+                 p.budget_hours / NULLIF(sc.cnt, 0)::numeric,
                  0
                ) AS allocated_hours
         FROM project_assignments pa
         JOIN projects p ON p.project_code = pa.project_code
+        LEFT JOIN staff_count sc ON sc.project_code = pa.project_code
       )
       SELECT
         p.project_code,
@@ -2483,8 +2496,9 @@ app.post('/api/v1/projects/assign-bulk', async (req, res) => {
     if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
       return res.status(403).json({ error: 'Only managers can assign projects.' });
     }
-    const projectCheck = await db.query('SELECT project_code FROM projects WHERE project_code = $1 AND COALESCE(status, \'ACTIVE\') != \'INACTIVE\' LIMIT 1', [projectCode]);
+    const projectCheck = await db.query('SELECT project_code, budget_hours, project_name FROM projects WHERE project_code = $1 AND COALESCE(status, \'ACTIVE\') != \'INACTIVE\' LIMIT 1', [projectCode]);
     if (projectCheck.rows.length === 0) return res.status(404).json({ error: 'Project code not found or is inactive.' });
+
     const results = [];
     for (const userId of userIds) {
       const r = await db.query(
@@ -2495,12 +2509,70 @@ app.post('/api/v1/projects/assign-bulk', async (req, res) => {
         [randomUUID(), userId, projectCode, managerId]
       );
       results.push(r.rows[0]);
-      // Notify staff
-      try {
-        await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
-          [userId, 'Project Assigned', `You have been assigned to project ${projectCode}.`]);
-      } catch (_) {}
     }
+
+    // Auto-distribute project budget hours equally among ALL currently assigned staff
+    const budgetHours = Number(projectCheck.rows[0].budget_hours || 0);
+    const projectName = projectCheck.rows[0].project_name || projectCode;
+    if (budgetHours > 0) {
+      const allAssigned = await db.query(
+        'SELECT user_id FROM project_assignments WHERE project_code = $1',
+        [projectCode]
+      );
+      const staffCount = allAssigned.rows.length;
+      const perStaffHours = Math.round((budgetHours / staffCount) * 100) / 100;
+
+      // Upsert allocation for each assigned staff member (delete old + insert new to avoid duplicates)
+      for (const assignedUser of allAssigned.rows) {
+        await db.query(
+          `DELETE FROM hour_allocations WHERE user_id = $1 AND project_code = $2`,
+          [assignedUser.user_id, projectCode]
+        );
+        await db.query(
+          `INSERT INTO hour_allocations (user_id, project_code, hours_per_week, allocated_by, manager_status, account_manager_status)
+           VALUES ($1, $2, $3, $4, 'APPROVED', 'APPROVED')`,
+          [assignedUser.user_id, projectCode, perStaffHours, managerId]
+        );
+      }
+
+      // Notify newly assigned staff
+      for (const userId of userIds) {
+        try {
+          await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [
+            userId, 'Project Assigned — Budget Allocated',
+            `You have been assigned to ${projectCode} (${projectName}) with ${perStaffHours} hrs. Budget of ${budgetHours} hrs split equally among ${staffCount} team member${staffCount !== 1 ? 's' : ''}.`,
+          ]);
+        } catch (_) {}
+      }
+
+      // Notify manager
+      try {
+        await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [
+          managerId, 'Staff Assigned to Project',
+          `${userIds.length} staff added to ${projectCode}. Each member now has ${perStaffHours} hrs (${budgetHours} hrs ÷ ${staffCount} staff).`,
+        ]);
+      } catch (_) {}
+
+      // Notify account manager
+      try {
+        const amRow = await db.query('SELECT account_manager_id FROM projects WHERE project_code = $1 LIMIT 1', [projectCode]);
+        if (amRow.rows[0]?.account_manager_id) {
+          await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [
+            amRow.rows[0].account_manager_id, 'Project Team Updated',
+            `${userIds.length} new staff added to ${projectCode}. Budget redistributed: ${perStaffHours} hrs/member (${staffCount} members).`,
+          ]);
+        }
+      } catch (_) {}
+    } else {
+      // No budget set — just notify assignment
+      for (const userId of userIds) {
+        try {
+          await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
+            [userId, 'Project Assigned', `You have been assigned to project ${projectCode}.`]);
+        } catch (_) {}
+      }
+    }
+
     return res.status(201).json({ success: true, data: results, count: results.length });
   } catch (error) {
     return res.status(500).json({ error: 'Bulk assignment failed.', detail: error.message });
