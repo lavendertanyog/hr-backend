@@ -2255,10 +2255,12 @@ app.get('/api/v1/users', async (req, res) => {
 
   try {
     if (role) {
+      // Check both legacy user_role AND user_roles[] array for multi-role support
       const filtered = await db.query(
-        `SELECT user_id, full_name, email, user_role::text AS user_role, supervisor_id
+        `SELECT user_id, full_name, email, user_role::text AS user_role, user_roles, supervisor_id
          FROM users
-         WHERE LOWER(user_role::text) = $1
+         WHERE (LOWER(user_role::text) = $1 OR user_roles @> ARRAY[$1]::text[])
+           AND account_status = 'active'
          ORDER BY full_name ASC`,
         [role]
       );
@@ -2266,7 +2268,7 @@ app.get('/api/v1/users', async (req, res) => {
     }
 
     const result = await db.query(
-      `SELECT user_id, full_name, email, user_role, supervisor_id
+      `SELECT user_id, full_name, email, user_role, user_roles, supervisor_id
        FROM users
        ORDER BY full_name ASC`
     );
