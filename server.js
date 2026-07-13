@@ -940,7 +940,7 @@ app.get('/api/v1/users/:userId/profile', async (req, res) => {
   try {
     const columns = await getUsersTableColumns();
     const result = await db.query(
-      `SELECT user_id, full_name, user_role${columns.has('email') ? ', email' : ''}${columns.has('phone') ? ', phone' : ''}
+      `SELECT user_id, full_name, user_role, user_roles, account_status${columns.has('email') ? ', email' : ''}${columns.has('phone') ? ', phone' : ''}
        FROM users
        WHERE user_id = $1`,
       [userId]
@@ -953,6 +953,34 @@ app.get('/api/v1/users/:userId/profile', async (req, res) => {
     return res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch user profile.', detail: error.message });
+  }
+});
+
+// Lightweight session validation: returns current roles + account_status for a user
+// Used by portals to detect role revocations without a full re-login
+app.get('/api/v1/auth/verify-session', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: 'userId is required.' });
+  try {
+    const result = await db.query(
+      'SELECT user_id, user_role, user_roles, account_status FROM users WHERE user_id = $1 LIMIT 1',
+      [userId]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'User not found.' });
+    const row = result.rows[0];
+    const roles = Array.isArray(row.user_roles) && row.user_roles.length > 0
+      ? row.user_roles : [row.user_role].filter(Boolean);
+    return res.status(200).json({
+      success: true,
+      data: {
+        user_id: row.user_id,
+        user_role: row.user_role,
+        user_roles: roles,
+        account_status: row.account_status,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Session verification failed.', detail: error.message });
   }
 });
 
