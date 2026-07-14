@@ -2497,6 +2497,26 @@ app.get('/api/v1/projects/assignments', async (req, res) => {
   }
 });
 
+// GET /api/v1/projects/:projectCode/members — all users assigned to a project (for hierarchy view)
+app.get('/api/v1/projects/:projectCode/members', async (req, res) => {
+  const { projectCode } = req.params;
+  try {
+    const result = await db.query(
+      `SELECT
+         u.user_id, u.full_name, u.email, u.user_role, u.user_roles, u.supervisor_id
+       FROM project_assignments pa
+       JOIN users u ON u.user_id = pa.user_id
+       WHERE pa.project_code = $1
+         AND u.account_status = 'active'
+       ORDER BY u.full_name ASC`,
+      [projectCode.toUpperCase()]
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch project members.', detail: error.message });
+  }
+});
+
 // POST /api/v1/projects/assign-bulk - assign multiple staff to a project at once
 app.post('/api/v1/projects/assign-bulk', async (req, res) => {
   const { managerId, userIds, projectCode } = req.body;
