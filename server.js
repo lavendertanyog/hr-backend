@@ -200,6 +200,10 @@ async function ensureOperationalTables() {
   // Multi-role support: additive roles array alongside legacy single role
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS user_roles TEXT[] DEFAULT '{}';`);
 
+  // Project-scoped role: what function does this person serve within this specific project?
+  // Values: 'account_manager' | 'manager' | 'staff' (independent of global user_roles)
+  await db.query(`ALTER TABLE project_assignments ADD COLUMN IF NOT EXISTS project_role TEXT NOT NULL DEFAULT 'staff';`);
+
   // Budget requests table
   await db.query(`
     CREATE TABLE IF NOT EXISTS budget_requests (
@@ -2218,6 +2222,42 @@ app.get('/api/v1/hr/active-users', async (req, res) => {
   }
 });
 
+// GET /api/v1/account-manager/:userId/my-projects — projects managed by this AM with team members
+app.get('/api/v1/account-manager/:userId/my-projects', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    // Verify the user is an account manager
+    const userRow = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    if (!userRow.rows[0] || !userHasRole(userRow.rows[0], 'account_manager')) {
+      return res.status(403).json({ error: 'Account Manager access required.' });
+    }
+    // Get projects where this user is account_manager
+    const projectsRes = await db.query(
+      `SELECT p.project_code, p.project_name, p.budget_hours, p.status, p.created_at
+       FROM projects p
+       WHERE p.account_manager_id = $1
+       ORDER BY p.project_code ASC`,
+      [userId]
+    );
+    // For each project, get the team members with their project roles
+    const projectsWithTeam = await Promise.all(projectsRes.rows.map(async (p) => {
+      const members = await db.query(
+        `SELECT u.user_id, u.full_name, u.email, u.user_role, u.user_roles, u.supervisor_id,
+                pa.project_role, pa.assignment_id
+         FROM project_assignments pa
+         JOIN users u ON u.user_id = pa.user_id
+         WHERE pa.project_code = $1 AND u.account_status = 'active'
+         ORDER BY pa.project_role ASC, u.full_name ASC`,
+        [p.project_code]
+      );
+      return { ...p, members: members.rows };
+    }));
+    return res.status(200).json({ success: true, data: projectsWithTeam });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch account manager projects.', detail: error.message });
+  }
+});
+
 // Account Manager final approval of budget requests (MANAGER_APPROVED → APPROVED/REJECTED)
 app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
   const { requestId, reviewerId, action } = req.body;
@@ -2503,17 +2543,43 @@ app.get('/api/v1/projects/:projectCode/members', async (req, res) => {
   try {
     const result = await db.query(
       `SELECT
-         u.user_id, u.full_name, u.email, u.user_role, u.user_roles, u.supervisor_id
+         u.user_id, u.full_name, u.email, u.user_role, u.user_roles, u.supervisor_id,
+         pa.project_role, pa.assignment_id
        FROM project_assignments pa
        JOIN users u ON u.user_id = pa.user_id
        WHERE pa.project_code = $1
          AND u.account_status = 'active'
-       ORDER BY u.full_name ASC`,
+       ORDER BY pa.project_role ASC, u.full_name ASC`,
       [projectCode.toUpperCase()]
     );
     return res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch project members.', detail: error.message });
+  }
+});
+
+// PATCH /api/v1/projects/assignments/role — update a user's project-specific role
+app.patch('/api/v1/projects/assignments/role', async (req, res) => {
+  const { managerId, userId, projectCode, projectRole } = req.body;
+  const allowed = ['account_manager', 'manager', 'staff'];
+  if (!managerId || !userId || !projectCode || !allowed.includes(projectRole)) {
+    return res.status(400).json({ error: 'managerId, userId, projectCode and a valid projectRole (account_manager|manager|staff) are required.' });
+  }
+  try {
+    const mgrCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
+    if (!mgrCheck.rows[0] || !userIsManagerial(mgrCheck.rows[0])) {
+      return res.status(403).json({ error: 'Only manager-level users can update project roles.' });
+    }
+    const result = await db.query(
+      `UPDATE project_assignments SET project_role = $1
+       WHERE user_id = $2 AND project_code = $3
+       RETURNING *`,
+      [projectRole, userId, projectCode.toUpperCase()]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Assignment not found.' });
+    return res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to update project role.', detail: error.message });
   }
 });
 
@@ -2533,12 +2599,23 @@ app.post('/api/v1/projects/assign-bulk', async (req, res) => {
 
     const results = [];
     for (const userId of userIds) {
+      // Determine project role for each user being assigned
+      // HR/AM/Manager assigns => assign as 'staff' by default unless explicitly given
+      const assigneeRow = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+      const assigneeRoles = assigneeRow.rows[0]
+        ? (Array.isArray(assigneeRow.rows[0].user_roles) && assigneeRow.rows[0].user_roles.length > 0
+          ? assigneeRow.rows[0].user_roles : [assigneeRow.rows[0].user_role].filter(Boolean))
+        : ['staff'];
+      // Default project_role: use the user's highest-privilege role that makes sense for a project
+      const PROJECT_ROLE_PRIORITY = ['account_manager', 'manager', 'staff'];
+      const defaultProjectRole = PROJECT_ROLE_PRIORITY.find((r) => assigneeRoles.includes(r)) || 'staff';
+
       const r = await db.query(
-        `INSERT INTO project_assignments (assignment_id, user_id, project_code, assigned_by)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO project_assignments (assignment_id, user_id, project_code, assigned_by, project_role)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (user_id, project_code) DO UPDATE SET assigned_by = EXCLUDED.assigned_by
          RETURNING *`,
-        [randomUUID(), userId, projectCode, managerId]
+        [randomUUID(), userId, projectCode, managerId, defaultProjectRole]
       );
       results.push(r.rows[0]);
     }
