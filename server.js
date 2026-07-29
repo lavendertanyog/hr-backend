@@ -241,6 +241,15 @@ async function ensureOperationalTables() {
       reviewed_by UUID REFERENCES users(user_id)
     );
   `);
+
+  // HR-configurable per-employee leave entitlement (replaces hardcoded 12-day balance)
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS leave_entitlement_days INTEGER NOT NULL DEFAULT 12;`);
+
+  // Log Time: remarks + general (non-project) vs project entries + manual entry flag
+  await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS remark TEXT;`);
+  await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS entry_type TEXT NOT NULL DEFAULT 'PROJECT';`);
+  await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS is_manual_entry BOOLEAN NOT NULL DEFAULT FALSE;`);
+  await db.query(`ALTER TABLE attendance_logs ALTER COLUMN project_code DROP NOT NULL;`);
 }
 
 async function tableExists(tableName) {
@@ -1216,7 +1225,8 @@ app.post('/api/v1/attendance/pre-fetch-address', async (req, res) => {
 // ROUTE: CLOCK-IN ENDPOINT 
 // ========================================================================
 app.post('/api/v1/attendance/clock-in', async (req, res) => {
-  const { userId, projectCode, latitude, longitude, isManualLocation, manualLocationText } = req.body;
+  const { userId, projectCode, latitude, longitude, isManualLocation, manualLocationText, remark } = req.body;
+  const entryType = projectCode ? 'PROJECT' : 'GENERAL';
 
   try {
     const userProfile = await db.query('SELECT home_office_country, user_role, user_roles FROM users WHERE user_id = $1', [userId]);
@@ -1224,9 +1234,9 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
       return res.status(404).json({ error: 'User profile not found' });
     }
 
-    // Non-managerial staff must be assigned to the project to clock in
+    // Non-managerial staff must be assigned to the project to clock in (general/non-project time is exempt)
     const userRow = userProfile.rows[0];
-    if (!userIsManagerial(userRow)) {
+    if (entryType === 'PROJECT' && !userIsManagerial(userRow)) {
       const assignCheck = await db.query(
         'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
         [userId, projectCode]
@@ -1235,7 +1245,7 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
         return res.status(403).json({ error: `You are not assigned to project ${projectCode}. Please ask your manager to assign you first.` });
       }
     }
-    
+
     const homeCountry = userProfile.rows[0].home_office_country;
     let locationName = manualLocationText || 'Kuala Lumpur, Malaysia (Local Network Test)';
     let countryCode = homeCountry;
@@ -1250,18 +1260,18 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
 
     const insertQuery = `
       INSERT INTO attendance_logs (
-        attendance_id, user_id, project_code, clock_in_time, raw_coordinates, 
-        location_name, country_code, is_manual_location, travel_mode, status, created_at
+        attendance_id, user_id, project_code, clock_in_time, raw_coordinates,
+        location_name, country_code, is_manual_location, travel_mode, status, entry_type, remark, created_at
       ) VALUES (
-        $1, $2, $3, CURRENT_TIMESTAMP, 
-        CASE WHEN $4::numeric IS NOT NULL AND $5::numeric IS NOT NULL 
-             THEN ST_SetSRID(ST_MakePoint($5::numeric, $4::numeric), 4326) ELSE NULL END, 
-        $6, $7, $8, $9, 'ACTIVE', CURRENT_TIMESTAMP
+        $1, $2, $3, CURRENT_TIMESTAMP,
+        CASE WHEN $4::numeric IS NOT NULL AND $5::numeric IS NOT NULL
+             THEN ST_SetSRID(ST_MakePoint($5::numeric, $4::numeric), 4326) ELSE NULL END,
+        $6, $7, $8, $9, 'ACTIVE', $10, $11, CURRENT_TIMESTAMP
       ) RETURNING *;
     `;
 
     const result = await db.query(insertQuery, [
-      randomUUID(), userId, projectCode, latitude, longitude, locationName, countryCode, isManualLocation || false, travelMode
+      randomUUID(), userId, projectCode || null, latitude, longitude, locationName, countryCode, isManualLocation || false, travelMode, entryType, remark || null
     ]);
 
     res.status(201).json({ success: true, data: result.rows[0] });
@@ -1275,7 +1285,7 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
 // ROUTE: CLOCK-OUT ENDPOINT 
 // ========================================================================
 app.post('/api/v1/attendance/clock-out', async (req, res) => {
-  const { userId, attendanceId } = req.body;
+  const { userId, attendanceId, remark } = req.body;
 
   try {
     const logCheck = await db.query(
@@ -1289,7 +1299,7 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
 
     const updateQuery = `
       WITH TimeCalculations AS (
-        SELECT 
+        SELECT
           attendance_id,
           clock_in_time,
           CURRENT_TIMESTAMP AS current_out,
@@ -1299,26 +1309,83 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
         WHERE attendance_id = $1
       )
       UPDATE attendance_logs
-      SET 
+      SET
         clock_out_time = TC.current_out,
-        daily_worktime_hours = CASE 
+        daily_worktime_hours = CASE
           WHEN TC.raw_hours > 1.00 THEN ROUND((TC.raw_hours - 1.00)::numeric, 2)
           ELSE ROUND(TC.raw_hours::numeric, 2)
         END,
-        ot_hours_accrued = CASE 
+        ot_hours_accrued = CASE
           WHEN TC.raw_hours > 9.50 AND TC.out_hour >= 18 THEN ROUND((TC.raw_hours - 9.50)::numeric, 2)
           ELSE 0.00
-        END
+        END,
+        remark = COALESCE($2, attendance_logs.remark)
       FROM TimeCalculations TC
       WHERE attendance_logs.attendance_id = $1
       RETURNING attendance_logs.attendance_id, attendance_logs.daily_worktime_hours, attendance_logs.ot_hours_accrued;
     `;
 
-    const result = await db.query(updateQuery, [attendanceId]);
+    const result = await db.query(updateQuery, [attendanceId, remark || null]);
     res.status(200).json({ success: true, data: result.rows[0] });
 
   } catch (error) {
     res.status(500).json({ error: 'Clock-Out transaction failure', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: MANUAL TIME ENTRY (Log Time — enter actual start/end times directly)
+// ========================================================================
+app.post('/api/v1/attendance/manual-entry', async (req, res) => {
+  const { userId, projectCode, startTime, endTime, remark } = req.body;
+  const entryType = projectCode ? 'PROJECT' : 'GENERAL';
+
+  if (!userId || !startTime || !endTime) {
+    return res.status(400).json({ error: 'userId, startTime, and endTime are required.' });
+  }
+  const start = new Date(startTime);
+  const end = new Date(endTime);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) {
+    return res.status(400).json({ error: 'endTime must be a valid time after startTime.' });
+  }
+
+  try {
+    const userProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
+    if (userProfile.rows.length === 0) {
+      return res.status(404).json({ error: 'User profile not found' });
+    }
+
+    if (entryType === 'PROJECT' && !userIsManagerial(userProfile.rows[0])) {
+      const assignCheck = await db.query(
+        'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
+        [userId, projectCode]
+      );
+      if (assignCheck.rows.length === 0) {
+        return res.status(403).json({ error: `You are not assigned to project ${projectCode}. Please ask your manager to assign you first.` });
+      }
+    }
+
+    const rawHours = (end.getTime() - start.getTime()) / (1000 * 60 * 60);
+    const outHour = end.getHours();
+    const dailyWorktimeHours = Math.round((rawHours > 1 ? rawHours - 1 : rawHours) * 100) / 100;
+    const otHoursAccrued = rawHours > 9.5 && outHour >= 18 ? Math.round((rawHours - 9.5) * 100) / 100 : 0;
+
+    const insertQuery = `
+      INSERT INTO attendance_logs (
+        attendance_id, user_id, project_code, clock_in_time, clock_out_time,
+        daily_worktime_hours, ot_hours_accrued, status, entry_type, is_manual_entry, remark, created_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, 'CLOSED', $8, TRUE, $9, CURRENT_TIMESTAMP
+      ) RETURNING *;
+    `;
+    const result = await db.query(insertQuery, [
+      randomUUID(), userId, projectCode || null, start.toISOString(), end.toISOString(),
+      dailyWorktimeHours, otHoursAccrued, entryType, remark || null
+    ]);
+
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Manual time entry failed.', detail: error.message });
   }
 });
 
@@ -1707,16 +1774,19 @@ app.delete('/api/v1/leave/:leaveId', async (req, res) => {
 app.get('/api/v1/leave/balance/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const result = await db.query(
-      `SELECT COALESCE(SUM(end_date - start_date + 1), 0) AS used_days
-       FROM leave_applications
-       WHERE user_id = $1
-         AND category::TEXT IN ('ANNUAL', 'EMERGENCY')
-         AND workflow_status::TEXT = 'APPROVED'`,
-      [userId]
-    );
-    const usedDays = parseInt(result.rows[0]?.used_days || 0);
-    const totalDays = 12;
+    const [usageResult, entitlementResult] = await Promise.all([
+      db.query(
+        `SELECT COALESCE(SUM(end_date - start_date + 1), 0) AS used_days
+         FROM leave_applications
+         WHERE user_id = $1
+           AND category::TEXT IN ('ANNUAL', 'EMERGENCY')
+           AND workflow_status::TEXT = 'APPROVED'`,
+        [userId]
+      ),
+      db.query('SELECT leave_entitlement_days FROM users WHERE user_id = $1', [userId]),
+    ]);
+    const usedDays = parseInt(usageResult.rows[0]?.used_days || 0);
+    const totalDays = entitlementResult.rows[0]?.leave_entitlement_days ?? 12;
     const remainingDays = Math.max(0, totalDays - usedDays);
     return res.status(200).json({ success: true, data: { totalDays, usedDays, remainingDays } });
   } catch (error) {
@@ -2291,7 +2361,7 @@ app.get('/api/v1/hr/active-users', async (req, res) => {
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   try {
     const result = await db.query(
-      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at
+      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at, leave_entitlement_days
        FROM users
        WHERE account_status = 'active'
        ORDER BY full_name ASC`
@@ -2299,6 +2369,26 @@ app.get('/api/v1/hr/active-users', async (req, res) => {
     return res.status(200).json({ success: true, data: result.rows });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to fetch active users.', detail: err.message });
+  }
+});
+
+// HR: set a per-employee leave entitlement override
+app.patch('/api/v1/hr/update-leave-entitlement', async (req, res) => {
+  const { requesterId, userId, leaveEntitlementDays } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  const days = Number(leaveEntitlementDays);
+  if (!userId || !Number.isInteger(days) || days < 0) {
+    return res.status(400).json({ error: 'userId and a non-negative integer leaveEntitlementDays are required.' });
+  }
+  try {
+    const updated = await db.query(
+      'UPDATE users SET leave_entitlement_days = $1 WHERE user_id = $2 RETURNING user_id, full_name, leave_entitlement_days',
+      [days, userId]
+    );
+    if (!updated.rows[0]) return res.status(404).json({ error: 'User not found.' });
+    return res.status(200).json({ success: true, data: updated.rows[0] });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update leave entitlement.', detail: err.message });
   }
 });
 
@@ -2862,6 +2952,9 @@ app.get('/api/v1/manager/:managerId/attendance-logs', async (req, res) => {
          al.daily_worktime_hours,
          al.ot_hours_accrued,
          al.status,
+         al.entry_type,
+         al.is_manual_entry,
+         al.remark,
          al.created_at
        FROM attendance_logs al
        JOIN users u ON u.user_id = al.user_id
