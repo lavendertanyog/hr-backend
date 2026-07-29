@@ -3,8 +3,14 @@ const axios = require('axios');
 const cors = require('cors');
 const { randomUUID } = require('crypto');
 const bcrypt = require('bcryptjs');
+const dotenv = require('dotenv');
 const db = require('./db');
-require('dotenv').config();
+
+const isRenderEnvironment = Boolean(process.env.RENDER) || Boolean(process.env.RENDER_SERVICE_NAME);
+if (!isRenderEnvironment) {
+  dotenv.config();
+}
+
 const { Expo } = require('expo-server-sdk');
 const expo = new Expo();
 
@@ -181,7 +187,8 @@ async function ensureOperationalTables() {
       reviewer_remarks TEXT,
       workflow_status TEXT NOT NULL DEFAULT 'PENDING',
       reason TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ
     );
   `);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS mc_file_url TEXT;`);
@@ -189,6 +196,7 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reviewer_remarks TEXT;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS workflow_status TEXT NOT NULL DEFAULT 'PENDING';`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reason TEXT;`);
+  await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;`);
 
   // Ensure gen_random_uuid() defaults on primary key columns (in case tables were created externally without defaults)
   await db.query(`ALTER TABLE leave_applications ALTER COLUMN leave_id SET DEFAULT gen_random_uuid();`);
@@ -1315,6 +1323,43 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
 });
 
 // ========================================================================
+// ROUTE: ACTIVE ATTENDANCE SESSION CHECK
+// ========================================================================
+app.get('/api/v1/attendance/active-session/:userId', async (req, res) => {
+  const { userId } = req.params;
+  if (!userId) {
+    return res.status(400).json({ error: 'Missing userId parameter.' });
+  }
+
+  try {
+    const result = await db.query(
+      `SELECT
+         attendance_id,
+         user_id,
+         project_code,
+         clock_in_time,
+         ST_Y(raw_coordinates::geometry) AS latitude,
+         ST_X(raw_coordinates::geometry) AS longitude,
+         location_name,
+         country_code,
+         is_manual_location,
+         travel_mode,
+         status,
+         created_at
+       FROM attendance_logs
+       WHERE user_id = $1 AND status = 'ACTIVE' AND clock_out_time IS NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId]
+    );
+
+    return res.status(200).json({ success: true, data: result.rows[0] || null });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch active attendance session.', detail: error.message });
+  }
+});
+
+// ========================================================================
 // ROUTE: HIDDEN HOURLY LOCATION TRACKING (EMPLOYEE-FACING UI NOT USED)
 // ========================================================================
 app.post('/api/v1/attendance/track-location', async (req, res) => {
@@ -1545,7 +1590,7 @@ app.post('/api/v1/leave/apply', async (req, res) => {
     const overlapCheck = await db.query(
       `SELECT leave_id FROM leave_applications
        WHERE user_id = $1
-         AND workflow_status::TEXT NOT IN ('REJECTED')
+         AND workflow_status::TEXT NOT IN ('REJECTED', 'CANCELLED')
          AND start_date <= $3::date
          AND end_date >= $2::date`,
       [userId, startDate, endDate]
@@ -1604,7 +1649,7 @@ app.patch('/api/v1/leave/:leaveId', async (req, res) => {
     const overlapCheck = await db.query(
       `SELECT leave_id FROM leave_applications
        WHERE user_id = $1 AND leave_id != $2
-         AND workflow_status::TEXT NOT IN ('REJECTED')
+         AND workflow_status::TEXT NOT IN ('REJECTED', 'CANCELLED')
          AND start_date <= $4::date AND end_date >= $3::date`,
       [userId, leaveId, startDate, endDate]
     );
@@ -1612,12 +1657,47 @@ app.patch('/api/v1/leave/:leaveId', async (req, res) => {
       return res.status(409).json({ error: 'These dates overlap with another existing leave application.' });
     }
     await db.query(
-      'UPDATE leave_applications SET category = $1, start_date = $2, end_date = $3, reason = $4 WHERE leave_id = $5',
+      'UPDATE leave_applications SET category = $1, start_date = $2, end_date = $3, reason = $4, updated_at = CURRENT_TIMESTAMP WHERE leave_id = $5',
       [category.toUpperCase(), startDate, endDate, reason || null, leaveId]
     );
     return res.status(200).json({ success: true });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to update leave application.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: CANCEL PENDING LEAVE APPLICATION
+// ========================================================================
+app.delete('/api/v1/leave/:leaveId', async (req, res) => {
+  const { leaveId } = req.params;
+  const { userId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required to cancel a leave request.' });
+  }
+
+  try {
+    const result = await db.query(
+      `UPDATE leave_applications
+       SET workflow_status = 'CANCELLED', reviewer_remarks = 'Cancelled by applicant', updated_at = CURRENT_TIMESTAMP
+       WHERE leave_id = $1 AND user_id = $2 AND workflow_status = 'PENDING'
+       RETURNING leave_id, user_id, category, start_date, end_date, workflow_status, reviewer_remarks`,
+      [leaveId, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Leave request not found or it is not eligible for cancellation.' });
+    }
+
+    try {
+      const cancelled = result.rows[0];
+      const message = `Your leave request from ${cancelled.start_date.toISOString().slice(0, 10)} to ${cancelled.end_date.toISOString().slice(0, 10)} has been cancelled.`;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, 'Leave Request Cancelled', message]);
+    } catch (_) {}
+
+    return res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to cancel leave application.', detail: error.message });
   }
 });
 

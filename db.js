@@ -1,5 +1,10 @@
-require('dotenv').config();
+const dotenv = require('dotenv');
 const { Pool } = require('pg');
+
+const isRenderEnvironment = Boolean(process.env.RENDER) || Boolean(process.env.RENDER_SERVICE_NAME);
+if (!isRenderEnvironment) {
+  dotenv.config();
+}
 
 const hasDatabaseUrl = Boolean(process.env.DATABASE_URL);
 const databaseUrl = process.env.DATABASE_URL || '';
@@ -16,6 +21,7 @@ const poolConfig = hasDatabaseUrl
       database: process.env.DB_DATABASE,
       password: process.env.DB_PASSWORD,
       port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : 5432,
+      ssl: process.env.DB_SSL === 'false' ? false : { rejectUnauthorized: false },
     };
 
 const pool = new Pool(poolConfig);
