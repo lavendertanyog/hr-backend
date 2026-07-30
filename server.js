@@ -2536,6 +2536,28 @@ app.patch('/api/v1/projects/:projectCode/deactivate', async (req, res) => {
   }
 });
 
+// REACTIVATE PROJECT (sets ACTIVE again — staff assignments must be re-added manually)
+app.patch('/api/v1/projects/:projectCode/reactivate', async (req, res) => {
+  const { projectCode } = req.params;
+  const { editorId } = req.body;
+  if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
+  try {
+    const editorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [editorId]);
+    if (editorCheck.rows.length === 0 || !userIsManagerial(editorCheck.rows[0])) {
+      return res.status(403).json({ error: 'Access Denied.' });
+    }
+    const code = projectCode.toUpperCase().trim();
+    const result = await db.query(
+      `UPDATE projects SET status = 'ACTIVE' WHERE project_code = $1 RETURNING *`,
+      [code]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
+    res.status(200).json({ success: true, message: `Project ${code} reactivated.`, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to reactivate project.', detail: error.message });
+  }
+});
+
 app.get('/api/v1/users', async (req, res) => {
   const role = normalizeRole(req.query.role);
 
