@@ -684,6 +684,26 @@ app.patch('/api/v1/account-manager/approve-staff-registration', async (req, res)
   }
 });
 
+// Account Manager: history of staff registrations already decided (active/rejected)
+app.get('/api/v1/account-manager/staff-registration-history', async (req, res) => {
+  const { requesterId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'account_manager', res)) return;
+  try {
+    const result = await db.query(
+      `SELECT user_id, full_name, email, account_status, created_at
+       FROM users
+       WHERE account_status IN ('active', 'rejected')
+         AND (LOWER(user_role::text) = 'staff'
+              OR (user_roles @> ARRAY['staff'] AND NOT (user_roles && ARRAY['manager','account_manager','hr'])))
+       ORDER BY created_at DESC
+       LIMIT 200`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch staff registration history.', detail: err.message });
+  }
+});
+
 // GET reset history (approved/rejected)
 app.get('/api/v1/admin/reset-history', async (req, res) => {
   const { adminId } = req.query;
