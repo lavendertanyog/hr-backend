@@ -212,6 +212,7 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS workflow_status TEXT NOT NULL DEFAULT 'PENDING';`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reason TEXT;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;`);
+  await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reviewed_by UUID REFERENCES users(user_id);`);
 
   // Ensure gen_random_uuid() defaults on primary key columns (in case tables were created externally without defaults)
   await db.query(`ALTER TABLE leave_applications ALTER COLUMN leave_id SET DEFAULT gen_random_uuid();`);
@@ -882,6 +883,21 @@ app.patch('/api/v1/allocations/:allocationId/account-manager-review', async (req
   }
 });
 
+// Sum of each staff member's approved weekly hour allocations, for workload-aware allocation UIs
+app.get('/api/v1/staff/workload-summary', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT user_id, COALESCE(SUM(hours_per_week), 0) AS total_hours
+       FROM hour_allocations
+       WHERE manager_status = 'APPROVED' AND account_manager_status = 'APPROVED'
+       GROUP BY user_id`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch workload summary.', detail: error.message });
+  }
+});
+
 app.get('/api/v1/allocations/:userId', async (req, res) => {
   try {
     const result = await db.query(
@@ -1333,7 +1349,8 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
           WHEN TC.raw_hours > 9.50 AND TC.out_hour >= 18 THEN ROUND((TC.raw_hours - 9.50)::numeric, 2)
           ELSE 0.00
         END,
-        remark = COALESCE($2, attendance_logs.remark)
+        remark = COALESCE($2, attendance_logs.remark),
+        status = 'CLOSED'
       FROM TimeCalculations TC
       WHERE attendance_logs.attendance_id = $1
       RETURNING attendance_logs.attendance_id, attendance_logs.daily_worktime_hours, attendance_logs.ot_hours_accrued;
@@ -1612,9 +1629,11 @@ app.get('/api/v1/manager/:supervisorId/leave-all', async (req, res) => {
     }
     const result = await db.query(
       `SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date,
-              la.workflow_status, la.reviewer_remarks, la.is_late_submission
+              la.workflow_status, la.reviewer_remarks, la.is_late_submission, la.updated_at,
+              r.full_name AS reviewer_name
        FROM leave_applications la
        JOIN users u ON la.user_id = u.user_id
+       LEFT JOIN users r ON r.user_id = la.reviewed_by
        WHERE (u.supervisor_id = $1 OR la.workflow_status != 'PENDING')
          AND la.workflow_status != 'PENDING'
        ORDER BY la.created_at DESC`,
@@ -1825,8 +1844,8 @@ app.patch('/api/v1/leave/re-review', async (req, res) => {
     const role = normalizeRole(reviewerProfile.rows[0].user_role);
     if (role === 'staff') return res.status(403).json({ error: 'Staff users cannot review leave.' });
     const result = await db.query(
-      `UPDATE leave_applications SET workflow_status = $1, reviewer_remarks = $2 WHERE leave_id = $3 RETURNING *`,
-      [action.toUpperCase(), reviewerRemarks || '', leaveId]
+      `UPDATE leave_applications SET workflow_status = $1, reviewer_remarks = $2, reviewed_by = $3, updated_at = CURRENT_TIMESTAMP WHERE leave_id = $4 RETURNING *`,
+      [action.toUpperCase(), reviewerRemarks || '', reviewerId, leaveId]
     );
     const updated = result.rows[0];
     if (!updated) return res.status(404).json({ error: 'Leave request not found.' });
@@ -1873,12 +1892,12 @@ app.patch('/api/v1/leave/review', async (req, res) => {
 
    const reviewQuery = `
       UPDATE leave_applications
-      SET workflow_status = $1, reviewer_remarks = $2
-      WHERE leave_id = $3 AND workflow_status = 'PENDING'
+      SET workflow_status = $1, reviewer_remarks = $2, reviewed_by = $3, updated_at = CURRENT_TIMESTAMP
+      WHERE leave_id = $4 AND workflow_status = 'PENDING'
       RETURNING *;
     `;
 
-    const result = await db.query(reviewQuery, [action.toUpperCase(), reviewerRemarks || 'Processed via Manager Dashboard.', leaveId]);
+    const result = await db.query(reviewQuery, [action.toUpperCase(), reviewerRemarks || 'Processed via Manager Dashboard.', reviewerId, leaveId]);
     const updatedLeave = result.rows[0];
 
     if (!updatedLeave) {
@@ -2338,10 +2357,12 @@ app.get('/api/v1/projects/budget-requests/history', async (req, res) => {
     }
 
     const result = await db.query(
-      `SELECT br.*, p.project_name, u.full_name AS requester_name, u.email AS requester_email
+      `SELECT br.*, p.project_name, u.full_name AS requester_name, u.email AS requester_email,
+              r.full_name AS reviewer_name
        FROM budget_requests br
        JOIN projects p ON br.project_code = p.project_code
        LEFT JOIN users u ON u.user_id = br.user_id
+       LEFT JOIN users r ON r.user_id = br.reviewed_by
        WHERE br.status != 'PENDING'
        ORDER BY br.reviewed_at DESC NULLS LAST, br.created_at DESC`
     );
