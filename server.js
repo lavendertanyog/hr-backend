@@ -2167,8 +2167,8 @@ app.get('/api/v1/projects', async (req, res) => {
       SELECT p.project_code, p.project_name, p.account_manager_id, p.account_manager_ids, p.manager_ids,
              p.budget_hours, p.total_tracked_hours, p.status, p.created_at,
              u.full_name AS account_manager_name,
-             (SELECT array_agg(full_name ORDER BY full_name) FROM users WHERE user_id = ANY(p.account_manager_ids)) AS account_manager_names,
-             (SELECT array_agg(full_name ORDER BY full_name) FROM users WHERE user_id = ANY(p.manager_ids)) AS manager_names
+             (SELECT array_agg(full_name ORDER BY full_name) FROM users WHERE user_id = ANY(p.account_manager_ids::uuid[])) AS account_manager_names,
+             (SELECT array_agg(full_name ORDER BY full_name) FROM users WHERE user_id = ANY(p.manager_ids::uuid[])) AS manager_names
       FROM projects p
       LEFT JOIN users u ON u.user_id = p.account_manager_id
       ORDER BY p.created_at DESC
@@ -2596,7 +2596,7 @@ app.get('/api/v1/account-manager/:userId/my-projects', async (req, res) => {
     const projectsRes = await db.query(
       `SELECT p.project_code, p.project_name, p.budget_hours, p.status, p.created_at
        FROM projects p
-       WHERE $1 = ANY(p.account_manager_ids) OR p.account_manager_id = $1
+       WHERE p.account_manager_id = $1::uuid OR $1::uuid = ANY(p.account_manager_ids::uuid[])
        ORDER BY p.project_code ASC`,
       [userId]
     );
@@ -2869,9 +2869,9 @@ app.get('/api/v1/manager/:managerId/my-projects', async (req, res) => {
   try {
     const result = await db.query(
       `SELECT project_code, project_name, status,
-              CASE WHEN $1 = ANY(account_manager_ids) OR account_manager_id = $1 THEN 'account_manager' ELSE 'manager' END AS my_role
+              CASE WHEN account_manager_id = $1::uuid OR $1::uuid = ANY(account_manager_ids::uuid[]) THEN 'account_manager' ELSE 'manager' END AS my_role
        FROM projects
-       WHERE $1 = ANY(account_manager_ids) OR account_manager_id = $1 OR $1 = ANY(manager_ids)
+       WHERE account_manager_id = $1::uuid OR $1::uuid = ANY(account_manager_ids::uuid[]) OR $1::uuid = ANY(manager_ids::uuid[])
        ORDER BY project_code ASC`,
       [managerId]
     );
