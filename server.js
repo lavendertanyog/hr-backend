@@ -1369,8 +1369,7 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
           WHEN TC.raw_hours > 9.50 AND TC.out_hour >= 18 THEN ROUND((TC.raw_hours - 9.50)::numeric, 2)
           ELSE 0.00
         END,
-        remark = COALESCE($2, attendance_logs.remark),
-        status = 'CLOSED'
+        remark = COALESCE($2, attendance_logs.remark)
       FROM TimeCalculations TC
       WHERE attendance_logs.attendance_id = $1
       RETURNING attendance_logs.attendance_id, attendance_logs.daily_worktime_hours, attendance_logs.ot_hours_accrued;
