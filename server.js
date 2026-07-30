@@ -175,6 +175,13 @@ async function ensureOperationalTables() {
   // Projects: support multiple managers
   await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS manager_ids TEXT[] DEFAULT '{}';`);
 
+  // Projects: support multiple Account Managers as its own field, separate from manager_ids
+  await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS account_manager_ids TEXT[] DEFAULT '{}';`);
+  await db.query(`
+    UPDATE projects SET account_manager_ids = ARRAY[account_manager_id]
+    WHERE (account_manager_ids IS NULL OR account_manager_ids = '{}') AND account_manager_id IS NOT NULL;
+  `);
+
   // Projects: status column
   await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ACTIVE';`);
 
@@ -1513,12 +1520,13 @@ app.patch('/api/v1/account-manager/projects/allocate-budget', async (req, res) =
   }
 
   try {
-    const projectCheck = await db.query('SELECT account_manager_id FROM projects WHERE project_code = $1', [projectCode]);
+    const projectCheck = await db.query('SELECT account_manager_id, account_manager_ids FROM projects WHERE project_code = $1', [projectCode]);
     if (projectCheck.rows.length === 0) {
       return res.status(404).json({ error: `Project reference lookup failed for code: ${projectCode}` });
     }
 
-    if (projectCheck.rows[0].account_manager_id !== accountManagerId) {
+    const amIds = projectCheck.rows[0].account_manager_ids || [];
+    if (!amIds.includes(accountManagerId) && projectCheck.rows[0].account_manager_id !== accountManagerId) {
       return res.status(403).json({ error: "Access Denied: You are not designated as the Account Manager managing this project matrix." });
     }
 
@@ -2117,9 +2125,11 @@ app.post('/api/v1/projects/progress-baseline/apply', async (req, res) => {
 app.get('/api/v1/projects', async (req, res) => {
   try {
     const result = await db.query(`
-      SELECT p.project_code, p.project_name, p.account_manager_id, p.manager_ids,
+      SELECT p.project_code, p.project_name, p.account_manager_id, p.account_manager_ids, p.manager_ids,
              p.budget_hours, p.total_tracked_hours, p.status, p.created_at,
-             u.full_name AS account_manager_name
+             u.full_name AS account_manager_name,
+             (SELECT array_agg(full_name ORDER BY full_name) FROM users WHERE user_id = ANY(p.account_manager_ids)) AS account_manager_names,
+             (SELECT array_agg(full_name ORDER BY full_name) FROM users WHERE user_id = ANY(p.manager_ids)) AS manager_names
       FROM projects p
       LEFT JOIN users u ON u.user_id = p.account_manager_id
       ORDER BY p.created_at DESC
@@ -2143,8 +2153,48 @@ app.get('/api/v1/projects/suggestions', async (req, res) => {
   }
 });
 
+// Replaces a project's account_manager/manager project_assignments rows with the given sets
+// (staff assignments are left untouched). This is the write-path for keeping the
+// per-project role roster (used by the Org Tree, Team pages, etc.) in sync with
+// whatever HR picks on the Project Codes form or the Users page "Project Roles" modal.
+async function syncProjectRoleAssignments(projectCode, { accountManagerIds = [], managerIds = [] }, assignedBy) {
+  const code = projectCode.toUpperCase().trim();
+  await db.query(
+    `DELETE FROM project_assignments WHERE project_code = $1 AND project_role IN ('account_manager', 'manager')`,
+    [code]
+  );
+  const rows = [
+    ...accountManagerIds.map((id) => ({ id, role: 'account_manager' })),
+    ...managerIds.map((id) => ({ id, role: 'manager' })),
+  ];
+  for (const r of rows) {
+    await db.query(
+      `INSERT INTO project_assignments (assignment_id, user_id, project_code, project_role, assigned_by)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (user_id, project_code) DO UPDATE SET project_role = EXCLUDED.project_role, assigned_by = EXCLUDED.assigned_by`,
+      [randomUUID(), r.id, code, r.role, assignedBy]
+    );
+  }
+}
+
+// Recomputes projects.account_manager_ids / manager_ids / account_manager_id from
+// project_assignments — the reverse direction of syncProjectRoleAssignments, so edits
+// made via the Users page "Project Roles" modal also show up on the Projects page.
+async function syncProjectManagerFields(projectCodes) {
+  for (const code of new Set(projectCodes.filter(Boolean).map((c) => c.toUpperCase().trim()))) {
+    await db.query(
+      `UPDATE projects p SET
+         account_manager_ids = COALESCE((SELECT array_agg(pa.user_id) FROM project_assignments pa WHERE pa.project_code = p.project_code AND pa.project_role = 'account_manager'), '{}'),
+         manager_ids = COALESCE((SELECT array_agg(pa.user_id) FROM project_assignments pa WHERE pa.project_code = p.project_code AND pa.project_role = 'manager'), '{}'),
+         account_manager_id = (SELECT pa.user_id FROM project_assignments pa WHERE pa.project_code = p.project_code AND pa.project_role = 'account_manager' ORDER BY pa.created_at ASC LIMIT 1)
+       WHERE p.project_code = $1`,
+      [code]
+    );
+  }
+}
+
 app.post('/api/v1/projects/create', async (req, res) => {
-  const { creatorId, projectCode, projectName, accountManagerId, managerIds, budgetHours } = req.body;
+  const { creatorId, projectCode, projectName, accountManagerIds, managerIds, budgetHours } = req.body;
 
   if (!creatorId || !projectCode || !projectName) {
     return res.status(400).json({ error: 'creatorId, projectCode and projectName are required.' });
@@ -2156,17 +2206,22 @@ app.post('/api/v1/projects/create', async (req, res) => {
       return res.status(403).json({ error: 'Access Denied: Only authorized HR or manager users may issue new project codes.' });
     }
 
-    const primaryManager = (Array.isArray(managerIds) && managerIds.length > 0) ? managerIds[0] : (accountManagerId || creatorId);
-    const allManagerIds = Array.isArray(managerIds) && managerIds.length > 0 ? managerIds : [primaryManager];
+    const code = projectCode.toUpperCase().trim();
+    const amIds = Array.isArray(accountManagerIds) ? accountManagerIds : [];
+    const mgrIds = Array.isArray(managerIds) ? managerIds : [];
 
     const insertResult = await db.query(
-      `INSERT INTO projects (project_code, project_name, account_manager_id, manager_ids, budget_hours, total_tracked_hours, created_at)
-       VALUES ($1, $2, $3, $4, $5, 0.00, CURRENT_TIMESTAMP)
+      `INSERT INTO projects (project_code, project_name, budget_hours, total_tracked_hours, created_at)
+       VALUES ($1, $2, $3, 0.00, CURRENT_TIMESTAMP)
        RETURNING *;`,
-      [projectCode.toUpperCase().trim(), projectName.trim(), primaryManager, allManagerIds, parseFloat(budgetHours) || 0]
+      [code, projectName.trim(), parseFloat(budgetHours) || 0]
     );
 
-    res.status(201).json({ success: true, data: insertResult.rows[0] });
+    await syncProjectRoleAssignments(code, { accountManagerIds: amIds, managerIds: mgrIds }, creatorId);
+    await syncProjectManagerFields([code]);
+
+    const finalProject = await db.query('SELECT * FROM projects WHERE project_code = $1', [code]);
+    res.status(201).json({ success: true, data: finalProject.rows[0] || insertResult.rows[0] });
   } catch (error) {
     res.status(500).json({ error: 'Failed to create project code.', detail: error.message });
   }
@@ -2175,28 +2230,36 @@ app.post('/api/v1/projects/create', async (req, res) => {
 // PATCH /api/v1/projects/:projectCode - edit an existing project
 app.patch('/api/v1/projects/:projectCode', async (req, res) => {
   const { projectCode } = req.params;
-  const { projectName, managerIds, budgetHours, editorId } = req.body;
+  const { projectName, accountManagerIds, managerIds, budgetHours, editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
   try {
     const editorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [editorId]);
     if (editorCheck.rows.length === 0 || !userIsManagerial(editorCheck.rows[0])) {
       return res.status(403).json({ error: 'Access Denied.' });
     }
+    const code = projectCode.toUpperCase().trim();
     const updates = [];
     const values = [];
     let idx = 1;
     if (projectName !== undefined) { updates.push(`project_name = $${idx++}`); values.push(projectName.trim()); }
     if (budgetHours !== undefined) { updates.push(`budget_hours = $${idx++}`); values.push(parseFloat(budgetHours) || 0); }
-    if (Array.isArray(managerIds) && managerIds.length > 0) {
-      updates.push(`account_manager_id = $${idx++}`); values.push(managerIds[0]);
-      updates.push(`manager_ids = $${idx++}`); values.push(managerIds);
+    const rolesProvided = Array.isArray(accountManagerIds) || Array.isArray(managerIds);
+    if (updates.length === 0 && !rolesProvided) return res.status(400).json({ error: 'No fields to update.' });
+
+    if (updates.length > 0) {
+      values.push(code);
+      await db.query(`UPDATE projects SET ${updates.join(', ')} WHERE project_code = $${idx}`, values);
     }
-    if (updates.length === 0) return res.status(400).json({ error: 'No fields to update.' });
-    values.push(projectCode.toUpperCase().trim());
-    const result = await db.query(
-      `UPDATE projects SET ${updates.join(', ')} WHERE project_code = $${idx} RETURNING *`,
-      values
-    );
+
+    if (rolesProvided) {
+      await syncProjectRoleAssignments(code, {
+        accountManagerIds: Array.isArray(accountManagerIds) ? accountManagerIds : [],
+        managerIds: Array.isArray(managerIds) ? managerIds : [],
+      }, editorId);
+      await syncProjectManagerFields([code]);
+    }
+
+    const result = await db.query('SELECT * FROM projects WHERE project_code = $1', [code]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
     res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
@@ -2422,6 +2485,63 @@ app.patch('/api/v1/hr/update-leave-entitlement', async (req, res) => {
   }
 });
 
+// HR: list a user's current project-role assignments (for the "Project Roles" modal)
+app.get('/api/v1/hr/user-project-roles/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { requesterId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  try {
+    const result = await db.query(
+      `SELECT pa.assignment_id, pa.project_code, pa.project_role, p.project_name
+       FROM project_assignments pa
+       LEFT JOIN projects p ON p.project_code = pa.project_code
+       WHERE pa.user_id = $1
+       ORDER BY pa.project_code ASC`,
+      [userId]
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch project roles.', detail: err.message });
+  }
+});
+
+// HR: replace a user's full set of project-role assignments in one call (the
+// "Manage Project Roles" modal Save All action), then resync every affected
+// project's account_manager_ids/manager_ids so the Projects page stays in sync.
+app.post('/api/v1/hr/set-project-roles', async (req, res) => {
+  const { requesterId, userId, assignments } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  const ALLOWED_ROLES = ['hr', 'account_manager', 'manager', 'staff'];
+  if (!userId || !Array.isArray(assignments)) {
+    return res.status(400).json({ error: 'userId and an assignments array are required.' });
+  }
+  const cleaned = assignments
+    .map((a) => ({ projectCode: String(a.projectCode || '').toUpperCase().trim(), projectRole: a.projectRole }))
+    .filter((a) => a.projectCode && ALLOWED_ROLES.includes(a.projectRole));
+
+  try {
+    const existing = await db.query('SELECT DISTINCT project_code FROM project_assignments WHERE user_id = $1', [userId]);
+    const previousCodes = existing.rows.map((r) => r.project_code);
+
+    await db.query('DELETE FROM project_assignments WHERE user_id = $1', [userId]);
+    for (const a of cleaned) {
+      await db.query(
+        `INSERT INTO project_assignments (assignment_id, user_id, project_code, project_role, assigned_by)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id, project_code) DO UPDATE SET project_role = EXCLUDED.project_role, assigned_by = EXCLUDED.assigned_by`,
+        [randomUUID(), userId, a.projectCode, a.projectRole, requesterId]
+      );
+    }
+
+    const affectedCodes = [...new Set([...previousCodes, ...cleaned.map((a) => a.projectCode)])];
+    await syncProjectManagerFields(affectedCodes);
+
+    return res.status(200).json({ success: true, data: cleaned });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update project roles.', detail: err.message });
+  }
+});
+
 // GET /api/v1/account-manager/:userId/my-projects — projects managed by this AM with team members
 app.get('/api/v1/account-manager/:userId/my-projects', async (req, res) => {
   const { userId } = req.params;
@@ -2435,7 +2555,7 @@ app.get('/api/v1/account-manager/:userId/my-projects', async (req, res) => {
     const projectsRes = await db.query(
       `SELECT p.project_code, p.project_name, p.budget_hours, p.status, p.created_at
        FROM projects p
-       WHERE p.account_manager_id = $1
+       WHERE $1 = ANY(p.account_manager_ids) OR p.account_manager_id = $1
        ORDER BY p.project_code ASC`,
       [userId]
     );
@@ -2699,6 +2819,24 @@ app.get('/api/v1/projects/utilisation-detail', async (req, res) => {
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch utilisation detail.', detail: error.message });
+  }
+});
+
+// GET /api/v1/manager/:managerId/my-projects - projects this manager/AM is in charge of (for the Team page banner)
+app.get('/api/v1/manager/:managerId/my-projects', async (req, res) => {
+  const { managerId } = req.params;
+  try {
+    const result = await db.query(
+      `SELECT project_code, project_name, status,
+              CASE WHEN $1 = ANY(account_manager_ids) OR account_manager_id = $1 THEN 'account_manager' ELSE 'manager' END AS my_role
+       FROM projects
+       WHERE $1 = ANY(account_manager_ids) OR account_manager_id = $1 OR $1 = ANY(manager_ids)
+       ORDER BY project_code ASC`,
+      [managerId]
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch your projects.', detail: error.message });
   }
 });
 
