@@ -82,6 +82,14 @@ function userIsManagerial(userRow) {
   return false;
 }
 
+// Standard date format used across all notification/inbox text (matches the "DD Mon YYYY" TO_CHAR format used elsewhere)
+function formatDateDMY(dateLike) {
+  if (!dateLike) return '';
+  const d = dateLike instanceof Date ? dateLike : new Date(dateLike);
+  if (Number.isNaN(d.getTime())) return String(dateLike);
+  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
 function deriveNameFromEmail(email) {
   const local = (email || '').split('@')[0] || '';
   return local
@@ -1183,9 +1191,8 @@ async function resolveGeospatialMetrics(lat, lng, homeCountry) {
       }
     }
 
-    const home = homeCountry.toUpperCase();
     const current = countryCode.toUpperCase();
-    const isDomestic = home.startsWith(current) || current.startsWith(home);
+    const isDomestic = current === 'SG';
 
     const travelMode = isDomestic ? 'DOMESTIC_ATTENDANCE' : 'OVERSEAS_ATTENDANCE';
 
@@ -1195,7 +1202,7 @@ async function resolveGeospatialMetrics(lat, lng, homeCountry) {
     return {
       locationName: 'Kuala Lumpur, Malaysia (Local Network Test)',
       countryCode: homeCountry,
-      travelMode: 'DOMESTIC_ATTENDANCE'
+      travelMode: String(homeCountry || '').toUpperCase() === 'SG' ? 'DOMESTIC_ATTENDANCE' : 'OVERSEAS_ATTENDANCE'
     };
   }
 }
@@ -1682,7 +1689,7 @@ app.post('/api/v1/leave/apply', async (req, res) => {
     // Notify the requester
     try {
       const notifTitle = 'Leave Request Submitted';
-      const notifBody = `You have just submitted a ${category.toLowerCase()} leave request from ${startDate} to ${endDate}. It is pending manager review.`;
+      const notifBody = `You have just submitted a ${category.toLowerCase()} leave request from ${formatDateDMY(startDate)} to ${formatDateDMY(endDate)}. It is pending manager review.`;
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, notifTitle, notifBody]);
       await sendPushToUser(userId, notifTitle, notifBody);
     } catch (_) {}
@@ -1758,7 +1765,7 @@ app.delete('/api/v1/leave/:leaveId', async (req, res) => {
 
     try {
       const cancelled = result.rows[0];
-      const message = `Your leave request from ${cancelled.start_date.toISOString().slice(0, 10)} to ${cancelled.end_date.toISOString().slice(0, 10)} has been cancelled.`;
+      const message = `Your leave request from ${formatDateDMY(cancelled.start_date)} to ${formatDateDMY(cancelled.end_date)} has been cancelled.`;
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, 'Leave Request Cancelled', message]);
     } catch (_) {}
 
@@ -2233,6 +2240,29 @@ app.get('/api/v1/projects/budget-requests', async (req, res) => {
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch pending budget requests.', detail: error.message });
+  }
+});
+
+// FETCH A STAFF MEMBER'S OWN BUDGET REQUESTS (full detail incl. justification/reviewer remarks)
+app.get('/api/v1/projects/budget-requests/mine/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const hasBudgetRequestsTable = await tableExists('public.budget_requests');
+    if (!hasBudgetRequestsTable) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    const result = await db.query(
+      `SELECT br.*, p.project_name
+       FROM budget_requests br
+       LEFT JOIN projects p ON br.project_code = p.project_code
+       WHERE br.user_id = $1
+       ORDER BY br.created_at DESC`,
+      [userId]
+    );
+    res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch your budget requests.', detail: error.message });
   }
 });
 
