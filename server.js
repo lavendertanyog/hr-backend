@@ -1275,8 +1275,9 @@ app.post('/api/v1/attendance/pre-fetch-address', async (req, res) => {
 // ROUTE: CLOCK-IN ENDPOINT 
 // ========================================================================
 app.post('/api/v1/attendance/clock-in', async (req, res) => {
-  const { userId, projectCode, latitude, longitude, isManualLocation, manualLocationText, remark } = req.body;
+  const { userId, projectCode, latitude, longitude, isManualLocation, manualLocationText, remark, clockInTime } = req.body;
   const entryType = projectCode ? 'PROJECT' : 'GENERAL';
+  const isManualEntry = Boolean(clockInTime);
 
   try {
     const userProfile = await db.query('SELECT home_office_country, user_role, user_roles FROM users WHERE user_id = $1', [userId]);
@@ -1311,17 +1312,17 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
     const insertQuery = `
       INSERT INTO attendance_logs (
         attendance_id, user_id, project_code, clock_in_time, raw_coordinates,
-        location_name, country_code, is_manual_location, travel_mode, status, entry_type, remark, created_at
+        location_name, country_code, is_manual_location, travel_mode, status, entry_type, remark, is_manual_entry, created_at
       ) VALUES (
-        $1, $2, $3, CURRENT_TIMESTAMP,
+        $1, $2, $3, COALESCE($12::timestamptz, CURRENT_TIMESTAMP),
         CASE WHEN $4::numeric IS NOT NULL AND $5::numeric IS NOT NULL
              THEN ST_SetSRID(ST_MakePoint($5::numeric, $4::numeric), 4326) ELSE NULL END,
-        $6, $7, $8, $9, 'ACTIVE', $10, $11, CURRENT_TIMESTAMP
+        $6, $7, $8, $9, 'ACTIVE', $10, $11, $13, CURRENT_TIMESTAMP
       ) RETURNING *;
     `;
 
     const result = await db.query(insertQuery, [
-      randomUUID(), userId, projectCode || null, latitude, longitude, locationName, countryCode, isManualLocation || false, travelMode, entryType, remark || null
+      randomUUID(), userId, projectCode || null, latitude, longitude, locationName, countryCode, isManualLocation || false, travelMode, entryType, remark || null, clockInTime || null, isManualEntry
     ]);
 
     res.status(201).json({ success: true, data: result.rows[0] });
@@ -1335,7 +1336,7 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
 // ROUTE: CLOCK-OUT ENDPOINT 
 // ========================================================================
 app.post('/api/v1/attendance/clock-out', async (req, res) => {
-  const { userId, attendanceId, remark } = req.body;
+  const { userId, attendanceId, remark, clockOutTime } = req.body;
 
   try {
     const logCheck = await db.query(
@@ -1352,9 +1353,9 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
         SELECT
           attendance_id,
           clock_in_time,
-          CURRENT_TIMESTAMP AS current_out,
-          EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - clock_in_time)) / 3600 AS raw_hours,
-          EXTRACT(HOUR FROM CURRENT_TIMESTAMP) AS out_hour
+          COALESCE($3::timestamptz, CURRENT_TIMESTAMP) AS current_out,
+          EXTRACT(EPOCH FROM (COALESCE($3::timestamptz, CURRENT_TIMESTAMP) - clock_in_time)) / 3600 AS raw_hours,
+          EXTRACT(HOUR FROM COALESCE($3::timestamptz, CURRENT_TIMESTAMP)) AS out_hour
         FROM attendance_logs
         WHERE attendance_id = $1
       )
@@ -1375,7 +1376,7 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
       RETURNING attendance_logs.attendance_id, attendance_logs.daily_worktime_hours, attendance_logs.ot_hours_accrued;
     `;
 
-    const result = await db.query(updateQuery, [attendanceId, remark || null]);
+    const result = await db.query(updateQuery, [attendanceId, remark || null, clockOutTime || null]);
     res.status(200).json({ success: true, data: result.rows[0] });
 
   } catch (error) {
@@ -1425,7 +1426,7 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
         attendance_id, user_id, project_code, clock_in_time, clock_out_time,
         daily_worktime_hours, ot_hours_accrued, status, entry_type, is_manual_entry, remark, created_at
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, 'CLOSED', $8, TRUE, $9, CURRENT_TIMESTAMP
+        $1, $2, $3, $4, $5, $6, $7, 'ACTIVE', $8, TRUE, $9, CURRENT_TIMESTAMP
       ) RETURNING *;
     `;
     const result = await db.query(insertQuery, [
