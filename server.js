@@ -27,7 +27,7 @@ async function sendPushToUser(userId, title, body) {
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // raised to accommodate base64-encoded MC document uploads
 
 app.get('/', (_req, res) => {
   res.status(200).json({
@@ -1163,7 +1163,7 @@ app.get('/api/v1/leave/my-requests/:userId', async (req, res) => {
 
   try {
     const result = await db.query(
-      `SELECT leave_id, category, start_date, end_date, workflow_status, reviewer_remarks, created_at
+      `SELECT leave_id, category, start_date, end_date, workflow_status, reviewer_remarks, mc_file_url, created_at
        FROM leave_applications
        WHERE user_id = $1
        ORDER BY created_at DESC`,
@@ -1649,7 +1649,7 @@ app.get('/api/v1/manager/:supervisorId/leave-all', async (req, res) => {
     }
     const result = await db.query(
       `SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date,
-              la.workflow_status, la.reviewer_remarks, la.is_late_submission, la.updated_at,
+              la.workflow_status, la.reviewer_remarks, la.is_late_submission, la.updated_at, la.mc_file_url,
               r.full_name AS reviewer_name
        FROM leave_applications la
        JOIN users u ON la.user_id = u.user_id
@@ -1676,7 +1676,7 @@ app.get('/api/v1/manager/:supervisorId/leave-pending', async (req, res) => {
     }
 
     const fetchPendingQuery = `
-      SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date, la.is_late_submission, la.workflow_status
+      SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date, la.is_late_submission, la.workflow_status, la.mc_file_url
       FROM leave_applications la
       JOIN users u ON la.user_id = u.user_id
       WHERE u.supervisor_id = $1 AND la.workflow_status = 'PENDING'
@@ -1753,7 +1753,7 @@ app.post('/api/v1/leave/apply', async (req, res) => {
 // ========================================================================
 app.patch('/api/v1/leave/:leaveId', async (req, res) => {
   const { leaveId } = req.params;
-  const { userId, category, startDate, endDate, reason } = req.body;
+  const { userId, category, startDate, endDate, reason, mcFileUrl } = req.body;
   if (!userId || !category || !startDate || !endDate) {
     return res.status(400).json({ error: 'userId, category, startDate, and endDate are required.' });
   }
@@ -1777,13 +1777,45 @@ app.patch('/api/v1/leave/:leaveId', async (req, res) => {
     if (overlapCheck.rows.length > 0) {
       return res.status(409).json({ error: 'These dates overlap with another existing leave application.' });
     }
+    const categoryUpper = category.toUpperCase();
     await db.query(
-      'UPDATE leave_applications SET category = $1, start_date = $2, end_date = $3, reason = $4, updated_at = CURRENT_TIMESTAMP WHERE leave_id = $5',
-      [category.toUpperCase(), startDate, endDate, reason || null, leaveId]
+      `UPDATE leave_applications SET category = $1, start_date = $2, end_date = $3, reason = $4,
+       mc_file_url = CASE WHEN $1 = 'SICK' THEN COALESCE($6, mc_file_url) ELSE NULL END,
+       updated_at = CURRENT_TIMESTAMP WHERE leave_id = $5`,
+      [categoryUpper, startDate, endDate, reason || null, leaveId, mcFileUrl || null]
     );
     return res.status(200).json({ success: true });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to update leave application.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: UPLOAD MC DOCUMENT FOR A SICK LEAVE (allowed regardless of status —
+// staff can attach the MC any time after applying, not just while pending)
+// ========================================================================
+app.post('/api/v1/leave/:leaveId/mc-upload', async (req, res) => {
+  const { leaveId } = req.params;
+  const { userId, mcFileUrl } = req.body;
+  if (!userId || !mcFileUrl) {
+    return res.status(400).json({ error: 'userId and mcFileUrl are required.' });
+  }
+  try {
+    const check = await db.query(
+      'SELECT leave_id, category FROM leave_applications WHERE leave_id = $1 AND user_id = $2',
+      [leaveId, userId]
+    );
+    if (!check.rows[0]) return res.status(404).json({ error: 'Leave not found.' });
+    if (check.rows[0].category !== 'SICK') {
+      return res.status(400).json({ error: 'MC upload only applies to sick leave requests.' });
+    }
+    const result = await db.query(
+      'UPDATE leave_applications SET mc_file_url = $1, updated_at = CURRENT_TIMESTAMP WHERE leave_id = $2 RETURNING leave_id, mc_file_url',
+      [mcFileUrl, leaveId]
+    );
+    return res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to upload MC document.', detail: error.message });
   }
 });
 
