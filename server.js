@@ -185,6 +185,10 @@ async function ensureOperationalTables() {
   // Projects: status column
   await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ACTIVE';`);
 
+  // Projects: start/end dates (project kickoff date and deadline/contract end date)
+  await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS start_date DATE;`);
+  await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS end_date DATE;`);
+
   // Account approval system
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status TEXT NOT NULL DEFAULT 'pending';`);
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;`);
@@ -2197,7 +2201,7 @@ app.get('/api/v1/projects', async (req, res) => {
   try {
     const result = await db.query(`
       SELECT p.project_code, p.project_name, p.account_manager_id, p.account_manager_ids, p.manager_ids,
-             p.budget_hours, p.total_tracked_hours, p.status, p.created_at,
+             p.budget_hours, p.total_tracked_hours, p.status, p.start_date, p.end_date, p.created_at,
              u.full_name AS account_manager_name,
              (SELECT array_agg(full_name ORDER BY full_name) FROM users WHERE user_id = ANY(p.account_manager_ids::uuid[])) AS account_manager_names,
              (SELECT array_agg(full_name ORDER BY full_name) FROM users WHERE user_id = ANY(p.manager_ids::uuid[])) AS manager_names
@@ -2265,7 +2269,7 @@ async function syncProjectManagerFields(projectCodes) {
 }
 
 app.post('/api/v1/projects/create', async (req, res) => {
-  const { creatorId, projectCode, projectName, accountManagerIds, managerIds, budgetHours } = req.body;
+  const { creatorId, projectCode, projectName, accountManagerIds, managerIds, budgetHours, startDate, endDate } = req.body;
 
   if (!creatorId || !projectCode || !projectName) {
     return res.status(400).json({ error: 'creatorId, projectCode and projectName are required.' });
@@ -2282,10 +2286,10 @@ app.post('/api/v1/projects/create', async (req, res) => {
     const mgrIds = Array.isArray(managerIds) ? managerIds : [];
 
     const insertResult = await db.query(
-      `INSERT INTO projects (project_code, project_name, budget_hours, total_tracked_hours, created_at)
-       VALUES ($1, $2, $3, 0.00, CURRENT_TIMESTAMP)
+      `INSERT INTO projects (project_code, project_name, budget_hours, total_tracked_hours, start_date, end_date, created_at)
+       VALUES ($1, $2, $3, 0.00, $4, $5, CURRENT_TIMESTAMP)
        RETURNING *;`,
-      [code, projectName.trim(), parseFloat(budgetHours) || 0]
+      [code, projectName.trim(), parseFloat(budgetHours) || 0, startDate || null, endDate || null]
     );
 
     await syncProjectRoleAssignments(code, { accountManagerIds: amIds, managerIds: mgrIds }, creatorId);
@@ -2301,7 +2305,7 @@ app.post('/api/v1/projects/create', async (req, res) => {
 // PATCH /api/v1/projects/:projectCode - edit an existing project
 app.patch('/api/v1/projects/:projectCode', async (req, res) => {
   const { projectCode } = req.params;
-  const { projectName, accountManagerIds, managerIds, budgetHours, editorId } = req.body;
+  const { projectName, accountManagerIds, managerIds, budgetHours, startDate, endDate, editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
   try {
     const editorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [editorId]);
@@ -2314,6 +2318,8 @@ app.patch('/api/v1/projects/:projectCode', async (req, res) => {
     let idx = 1;
     if (projectName !== undefined) { updates.push(`project_name = $${idx++}`); values.push(projectName.trim()); }
     if (budgetHours !== undefined) { updates.push(`budget_hours = $${idx++}`); values.push(parseFloat(budgetHours) || 0); }
+    if (startDate !== undefined) { updates.push(`start_date = $${idx++}`); values.push(startDate || null); }
+    if (endDate !== undefined) { updates.push(`end_date = $${idx++}`); values.push(endDate || null); }
     const rolesProvided = Array.isArray(accountManagerIds) || Array.isArray(managerIds);
     if (updates.length === 0 && !rolesProvided) return res.status(400).json({ error: 'No fields to update.' });
 
