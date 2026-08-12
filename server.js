@@ -613,8 +613,6 @@ app.get('/api/v1/hr/pending-registrations', async (req, res) => {
       `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at
        FROM users
        WHERE account_status = 'pending'
-         AND (LOWER(user_role::text) IN ('manager', 'account_manager')
-              OR user_roles && ARRAY['manager','account_manager'])
        ORDER BY created_at ASC`
     );
     return res.status(200).json({ success: true, data: result.rows });
@@ -623,7 +621,7 @@ app.get('/api/v1/hr/pending-registrations', async (req, res) => {
   }
 });
 
-// HR: approve or reject a Manager or Account Manager registration
+// HR: approve or reject any pending registration (Manager, Account Manager, or Staff)
 app.patch('/api/v1/hr/approve-registration', async (req, res) => {
   const { requesterId, userId, action } = req.body;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
@@ -631,14 +629,8 @@ app.patch('/api/v1/hr/approve-registration', async (req, res) => {
     return res.status(400).json({ error: 'userId and action (approve|reject) are required.' });
   }
   try {
-    // Verify target is a manager or account_manager
     const target = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
     if (!target.rows[0]) return res.status(404).json({ error: 'User not found.' });
-    const targetRow = target.rows[0];
-    const isManagerOrAM = userHasRole(targetRow, 'manager') || userHasRole(targetRow, 'account_manager');
-    if (!isManagerOrAM) {
-      return res.status(403).json({ error: 'HR can only approve Manager or Account Manager registrations.' });
-    }
     const newStatus = action === 'approve' ? 'active' : 'rejected';
     await db.query('UPDATE users SET account_status = $1 WHERE user_id = $2', [newStatus, userId]);
     return res.status(200).json({ success: true, message: `Account ${newStatus}.` });
