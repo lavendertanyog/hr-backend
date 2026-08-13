@@ -488,8 +488,12 @@ app.post('/api/v1/auth/login', async (req, res) => {
 // Helper: verify requester is admin
 async function requireAdmin(adminId, res) {
   if (!adminId) { res.status(400).json({ error: 'adminId is required.' }); return false; }
-  const r = await db.query('SELECT is_admin FROM users WHERE user_id = $1 LIMIT 1', [adminId]);
-  if (!r.rows[0]?.is_admin) { res.status(403).json({ error: 'Admin access required.' }); return false; }
+  const r = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1 LIMIT 1', [adminId]);
+  const row = r.rows[0];
+  if (!row || (!row.is_admin && !userHasRole(row, 'hr'))) {
+    res.status(403).json({ error: 'Admin access required.' });
+    return false;
+  }
   return true;
 }
 
