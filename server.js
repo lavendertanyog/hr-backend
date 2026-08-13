@@ -1300,7 +1300,7 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
     const homeCountry = userProfile.rows[0].home_office_country;
     let locationName = manualLocationText || 'Location unavailable';
     let countryCode = homeCountry;
-    let travelMode = 'DOMESTIC_ATTENDANCE';
+    let travelMode = String(homeCountry || '').toUpperCase() === 'SG' ? 'DOMESTIC_ATTENDANCE' : 'OVERSEAS_ATTENDANCE';
 
     if (!isManualLocation && latitude && longitude) {
       const geoData = await resolveGeospatialMetrics(latitude, longitude, homeCountry);
