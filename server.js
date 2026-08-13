@@ -1243,7 +1243,7 @@ async function resolveGeospatialMetrics(lat, lng, homeCountry) {
   } catch (error) {
     console.error('Spatial Geocoding Live Engine Warning:', error.message);
     return {
-      locationName: 'Kuala Lumpur, Malaysia (Local Network Test)',
+      locationName: 'Location unavailable',
       countryCode: homeCountry,
       travelMode: String(homeCountry || '').toUpperCase() === 'SG' ? 'DOMESTIC_ATTENDANCE' : 'OVERSEAS_ATTENDANCE'
     };
@@ -1298,7 +1298,7 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
     }
 
     const homeCountry = userProfile.rows[0].home_office_country;
-    let locationName = manualLocationText || 'Kuala Lumpur, Malaysia (Local Network Test)';
+    let locationName = manualLocationText || 'Location unavailable';
     let countryCode = homeCountry;
     let travelMode = 'DOMESTIC_ATTENDANCE';
 
