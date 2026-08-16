@@ -192,6 +192,11 @@ async function ensureOperationalTables() {
   // Account approval system
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status TEXT NOT NULL DEFAULT 'pending';`);
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;`);
+  // Tester/super-admin accounts: fully functional logins, but excluded from directory-style
+  // listings (Users page, Hierarchy, Team member lists, AM/Manager assignment dropdowns) —
+  // NOT excluded from their own transactional data (leave, attendance, progress), since those
+  // need to keep flowing to real approvers for the account to actually be usable for testing.
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN NOT NULL DEFAULT FALSE;`);
 
   // Leave applications: ensure table and all columns exist
   await db.query(`
@@ -2531,7 +2536,7 @@ app.get('/api/v1/hr/active-users', async (req, res) => {
     const result = await db.query(
       `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at, leave_entitlement_days
        FROM users
-       WHERE account_status = 'active'
+       WHERE account_status = 'active' AND NOT is_hidden
        ORDER BY full_name ASC`
     );
     return res.status(200).json({ success: true, data: result.rows });
@@ -2763,7 +2768,7 @@ app.get('/api/v1/users', async (req, res) => {
         `SELECT user_id, full_name, email, user_role::text AS user_role, user_roles, supervisor_id
          FROM users
          WHERE (LOWER(user_role::text) = $1 OR user_roles @> ARRAY[$1]::text[])
-           AND account_status = 'active'
+           AND account_status = 'active' AND NOT is_hidden
          ORDER BY full_name ASC`,
         [role]
       );
@@ -2773,6 +2778,7 @@ app.get('/api/v1/users', async (req, res) => {
     const result = await db.query(
       `SELECT user_id, full_name, email, user_role, user_roles, supervisor_id
        FROM users
+       WHERE NOT is_hidden
        ORDER BY full_name ASC`
     );
     return res.status(200).json({ success: true, data: result.rows });
