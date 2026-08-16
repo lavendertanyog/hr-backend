@@ -3235,6 +3235,46 @@ app.get('/api/v1/manager/:managerId/attendance-logs', async (req, res) => {
   }
 });
 
+// HR: attendance logs across ALL employees (unlike the manager-scoped endpoint above,
+// which is limited to direct reports)
+app.get('/api/v1/hr/attendance-logs', async (req, res) => {
+  const { requesterId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+
+  try {
+    const result = await db.query(
+      `SELECT
+         al.attendance_id,
+         al.user_id,
+         u.full_name,
+         al.project_code,
+         al.clock_in_time,
+         al.clock_out_time,
+         ST_Y(al.raw_coordinates::geometry) AS latitude,
+         ST_X(al.raw_coordinates::geometry) AS longitude,
+         al.location_name,
+         al.country_code,
+         al.is_manual_location,
+         al.travel_mode,
+         al.daily_worktime_hours,
+         al.ot_hours_accrued,
+         al.status,
+         al.entry_type,
+         al.is_manual_entry,
+         al.remark,
+         al.created_at
+       FROM attendance_logs al
+       JOIN users u ON u.user_id = al.user_id
+       ORDER BY al.created_at DESC
+       LIMIT 500`
+    );
+
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch attendance logs.', detail: error.message });
+  }
+});
+
 app.get('/api/v1/manager/:managerId/progress-logs', async (req, res) => {
   const { managerId } = req.params;
 
