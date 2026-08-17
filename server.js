@@ -1649,7 +1649,9 @@ app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
   }
   try {
     const result = await db.query(
-      `UPDATE attendance_allocations aa SET allocated_hours = $1
+      `UPDATE attendance_allocations aa
+       SET allocated_hours = $1,
+           notified_at = CASE WHEN $1 > aa.allocated_hours THEN NULL ELSE aa.notified_at END
        FROM attendance_logs al
        WHERE aa.allocation_id = $2 AND aa.attendance_id = al.attendance_id AND al.user_id = $3
        RETURNING aa.*`,
