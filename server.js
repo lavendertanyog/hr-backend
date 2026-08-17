@@ -299,6 +299,11 @@ async function ensureOperationalTables() {
   // original plan, without adding any extra steps for staff.
   await db.query(`ALTER TABLE attendance_allocations ADD COLUMN IF NOT EXISTS last_edited_at TIMESTAMPTZ;`);
   await db.query(`ALTER TABLE attendance_allocations ADD COLUMN IF NOT EXISTS edited_after_completion BOOLEAN NOT NULL DEFAULT FALSE;`);
+
+  // Time actually tracked before the most recent pause/completion — preserved across a
+  // reopen or a demotion back to PENDING (e.g. reopening a different block) so switching
+  // between projects mid-session never silently discards progress already tracked.
+  await db.query(`ALTER TABLE attendance_allocations ADD COLUMN IF NOT EXISTS accumulated_hours NUMERIC(6,2) NOT NULL DEFAULT 0;`);
 }
 
 const STANDARD_WORKDAY_HOURS = 8;
@@ -1446,8 +1451,12 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
     const attendanceRow = result.rows[0];
 
     // Close out whichever allocation was still running, and let the leftover ones stand as planned.
+    // Bank whatever time the ACTIVE block had tracked so it isn't lost on clock-out.
     await db.query(
-      `UPDATE attendance_allocations SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP
+      `UPDATE attendance_allocations
+       SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP,
+           accumulated_hours = accumulated_hours + CASE WHEN status = 'ACTIVE' AND started_at IS NOT NULL
+             THEN EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - started_at)) / 3600 ELSE 0 END
        WHERE attendance_id = $1 AND status IN ('ACTIVE', 'PENDING')`,
       [attendanceId]
     );
@@ -1561,7 +1570,7 @@ app.get('/api/v1/attendance/active-session/:userId', async (req, res) => {
     const session = result.rows[0] || null;
     if (session) {
       const allocResult = await db.query(
-        `SELECT allocation_id, attendance_id, project_code, allocated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+        `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
          FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
         [session.attendance_id]
       );
@@ -1635,7 +1644,7 @@ app.post('/api/v1/attendance/allocations', async (req, res) => {
     );
 
     const all = await db.query(
-      `SELECT allocation_id, attendance_id, project_code, allocated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
        FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
       [attendanceId]
     );
@@ -1693,8 +1702,15 @@ app.post('/api/v1/attendance/allocations/:allocationId/reopen', async (req, res)
     const row = current.rows[0];
     if (row.status !== 'COMPLETED') return res.status(400).json({ error: 'Only a completed block can be reopened.' });
 
+    // Pause whichever block is currently ACTIVE — bank the time it already tracked into
+    // accumulated_hours rather than discarding it, so resuming it later doesn't restart at zero.
     await db.query(
-      `UPDATE attendance_allocations SET status = 'PENDING' WHERE attendance_id = $1 AND status = 'ACTIVE'`,
+      `UPDATE attendance_allocations
+       SET status = 'PENDING',
+           accumulated_hours = accumulated_hours + CASE WHEN started_at IS NOT NULL
+             THEN EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - started_at)) / 3600 ELSE 0 END,
+           started_at = NULL
+       WHERE attendance_id = $1 AND status = 'ACTIVE'`,
       [row.attendance_id]
     );
     await db.query(
@@ -1706,7 +1722,7 @@ app.post('/api/v1/attendance/allocations/:allocationId/reopen', async (req, res)
     );
 
     const all = await db.query(
-      `SELECT allocation_id, attendance_id, project_code, allocated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
        FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
       [row.attendance_id]
     );
@@ -1733,7 +1749,11 @@ app.post('/api/v1/attendance/allocations/:allocationId/complete', async (req, re
     const row = current.rows[0];
 
     await db.query(
-      `UPDATE attendance_allocations SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP WHERE allocation_id = $1`,
+      `UPDATE attendance_allocations
+       SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP,
+           accumulated_hours = accumulated_hours + CASE WHEN status = 'ACTIVE' AND started_at IS NOT NULL
+             THEN EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - started_at)) / 3600 ELSE 0 END
+       WHERE allocation_id = $1`,
       [allocationId]
     );
 
@@ -1751,7 +1771,7 @@ app.post('/api/v1/attendance/allocations/:allocationId/complete', async (req, re
     }
 
     const all = await db.query(
-      `SELECT allocation_id, attendance_id, project_code, allocated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
        FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
       [row.attendance_id]
     );
@@ -3547,7 +3567,7 @@ app.get('/api/v1/manager/:managerId/attendance-logs', async (req, res) => {
          al.remark,
          al.created_at,
          COALESCE(
-           (SELECT json_agg(json_build_object('project_code', aa.project_code, 'allocated_hours', aa.allocated_hours, 'status', aa.status, 'edited_after_completion', aa.edited_after_completion, 'last_edited_at', aa.last_edited_at) ORDER BY aa.seq)
+           (SELECT json_agg(json_build_object('project_code', aa.project_code, 'allocated_hours', aa.allocated_hours, 'accumulated_hours', aa.accumulated_hours, 'status', aa.status, 'edited_after_completion', aa.edited_after_completion, 'last_edited_at', aa.last_edited_at) ORDER BY aa.seq)
             FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id),
            '[]'
          ) AS allocations
@@ -3594,7 +3614,7 @@ app.get('/api/v1/hr/attendance-logs', async (req, res) => {
          al.remark,
          al.created_at,
          COALESCE(
-           (SELECT json_agg(json_build_object('project_code', aa.project_code, 'allocated_hours', aa.allocated_hours, 'status', aa.status, 'edited_after_completion', aa.edited_after_completion, 'last_edited_at', aa.last_edited_at) ORDER BY aa.seq)
+           (SELECT json_agg(json_build_object('project_code', aa.project_code, 'allocated_hours', aa.allocated_hours, 'accumulated_hours', aa.accumulated_hours, 'status', aa.status, 'edited_after_completion', aa.edited_after_completion, 'last_edited_at', aa.last_edited_at) ORDER BY aa.seq)
             FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id),
            '[]'
          ) AS allocations
