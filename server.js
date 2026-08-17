@@ -2206,7 +2206,7 @@ app.get('/api/v1/leave/balance/:userId', async (req, res) => {
     const { userId } = req.params;
     const [usageResult, entitlementResult] = await Promise.all([
       db.query(
-        `SELECT COALESCE(SUM(end_date - start_date + 1), 0) AS used_days
+        `SELECT COALESCE(SUM(end_date::date - start_date::date + 1), 0) AS used_days
          FROM leave_applications
          WHERE user_id = $1
            AND category::TEXT IN ('ANNUAL', 'EMERGENCY')
