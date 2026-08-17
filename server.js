@@ -3117,7 +3117,7 @@ app.get('/api/v1/users', async (req, res) => {
     const result = await db.query(
       `SELECT user_id, full_name, email, user_role, user_roles, supervisor_id
        FROM users
-       WHERE NOT is_hidden
+       WHERE account_status = 'active' AND NOT is_hidden
        ORDER BY full_name ASC`
     );
     return res.status(200).json({ success: true, data: result.rows });
