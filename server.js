@@ -534,22 +534,6 @@ async function requireAdmin(adminId, res) {
   return true;
 }
 
-// TEMPORARY — clears all attendance history for one account (used for wiping QA/test-session
-// clutter off the designated tester account, not for real employee data). Remove after use.
-app.delete('/api/v1/admin/attendance-history', async (req, res) => {
-  const { adminId, email } = req.body;
-  if (!await requireAdmin(adminId, res)) return;
-  if (!email) return res.status(400).json({ error: 'email is required.' });
-  try {
-    const userRes = await db.query('SELECT user_id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1', [email]);
-    if (userRes.rows.length === 0) return res.status(404).json({ error: 'No user found with that email.' });
-    const targetId = userRes.rows[0].user_id;
-    const result = await db.query('DELETE FROM attendance_logs WHERE user_id = $1', [targetId]);
-    return res.status(200).json({ success: true, deletedRows: result.rowCount });
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to clear attendance history.', detail: err.message });
-  }
-});
 
 // GET pending accounts
 app.get('/api/v1/admin/pending-accounts', async (req, res) => {
