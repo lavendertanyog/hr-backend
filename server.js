@@ -1419,6 +1419,14 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
       return res.status(404).json({ error: 'No active clock-in entry found matching your device session state.' });
     }
 
+    if (clockOutTime) {
+      const clockIn = new Date(logCheck.rows[0].clock_in_time);
+      const clockOut = new Date(clockOutTime);
+      if (Number.isNaN(clockOut.getTime()) || clockOut <= clockIn) {
+        return res.status(400).json({ error: 'Clock-out time must be after the clock-in time.' });
+      }
+    }
+
     const updateQuery = `
       WITH TimeCalculations AS (
         SELECT
