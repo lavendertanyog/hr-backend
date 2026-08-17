@@ -275,7 +275,28 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS entry_type TEXT NOT NULL DEFAULT 'PROJECT';`);
   await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS is_manual_entry BOOLEAN NOT NULL DEFAULT FALSE;`);
   await db.query(`ALTER TABLE attendance_logs ALTER COLUMN project_code DROP NOT NULL;`);
+
+  // Multi-project time allocation per clock-in session: staff can split one session's
+  // planned hours across several projects (or General), add projects mid-session, and
+  // mark/extend individual allocations without re-splitting time already used up.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS attendance_allocations (
+      allocation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      attendance_id UUID NOT NULL REFERENCES attendance_logs(attendance_id) ON DELETE CASCADE,
+      project_code TEXT REFERENCES projects(project_code),
+      allocated_hours NUMERIC(5,2) NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      seq INTEGER NOT NULL DEFAULT 0,
+      started_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      notified_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
 }
+
+const STANDARD_WORKDAY_HOURS = 8;
+const DEFAULT_SINGLE_BLOCK_HOURS = 4;
 
 async function tableExists(tableName) {
   const result = await db.query('SELECT to_regclass($1) AS regclass', [tableName]);
@@ -1280,8 +1301,15 @@ app.post('/api/v1/attendance/pre-fetch-address', async (req, res) => {
 // ROUTE: CLOCK-IN ENDPOINT 
 // ========================================================================
 app.post('/api/v1/attendance/clock-in', async (req, res) => {
-  const { userId, projectCode, latitude, longitude, isManualLocation, manualLocationText, remark, clockInTime } = req.body;
-  const entryType = projectCode ? 'PROJECT' : 'GENERAL';
+  const { userId, projectCode, latitude, longitude, isManualLocation, manualLocationText, remark, clockInTime, allocations } = req.body;
+  // `allocations`, if provided, is [{ projectCode: string|null, allocatedHours: number }, ...] —
+  // lets staff split this session's planned hours across several projects/General up front.
+  // `projectCode` stays as the single-project fallback for older clients (mobile app, etc.).
+  const requestedProjects = Array.isArray(allocations) && allocations.length > 0
+    ? allocations
+    : [{ projectCode: projectCode || null, allocatedHours: null }];
+  const primaryProjectCode = requestedProjects[0].projectCode || null;
+  const entryType = primaryProjectCode ? 'PROJECT' : 'GENERAL';
   const isManualEntry = Boolean(clockInTime);
 
   try {
@@ -1290,15 +1318,18 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
       return res.status(404).json({ error: 'User profile not found' });
     }
 
-    // Non-managerial staff must be assigned to the project to clock in (general/non-project time is exempt)
+    // Non-managerial staff must be assigned to every requested project to clock in (General is exempt)
     const userRow = userProfile.rows[0];
-    if (entryType === 'PROJECT' && !userIsManagerial(userRow)) {
-      const assignCheck = await db.query(
-        'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
-        [userId, projectCode]
-      );
-      if (assignCheck.rows.length === 0) {
-        return res.status(403).json({ error: `You are not assigned to project ${projectCode}. Please ask your manager to assign you first.` });
+    if (!userIsManagerial(userRow)) {
+      for (const alloc of requestedProjects) {
+        if (!alloc.projectCode) continue;
+        const assignCheck = await db.query(
+          'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
+          [userId, alloc.projectCode]
+        );
+        if (assignCheck.rows.length === 0) {
+          return res.status(403).json({ error: `You are not assigned to project ${alloc.projectCode}. Please ask your manager to assign you first.` });
+        }
       }
     }
 
@@ -1327,10 +1358,34 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
     `;
 
     const result = await db.query(insertQuery, [
-      randomUUID(), userId, projectCode || null, latitude, longitude, locationName, countryCode, isManualLocation || false, travelMode, entryType, remark || null, clockInTime || null, isManualEntry
+      randomUUID(), userId, primaryProjectCode, latitude, longitude, locationName, countryCode, isManualLocation || false, travelMode, entryType, remark || null, clockInTime || null, isManualEntry
     ]);
 
-    res.status(201).json({ success: true, data: result.rows[0] });
+    const attendanceRow = result.rows[0];
+
+    // Split the planned session hours across the requested projects/General, even by default,
+    // editable afterward. First block starts ACTIVE, the rest wait as PENDING.
+    const blockCount = requestedProjects.length;
+    const defaultHoursEach = blockCount > 1
+      ? STANDARD_WORKDAY_HOURS / blockCount
+      : DEFAULT_SINGLE_BLOCK_HOURS;
+
+    const allocationRows = [];
+    for (let i = 0; i < requestedProjects.length; i++) {
+      const alloc = requestedProjects[i];
+      const hours = typeof alloc.allocatedHours === 'number' && alloc.allocatedHours > 0
+        ? alloc.allocatedHours
+        : defaultHoursEach;
+      const inserted = await db.query(
+        `INSERT INTO attendance_allocations (attendance_id, project_code, allocated_hours, status, seq, started_at)
+         VALUES ($1, $2, $3, $4, $5, CASE WHEN $4 = 'ACTIVE' THEN CURRENT_TIMESTAMP ELSE NULL END)
+         RETURNING *`,
+        [attendanceRow.attendance_id, alloc.projectCode || null, Math.round(hours * 100) / 100, i === 0 ? 'ACTIVE' : 'PENDING', i]
+      );
+      allocationRows.push(inserted.rows[0]);
+    }
+
+    res.status(201).json({ success: true, data: { ...attendanceRow, allocations: allocationRows } });
   } catch (error) {
     console.error("Database Insert Failure Error Detail:", error.message);
     res.status(500).json({ error: 'Clock-In transaction failure', detail: error.message });
@@ -1382,7 +1437,28 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
     `;
 
     const result = await db.query(updateQuery, [attendanceId, remark || null, clockOutTime || null]);
-    res.status(200).json({ success: true, data: result.rows[0] });
+    const attendanceRow = result.rows[0];
+
+    // Close out whichever allocation was still running, and let the leftover ones stand as planned.
+    await db.query(
+      `UPDATE attendance_allocations SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP
+       WHERE attendance_id = $1 AND status IN ('ACTIVE', 'PENDING')`,
+      [attendanceId]
+    );
+
+    const allocResult = await db.query(
+      `SELECT allocation_id, project_code, allocated_hours, status FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
+      [attendanceId]
+    );
+    const totalAllocated = allocResult.rows.reduce((sum, r) => sum + Number(r.allocated_hours || 0), 0);
+    const actualHours = Number(attendanceRow.daily_worktime_hours || 0);
+    const reconciliation = {
+      totalAllocatedHours: Math.round(totalAllocated * 100) / 100,
+      actualWorkedHours: actualHours,
+      mismatch: Math.round(Math.abs(totalAllocated - actualHours) * 100) / 100 > 0.1,
+    };
+
+    res.status(200).json({ success: true, data: { ...attendanceRow, allocations: allocResult.rows, reconciliation } });
 
   } catch (error) {
     res.status(500).json({ error: 'Clock-Out transaction failure', detail: error.message });
@@ -1476,9 +1552,200 @@ app.get('/api/v1/attendance/active-session/:userId', async (req, res) => {
       [userId]
     );
 
-    return res.status(200).json({ success: true, data: result.rows[0] || null });
+    const session = result.rows[0] || null;
+    if (session) {
+      const allocResult = await db.query(
+        `SELECT allocation_id, attendance_id, project_code, allocated_hours, status, seq, started_at, completed_at, notified_at
+         FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
+        [session.attendance_id]
+      );
+      session.allocations = allocResult.rows;
+    }
+
+    return res.status(200).json({ success: true, data: session });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch active attendance session.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: MULTI-PROJECT TIME ALLOCATION MANAGEMENT
+// ========================================================================
+
+// Add a project mid-session: splits the *remaining, unallocated* time (standard workday minus
+// hours already used up by COMPLETED blocks) evenly across the not-yet-completed blocks + the new one.
+app.post('/api/v1/attendance/allocations', async (req, res) => {
+  const { userId, attendanceId, projectCode } = req.body;
+  if (!userId || !attendanceId) {
+    return res.status(400).json({ error: 'userId and attendanceId are required.' });
+  }
+
+  try {
+    const sessionCheck = await db.query(
+      'SELECT attendance_id FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2 AND clock_out_time IS NULL',
+      [attendanceId, userId]
+    );
+    if (sessionCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'No active clock-in session found.' });
+    }
+
+    if (projectCode) {
+      const userProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
+      if (!userIsManagerial(userProfile.rows[0])) {
+        const assignCheck = await db.query(
+          'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
+          [userId, projectCode]
+        );
+        if (assignCheck.rows.length === 0) {
+          return res.status(403).json({ error: `You are not assigned to project ${projectCode}. Please ask your manager to assign you first.` });
+        }
+      }
+    }
+
+    const existing = await db.query(
+      `SELECT allocation_id, allocated_hours, status, seq FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
+      [attendanceId]
+    );
+    const completedHours = existing.rows
+      .filter((r) => r.status === 'COMPLETED')
+      .reduce((sum, r) => sum + Number(r.allocated_hours || 0), 0);
+    const openRows = existing.rows.filter((r) => r.status !== 'COMPLETED');
+    const remainingHours = Math.max(STANDARD_WORKDAY_HOURS - completedHours, 0);
+    const splitCount = openRows.length + 1;
+    const evenShare = Math.round((remainingHours / splitCount) * 100) / 100;
+    const nextSeq = existing.rows.length > 0 ? Math.max(...existing.rows.map((r) => r.seq)) + 1 : 0;
+    const hasActive = existing.rows.some((r) => r.status === 'ACTIVE');
+
+    for (const row of openRows) {
+      await db.query('UPDATE attendance_allocations SET allocated_hours = $1 WHERE allocation_id = $2', [evenShare, row.allocation_id]);
+    }
+
+    const newStatus = hasActive ? 'PENDING' : 'ACTIVE';
+    const inserted = await db.query(
+      `INSERT INTO attendance_allocations (attendance_id, project_code, allocated_hours, status, seq, started_at)
+       VALUES ($1, $2, $3, $4, $5, CASE WHEN $4 = 'ACTIVE' THEN CURRENT_TIMESTAMP ELSE NULL END)
+       RETURNING *`,
+      [attendanceId, projectCode || null, evenShare, newStatus, nextSeq]
+    );
+
+    const all = await db.query(
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, status, seq, started_at, completed_at, notified_at
+       FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
+      [attendanceId]
+    );
+
+    res.status(201).json({ success: true, data: { newAllocation: inserted.rows[0], allocations: all.rows } });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to add project allocation.', detail: error.message });
+  }
+});
+
+// Direct manual edit — "editable at every stage" — overwrite one allocation's planned hours.
+app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
+  const { allocationId } = req.params;
+  const { userId, allocatedHours } = req.body;
+  if (!userId || typeof allocatedHours !== 'number' || allocatedHours <= 0) {
+    return res.status(400).json({ error: 'userId and a positive allocatedHours are required.' });
+  }
+  try {
+    const result = await db.query(
+      `UPDATE attendance_allocations aa SET allocated_hours = $1
+       FROM attendance_logs al
+       WHERE aa.allocation_id = $2 AND aa.attendance_id = al.attendance_id AND al.user_id = $3
+       RETURNING aa.*`,
+      [Math.round(allocatedHours * 100) / 100, allocationId, userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Allocation not found.' });
+    }
+    res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update allocation.', detail: error.message });
+  }
+});
+
+// Work finished before the time budget ran out — close this block now and hand off to the next one.
+app.post('/api/v1/attendance/allocations/:allocationId/complete', async (req, res) => {
+  const { allocationId } = req.params;
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId is required.' });
+
+  try {
+    const current = await db.query(
+      `SELECT aa.* FROM attendance_allocations aa
+       JOIN attendance_logs al ON al.attendance_id = aa.attendance_id
+       WHERE aa.allocation_id = $1 AND al.user_id = $2`,
+      [allocationId, userId]
+    );
+    if (current.rows.length === 0) return res.status(404).json({ error: 'Allocation not found.' });
+    const row = current.rows[0];
+
+    await db.query(
+      `UPDATE attendance_allocations SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP WHERE allocation_id = $1`,
+      [allocationId]
+    );
+
+    if (row.status === 'ACTIVE') {
+      const next = await db.query(
+        `SELECT allocation_id FROM attendance_allocations WHERE attendance_id = $1 AND status = 'PENDING' ORDER BY seq ASC LIMIT 1`,
+        [row.attendance_id]
+      );
+      if (next.rows.length > 0) {
+        await db.query(
+          `UPDATE attendance_allocations SET status = 'ACTIVE', started_at = CURRENT_TIMESTAMP WHERE allocation_id = $1`,
+          [next.rows[0].allocation_id]
+        );
+      }
+    }
+
+    const all = await db.query(
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, status, seq, started_at, completed_at, notified_at
+       FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
+      [row.attendance_id]
+    );
+    res.status(200).json({ success: true, data: { allocations: all.rows } });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to complete allocation.', detail: error.message });
+  }
+});
+
+// Time ran out but staff wants more time on this project — extends the budget and re-arms the reminder.
+app.post('/api/v1/attendance/allocations/:allocationId/extend', async (req, res) => {
+  const { allocationId } = req.params;
+  const { userId, extraHours } = req.body;
+  if (!userId || typeof extraHours !== 'number' || extraHours <= 0) {
+    return res.status(400).json({ error: 'userId and a positive extraHours are required.' });
+  }
+  try {
+    const result = await db.query(
+      `UPDATE attendance_allocations aa SET allocated_hours = aa.allocated_hours + $1, notified_at = NULL
+       FROM attendance_logs al
+       WHERE aa.allocation_id = $2 AND aa.attendance_id = al.attendance_id AND al.user_id = $3
+       RETURNING aa.*`,
+      [Math.round(extraHours * 100) / 100, allocationId, userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Allocation not found.' });
+    res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to extend allocation.', detail: error.message });
+  }
+});
+
+// Mark an allocation as "reminder shown" so the frontend doesn't re-notify every poll.
+app.post('/api/v1/attendance/allocations/:allocationId/mark-notified', async (req, res) => {
+  const { allocationId } = req.params;
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId is required.' });
+  try {
+    await db.query(
+      `UPDATE attendance_allocations aa SET notified_at = CURRENT_TIMESTAMP
+       FROM attendance_logs al
+       WHERE aa.allocation_id = $1 AND aa.attendance_id = al.attendance_id AND al.user_id = $2`,
+      [allocationId, userId]
+    );
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to mark allocation as notified.', detail: error.message });
   }
 });
 
@@ -3226,7 +3493,12 @@ app.get('/api/v1/manager/:managerId/attendance-logs', async (req, res) => {
          al.entry_type,
          al.is_manual_entry,
          al.remark,
-         al.created_at
+         al.created_at,
+         COALESCE(
+           (SELECT json_agg(json_build_object('project_code', aa.project_code, 'allocated_hours', aa.allocated_hours, 'status', aa.status) ORDER BY aa.seq)
+            FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id),
+           '[]'
+         ) AS allocations
        FROM attendance_logs al
        JOIN users u ON u.user_id = al.user_id
        WHERE u.supervisor_id = $1 OR u.user_id = $1
@@ -3268,7 +3540,12 @@ app.get('/api/v1/hr/attendance-logs', async (req, res) => {
          al.entry_type,
          al.is_manual_entry,
          al.remark,
-         al.created_at
+         al.created_at,
+         COALESCE(
+           (SELECT json_agg(json_build_object('project_code', aa.project_code, 'allocated_hours', aa.allocated_hours, 'status', aa.status) ORDER BY aa.seq)
+            FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id),
+           '[]'
+         ) AS allocations
        FROM attendance_logs al
        JOIN users u ON u.user_id = al.user_id
        ORDER BY al.created_at DESC
