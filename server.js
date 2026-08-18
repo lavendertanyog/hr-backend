@@ -3434,13 +3434,23 @@ app.patch('/api/v1/projects/assignments/role', async (req, res) => {
     if (!mgrCheck.rows[0] || !userIsManagerial(mgrCheck.rows[0])) {
       return res.status(403).json({ error: 'Only manager-level users can update project roles.' });
     }
+    const code = projectCode.toUpperCase();
+    // A project has at most one Account Manager — demote any existing one when a new person takes the role.
+    if (projectRole === 'account_manager') {
+      await db.query(
+        `UPDATE project_assignments SET project_role = 'manager'
+         WHERE project_code = $1 AND project_role = 'account_manager' AND user_id != $2`,
+        [code, userId]
+      );
+    }
     const result = await db.query(
       `UPDATE project_assignments SET project_role = $1
        WHERE user_id = $2 AND project_code = $3
        RETURNING *`,
-      [projectRole, userId, projectCode.toUpperCase()]
+      [projectRole, userId, code]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Assignment not found.' });
+    await syncProjectManagerFields([code]);
     return res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to update project role.', detail: error.message });
@@ -3473,6 +3483,15 @@ app.post('/api/v1/projects/assign-bulk', async (req, res) => {
       // Default project_role: use the user's highest-privilege role that makes sense for a project
       const PROJECT_ROLE_PRIORITY = ['account_manager', 'manager', 'staff'];
       const defaultProjectRole = PROJECT_ROLE_PRIORITY.find((r) => assigneeRoles.includes(r)) || 'staff';
+
+      // A project has at most one Account Manager — demote any existing one when a new person takes the role.
+      if (defaultProjectRole === 'account_manager') {
+        await db.query(
+          `UPDATE project_assignments SET project_role = 'manager'
+           WHERE project_code = $1 AND project_role = 'account_manager' AND user_id != $2`,
+          [projectCode, userId]
+        );
+      }
 
       const r = await db.query(
         `INSERT INTO project_assignments (assignment_id, user_id, project_code, assigned_by, project_role)
