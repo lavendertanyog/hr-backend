@@ -2139,10 +2139,10 @@ app.patch('/api/v1/leave/:leaveId', async (req, res) => {
     }
     const categoryUpper = category.toUpperCase();
     await db.query(
-      `UPDATE leave_applications SET category = $1::text, start_date = $2, end_date = $3, reason = $4,
-       mc_file_url = CASE WHEN $1::text = 'SICK' THEN COALESCE($6, mc_file_url) ELSE NULL END,
+      `UPDATE leave_applications SET category = $1, start_date = $2, end_date = $3, reason = $4,
+       mc_file_url = CASE WHEN $6::text = 'SICK' THEN COALESCE($7, mc_file_url) ELSE NULL END,
        updated_at = CURRENT_TIMESTAMP WHERE leave_id = $5`,
-      [categoryUpper, startDate, endDate, reason || null, leaveId, mcFileUrl || null]
+      [categoryUpper, startDate, endDate, reason || null, leaveId, categoryUpper, mcFileUrl || null]
     );
     return res.status(200).json({ success: true });
   } catch (error) {
