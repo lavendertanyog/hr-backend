@@ -1644,7 +1644,7 @@ app.get('/api/v1/attendance/project-log/:userId', async (req, res) => {
          JOIN attendance_allocations aa ON aa.attendance_id = s.attendance_id
          WHERE s.has_allocations
        )
-       SELECT day, project_code, SUM(hours) AS hours
+       SELECT to_char(day, 'YYYY-MM-DD') AS day, project_code, SUM(hours) AS hours
        FROM (SELECT * FROM legacy UNION ALL SELECT * FROM allocated) combined
        GROUP BY day, project_code
        ORDER BY day`,
