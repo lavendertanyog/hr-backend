@@ -234,6 +234,11 @@ async function ensureOperationalTables() {
     // Column may genuinely be TEXT on some environments (no enum type exists) — safe to ignore.
   }
 
+  // Cancelling a leave now hard-deletes the row (see DELETE /api/v1/leave/:leaveId), so a
+  // CANCELLED row should never exist going forward — this sweeps up any left behind by the
+  // old soft-cancel behavior. Runs on every boot; a no-op once the backlog is cleared.
+  await db.query(`DELETE FROM leave_applications WHERE workflow_status = 'CANCELLED';`);
+
   // Ensure gen_random_uuid() defaults on primary key columns (in case tables were created externally without defaults)
   await db.query(`ALTER TABLE leave_applications ALTER COLUMN leave_id SET DEFAULT gen_random_uuid();`);
   await db.query(`ALTER TABLE notifications ALTER COLUMN notification_id SET DEFAULT gen_random_uuid();`);
