@@ -1325,8 +1325,16 @@ app.post('/api/v1/attendance/pre-fetch-address', async (req, res) => {
   }
 });
 
+// Clients (web/mobile) use the sentinel string 'GENERAL' to represent non-project work in
+// their project pickers — normalize it (and any blank value) to null before it ever reaches
+// a project_code FK column, otherwise it fails as an unrecognised project code.
+function normalizeProjectCode(code) {
+  if (!code) return null;
+  return String(code).trim().toUpperCase() === 'GENERAL' ? null : code;
+}
+
 // ========================================================================
-// ROUTE: CLOCK-IN ENDPOINT 
+// ROUTE: CLOCK-IN ENDPOINT
 // ========================================================================
 app.post('/api/v1/attendance/clock-in', async (req, res) => {
   const { userId, projectCode, latitude, longitude, isManualLocation, manualLocationText, remark, clockInTime, allocations } = req.body;
@@ -1334,8 +1342,8 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
   // lets staff split this session's planned hours across several projects/General up front.
   // `projectCode` stays as the single-project fallback for older clients (mobile app, etc.).
   const requestedProjects = Array.isArray(allocations) && allocations.length > 0
-    ? allocations
-    : [{ projectCode: projectCode || null, allocatedHours: null }];
+    ? allocations.map((a) => ({ ...a, projectCode: normalizeProjectCode(a.projectCode) }))
+    : [{ projectCode: normalizeProjectCode(projectCode), allocatedHours: null }];
   const primaryProjectCode = requestedProjects[0].projectCode || null;
   const entryType = primaryProjectCode ? 'PROJECT' : 'GENERAL';
   const isManualEntry = Boolean(clockInTime);
@@ -1509,7 +1517,8 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
 // ROUTE: MANUAL TIME ENTRY (Log Time — enter actual start/end times directly)
 // ========================================================================
 app.post('/api/v1/attendance/manual-entry', async (req, res) => {
-  const { userId, projectCode, startTime, endTime, remark } = req.body;
+  const { userId, startTime, endTime, remark } = req.body;
+  const projectCode = normalizeProjectCode(req.body.projectCode);
   const entryType = projectCode ? 'PROJECT' : 'GENERAL';
 
   if (!userId || !startTime || !endTime) {
@@ -1654,7 +1663,8 @@ app.get('/api/v1/attendance/project-log/:userId', async (req, res) => {
 // Add a project mid-session: splits the *remaining, unallocated* time (standard workday minus
 // hours already used up by COMPLETED blocks) evenly across the not-yet-completed blocks + the new one.
 app.post('/api/v1/attendance/allocations', async (req, res) => {
-  const { userId, attendanceId, projectCode } = req.body;
+  const { userId, attendanceId } = req.body;
+  const projectCode = normalizeProjectCode(req.body.projectCode);
   if (!userId || !attendanceId) {
     return res.status(400).json({ error: 'userId and attendanceId are required.' });
   }
