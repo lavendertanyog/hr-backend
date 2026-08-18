@@ -3546,6 +3546,8 @@ app.post('/api/v1/projects/assign-bulk', async (req, res) => {
       }
     }
 
+    await syncProjectManagerFields([projectCode]);
+
     return res.status(201).json({ success: true, data: results, count: results.length });
   } catch (error) {
     return res.status(500).json({ error: 'Bulk assignment failed.', detail: error.message });
@@ -3614,6 +3616,7 @@ app.delete('/api/v1/assignments/remove', async (req, res) => {
       'DELETE FROM hour_allocations WHERE user_id = $1 AND project_code = $2',
       [userId, projectCode.toUpperCase().trim()]
     );
+    await syncProjectManagerFields([projectCode]);
     return res.status(200).json({ success: true, message: `Assignment removed for ${projectCode}.` });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to remove assignment.', detail: error.message });
