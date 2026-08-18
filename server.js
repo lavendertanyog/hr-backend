@@ -535,6 +535,22 @@ async function requireAdmin(adminId, res) {
 }
 
 
+// TEMPORARY diagnostic — list valid labels for a Postgres enum type. Remove after use.
+app.get('/api/v1/admin/enum-labels', async (req, res) => {
+  const { adminId, typeName } = req.query;
+  if (!await requireAdmin(adminId, res)) return;
+  if (!typeName) return res.status(400).json({ error: 'typeName is required.' });
+  try {
+    const result = await db.query(
+      `SELECT e.enumlabel FROM pg_enum e JOIN pg_type t ON e.enumtypid = t.oid WHERE t.typname = $1 ORDER BY e.enumsortorder`,
+      [typeName]
+    );
+    return res.status(200).json({ success: true, labels: result.rows.map((r) => r.enumlabel) });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch enum labels.', detail: error.message });
+  }
+});
+
 // GET pending accounts
 app.get('/api/v1/admin/pending-accounts', async (req, res) => {
   const { adminId } = req.query;
