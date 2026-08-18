@@ -1608,6 +1608,45 @@ app.get('/api/v1/attendance/active-session/:userId', async (req, res) => {
   }
 });
 
+// Per-day, per-project worked hours for a date range — powers the staff dashboard's weekly
+// project log. Handles both multi-project sessions (via attendance_allocations) and legacy
+// single-project sessions (attendance_logs rows with no allocations at all).
+app.get('/api/v1/attendance/project-log/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { start, end } = req.query;
+  if (!start || !end) {
+    return res.status(400).json({ error: 'start and end date query params are required (YYYY-MM-DD).' });
+  }
+  try {
+    const result = await db.query(
+      `WITH sessions AS (
+         SELECT attendance_id, clock_in_time::date AS day, project_code, daily_worktime_hours,
+                EXISTS (SELECT 1 FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id) AS has_allocations
+         FROM attendance_logs al
+         WHERE al.user_id = $1 AND al.clock_in_time::date BETWEEN $2::date AND $3::date
+       ),
+       legacy AS (
+         SELECT day, COALESCE(project_code, 'General') AS project_code, COALESCE(daily_worktime_hours, 0) AS hours
+         FROM sessions WHERE NOT has_allocations
+       ),
+       allocated AS (
+         SELECT s.day, COALESCE(aa.project_code, 'General') AS project_code, COALESCE(aa.accumulated_hours, 0) AS hours
+         FROM sessions s
+         JOIN attendance_allocations aa ON aa.attendance_id = s.attendance_id
+         WHERE s.has_allocations
+       )
+       SELECT day, project_code, SUM(hours) AS hours
+       FROM (SELECT * FROM legacy UNION ALL SELECT * FROM allocated) combined
+       GROUP BY day, project_code
+       ORDER BY day`,
+      [userId, start, end]
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch project log.', detail: error.message });
+  }
+});
+
 // ========================================================================
 // ROUTE: MULTI-PROJECT TIME ALLOCATION MANAGEMENT
 // ========================================================================
