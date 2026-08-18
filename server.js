@@ -2202,10 +2202,9 @@ app.delete('/api/v1/leave/:leaveId', async (req, res) => {
 
   try {
     const result = await db.query(
-      `UPDATE leave_applications
-       SET workflow_status = 'CANCELLED', reviewer_remarks = 'Cancelled by applicant', updated_at = CURRENT_TIMESTAMP
+      `DELETE FROM leave_applications
        WHERE leave_id = $1 AND user_id = $2 AND workflow_status = 'PENDING'
-       RETURNING leave_id, user_id, category, start_date, end_date, workflow_status, reviewer_remarks`,
+       RETURNING leave_id, user_id, category, start_date, end_date`,
       [leaveId, userId]
     );
 
@@ -2215,13 +2214,13 @@ app.delete('/api/v1/leave/:leaveId', async (req, res) => {
 
     try {
       const cancelled = result.rows[0];
-      const message = `Your leave request from ${formatDateDMY(cancelled.start_date)} to ${formatDateDMY(cancelled.end_date)} has been cancelled.`;
-      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, 'Leave Request Cancelled', message]);
+      const message = `Your leave request from ${formatDateDMY(cancelled.start_date)} to ${formatDateDMY(cancelled.end_date)} has been deleted.`;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, 'Leave Request Deleted', message]);
     } catch (_) {}
 
     return res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
-    return res.status(500).json({ error: 'Failed to cancel leave application.', detail: error.message });
+    return res.status(500).json({ error: 'Failed to delete leave application.', detail: error.message });
   }
 });
 
