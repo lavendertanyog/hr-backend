@@ -3264,26 +3264,6 @@ app.patch('/api/v1/hr/remove-supervisor', async (req, res) => {
   }
 });
 
-// HR: set a user's supervisor directly — powers the global org hierarchy tree, where HR
-// assigns Managers under Account Managers and Staff under Managers regardless of who is
-// currently logged in (unlike /users/set-supervisor, which requires the caller to be the
-// supervisor themselves).
-app.patch('/api/v1/hr/set-supervisor', async (req, res) => {
-  const { requesterId, staffId, supervisorId } = req.body;
-  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
-  if (!staffId || !supervisorId) return res.status(400).json({ error: 'staffId and supervisorId are required.' });
-  try {
-    const supervisorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [supervisorId]);
-    if (supervisorCheck.rows.length === 0 || !userIsManagerial(supervisorCheck.rows[0])) {
-      return res.status(400).json({ error: 'supervisorId must belong to a Manager or Account Manager.' });
-    }
-    await db.query('UPDATE users SET supervisor_id = $1 WHERE user_id = $2', [supervisorId, staffId]);
-    res.status(200).json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to set supervisor.', detail: error.message });
-  }
-});
-
 // GET /api/v1/projects/utilisation-detail - weighted utilisation per project (for HR/manager portals)
 app.get('/api/v1/projects/utilisation-detail', async (req, res) => {
   try {
