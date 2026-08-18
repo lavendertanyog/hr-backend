@@ -2106,7 +2106,7 @@ app.post('/api/v1/leave/apply', async (req, res) => {
 // ========================================================================
 app.patch('/api/v1/leave/:leaveId', async (req, res) => {
   const { leaveId } = req.params;
-  const { userId, category, startDate, endDate, reason, mcFileUrl } = req.body;
+  const { userId, requesterId, category, startDate, endDate, reason, mcFileUrl } = req.body;
   if (!userId || !category || !startDate || !endDate) {
     return res.status(400).json({ error: 'userId, category, startDate, and endDate are required.' });
   }
@@ -2116,7 +2116,14 @@ app.patch('/api/v1/leave/:leaveId', async (req, res) => {
       [leaveId, userId]
     );
     if (!check.rows[0]) return res.status(404).json({ error: 'Leave not found.' });
-    if (check.rows[0].workflow_status !== 'PENDING') {
+
+    // Editing on someone else's behalf requires HR; the staff owner can only edit their own
+    // still-pending request. requesterId defaults to userId for the existing self-edit path.
+    const actingId = requesterId || userId;
+    const isHrEditor = actingId !== userId;
+    if (isHrEditor) {
+      if (!await requireRoleCheck(actingId, 'hr', res)) return;
+    } else if (check.rows[0].workflow_status !== 'PENDING') {
       return res.status(400).json({ error: 'Only pending leave requests can be edited.' });
     }
     // Check for overlapping dates (excluding this leave itself)
@@ -3189,6 +3196,20 @@ app.patch('/api/v1/users/remove-from-team', async (req, res) => {
   }
 });
 
+// HR: clear a staff member's supervisor regardless of who that supervisor currently is —
+// used from the Hierarchy tree, where HR isn't necessarily that supervisor themselves.
+app.patch('/api/v1/hr/remove-supervisor', async (req, res) => {
+  const { requesterId, staffId } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!staffId) return res.status(400).json({ error: 'staffId is required.' });
+  try {
+    await db.query('UPDATE users SET supervisor_id = NULL WHERE user_id = $1', [staffId]);
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to remove supervisor.', detail: error.message });
+  }
+});
+
 // GET /api/v1/projects/utilisation-detail - weighted utilisation per project (for HR/manager portals)
 app.get('/api/v1/projects/utilisation-detail', async (req, res) => {
   try {
@@ -3636,6 +3657,29 @@ app.get('/api/v1/hr/attendance-logs', async (req, res) => {
     return res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch attendance logs.', detail: error.message });
+  }
+});
+
+// HR: leave requests across ALL employees, any status — the manager-scoped endpoints only
+// surface a supervisor's own team. Gives HR the full picture needed to edit a request.
+app.get('/api/v1/hr/leave-requests', async (req, res) => {
+  const { requesterId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+
+  try {
+    const result = await db.query(
+      `SELECT la.leave_id, la.user_id, u.full_name, u.email, la.category, la.start_date, la.end_date,
+              la.reason, la.workflow_status, la.reviewer_remarks, la.is_late_submission, la.mc_file_url,
+              la.created_at, la.updated_at, r.full_name AS reviewer_name
+       FROM leave_applications la
+       JOIN users u ON la.user_id = u.user_id
+       LEFT JOIN users r ON r.user_id = la.reviewed_by
+       ORDER BY la.created_at DESC
+       LIMIT 500`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch leave requests.', detail: error.message });
   }
 });
 
