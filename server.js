@@ -223,6 +223,17 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reviewed_by UUID REFERENCES users(user_id);`);
 
+  // workflow_status is actually a Postgres enum (leave_workflow_status) on the live table, not
+  // the TEXT the ADD COLUMN IF NOT EXISTS above assumes — that ALTER is a no-op once the column
+  // already exists, so it never widens the type. The enum only had PENDING/APPROVED/REJECTED,
+  // so cancelling a leave request (DELETE /api/v1/leave/:leaveId) always 500'd. Add the missing
+  // label; ADD VALUE IF NOT EXISTS requires Postgres 12+ and is a no-op if already present.
+  try {
+    await db.query(`ALTER TYPE leave_workflow_status ADD VALUE IF NOT EXISTS 'CANCELLED';`);
+  } catch (_) {
+    // Column may genuinely be TEXT on some environments (no enum type exists) — safe to ignore.
+  }
+
   // Ensure gen_random_uuid() defaults on primary key columns (in case tables were created externally without defaults)
   await db.query(`ALTER TABLE leave_applications ALTER COLUMN leave_id SET DEFAULT gen_random_uuid();`);
   await db.query(`ALTER TABLE notifications ALTER COLUMN notification_id SET DEFAULT gen_random_uuid();`);
@@ -534,22 +545,6 @@ async function requireAdmin(adminId, res) {
   return true;
 }
 
-
-// TEMPORARY diagnostic — list valid labels for a Postgres enum type. Remove after use.
-app.get('/api/v1/admin/enum-labels', async (req, res) => {
-  const { adminId, typeName } = req.query;
-  if (!await requireAdmin(adminId, res)) return;
-  if (!typeName) return res.status(400).json({ error: 'typeName is required.' });
-  try {
-    const result = await db.query(
-      `SELECT e.enumlabel FROM pg_enum e JOIN pg_type t ON e.enumtypid = t.oid WHERE t.typname = $1 ORDER BY e.enumsortorder`,
-      [typeName]
-    );
-    return res.status(200).json({ success: true, labels: result.rows.map((r) => r.enumlabel) });
-  } catch (error) {
-    return res.status(500).json({ error: 'Failed to fetch enum labels.', detail: error.message });
-  }
-});
 
 // GET pending accounts
 app.get('/api/v1/admin/pending-accounts', async (req, res) => {
