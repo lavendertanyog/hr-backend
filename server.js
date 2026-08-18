@@ -3826,6 +3826,72 @@ app.get('/api/v1/admin/audit-logs', async (req, res) => {
   }
 });
 
+// TEMPORARY: one-off admin purge endpoint used to fully remove a single approved user
+// account and every row referencing it. HR-gated, self-contained, and removed again once used.
+app.post('/api/v1/admin/purge-user', async (req, res) => {
+  const { requesterId, email } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!email) return res.status(400).json({ error: 'email is required.' });
+  const client = await db.pool.connect();
+  try {
+    const target = await client.query('SELECT user_id FROM users WHERE lower(email) = lower($1)', [email]);
+    if (target.rows.length === 0) {
+      client.release();
+      return res.status(404).json({ error: 'No user found with that email.' });
+    }
+    const userId = target.rows[0].user_id;
+
+    await client.query('BEGIN');
+
+    // Discover every FK column across the schema that references users.user_id
+    const fkRows = await client.query(`
+      SELECT tc.table_name, kcu.column_name, rc.delete_rule
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+      JOIN information_schema.referential_constraints rc
+        ON tc.constraint_name = rc.constraint_name AND tc.table_schema = rc.constraint_schema
+      JOIN information_schema.constraint_column_usage ccu
+        ON rc.unique_constraint_name = ccu.constraint_name AND rc.unique_constraint_schema = ccu.constraint_schema
+      WHERE tc.constraint_type = 'FOREIGN KEY' AND ccu.table_name = 'users' AND ccu.column_name = 'user_id'
+    `);
+
+    const purged = [];
+    for (const row of fkRows.rows) {
+      const { table_name, column_name, delete_rule } = row;
+      if (delete_rule === 'CASCADE') continue; // handled automatically by the final DELETE
+      const ident = `"${table_name}"."${column_name}"`;
+      try {
+        const r = await client.query(`UPDATE "${table_name}" SET "${column_name}" = NULL WHERE "${column_name}" = $1`, [userId]);
+        if (r.rowCount > 0) purged.push(`nulled ${r.rowCount} row(s) in ${ident}`);
+      } catch (_) {
+        // Column is NOT NULL and can't be cleared — drop those rows instead.
+        const r = await client.query(`DELETE FROM "${table_name}" WHERE "${column_name}" = $1`, [userId]);
+        if (r.rowCount > 0) purged.push(`deleted ${r.rowCount} row(s) from ${table_name} (NOT NULL FK)`);
+      }
+    }
+
+    // Non-FK array columns that can reference a user id as text
+    const arrayCleanup = await client.query(
+      `UPDATE projects SET account_manager_ids = array_remove(account_manager_ids, $1::text),
+                            manager_ids = array_remove(manager_ids, $1::text)
+       WHERE $1::text = ANY(account_manager_ids) OR $1::text = ANY(manager_ids)`,
+      [userId]
+    );
+    if (arrayCleanup.rowCount > 0) purged.push(`cleaned ${arrayCleanup.rowCount} project array reference(s)`);
+
+    const del = await client.query('DELETE FROM users WHERE user_id = $1', [userId]);
+
+    await client.query('COMMIT');
+    client.release();
+    return res.status(200).json({ success: true, deletedUsers: del.rowCount, detail: purged });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    client.release();
+    return res.status(500).json({ error: 'Failed to purge user.', detail: error.message });
+  }
+});
+
 // In server.js
 const PORT = process.env.PORT || 5000; // Changed from 3000
 ensureOperationalTables()
