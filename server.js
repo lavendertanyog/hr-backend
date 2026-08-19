@@ -1428,25 +1428,6 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
   }
 });
 
-app.patch('/api/v1/admin/attendance-correction', async (req, res) => {
-  const { requesterId, attendanceId, clockInTime, dailyWorktimeHours, accumulatedHours } = req.body;
-  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
-  if (!attendanceId || !clockInTime) return res.status(400).json({ error: 'attendanceId and clockInTime are required.' });
-  try {
-    const logResult = await db.query(
-      'UPDATE attendance_logs SET clock_in_time = $1::timestamptz, daily_worktime_hours = $2 WHERE attendance_id = $3 RETURNING *',
-      [clockInTime, dailyWorktimeHours, attendanceId]
-    );
-    const allocResult = await db.query(
-      'UPDATE attendance_allocations SET started_at = $1::timestamptz, accumulated_hours = $2 WHERE attendance_id = $3 RETURNING *',
-      [clockInTime, accumulatedHours, attendanceId]
-    );
-    res.status(200).json({ success: true, log: logResult.rows[0], allocations: allocResult.rows });
-  } catch (error) {
-    res.status(500).json({ error: 'Correction failed.', detail: error.message });
-  }
-});
-
 // ========================================================================
 // ROUTE: CLOCK-OUT ENDPOINT
 // ========================================================================
