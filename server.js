@@ -3838,22 +3838,6 @@ app.get('/api/v1/admin/audit-logs', async (req, res) => {
   }
 });
 
-// TEMPORARY: one-off cleanup of QA-testing notifications generated on a specific account.
-app.delete('/api/v1/admin/notifications-cleanup', async (req, res) => {
-  const { requesterId, userId, titleMatch, bodyContains } = req.body;
-  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
-  if (!userId || !titleMatch) return res.status(400).json({ error: 'userId and titleMatch are required.' });
-  try {
-    const result = await db.query(
-      `DELETE FROM notifications WHERE user_id = $1 AND title = $2 AND ($3::text IS NULL OR body LIKE '%' || $3 || '%') RETURNING notification_id`,
-      [userId, titleMatch, bodyContains || null]
-    );
-    res.status(200).json({ success: true, deleted: result.rowCount });
-  } catch (error) {
-    res.status(500).json({ error: 'Cleanup failed.', detail: error.message });
-  }
-});
-
 // In server.js
 const PORT = process.env.PORT || 5000; // Changed from 3000
 ensureOperationalTables()
