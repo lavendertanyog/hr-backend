@@ -1629,10 +1629,10 @@ app.get('/api/v1/attendance/project-log/:userId', async (req, res) => {
   try {
     const result = await db.query(
       `WITH sessions AS (
-         SELECT attendance_id, clock_in_time::date AS day, project_code, daily_worktime_hours,
+         SELECT attendance_id, (clock_in_time AT TIME ZONE 'Asia/Singapore')::date AS day, project_code, daily_worktime_hours,
                 EXISTS (SELECT 1 FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id) AS has_allocations
          FROM attendance_logs al
-         WHERE al.user_id = $1 AND al.clock_in_time::date BETWEEN $2::date AND $3::date
+         WHERE al.user_id = $1 AND (al.clock_in_time AT TIME ZONE 'Asia/Singapore')::date BETWEEN $2::date AND $3::date
        ),
        legacy AS (
          SELECT day, COALESCE(project_code, 'General') AS project_code, COALESCE(daily_worktime_hours, 0) AS hours
