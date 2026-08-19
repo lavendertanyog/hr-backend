@@ -1492,11 +1492,11 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
     // Bank whatever time the ACTIVE block had tracked so it isn't lost on clock-out.
     await db.query(
       `UPDATE attendance_allocations
-       SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP,
+       SET status = 'COMPLETED', completed_at = COALESCE($2::timestamptz, CURRENT_TIMESTAMP),
            accumulated_hours = accumulated_hours + CASE WHEN status = 'ACTIVE' AND started_at IS NOT NULL
-             THEN EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - started_at)) / 3600 ELSE 0 END
+             THEN EXTRACT(EPOCH FROM (COALESCE($2::timestamptz, CURRENT_TIMESTAMP) - started_at)) / 3600 ELSE 0 END
        WHERE attendance_id = $1 AND status IN ('ACTIVE', 'PENDING')`,
-      [attendanceId]
+      [attendanceId, clockOutTime || null]
     );
 
     const allocResult = await db.query(
