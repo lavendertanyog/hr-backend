@@ -448,7 +448,7 @@ app.post('/api/v1/auth/signup', async (req, res) => {
     return res.status(201).json({
       success: true,
       pending: true,
-      message: 'Account created. Awaiting admin approval before you can sign in.',
+      message: 'Account created. Awaiting admin approval from rebecca.lau@nextan.com.sg to approve before signing in.',
       data: result.rows[0],
     });
   } catch (error) {
