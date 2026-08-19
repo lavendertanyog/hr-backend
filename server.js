@@ -1333,6 +1333,48 @@ function normalizeProjectCode(code) {
   return String(code).trim().toUpperCase() === 'GENERAL' ? null : code;
 }
 
+// A user can log more than one session on the same day (e.g. catching up on a different
+// project's hours retroactively) — that's legitimate. But two same-category (same project,
+// or both General) sessions whose time ranges overlap are almost always duplicate/redundant
+// reporting of the same wall-clock time. Rather than rejecting the newer entry outright, clip
+// its counted hours down to only the portion that isn't already covered by an existing
+// same-category session, so the same minute never gets counted twice in daily/weekly totals.
+// The clock-in/out timestamps themselves are left untouched (they're the record of what the
+// user actually entered) — only the derived hour totals are adjusted.
+async function clipOverlappingHours(userId, projectCode, startIso, endIso, excludeAttendanceId) {
+  const start = new Date(startIso);
+  const end = new Date(endIso);
+  const rawHours = Math.max((end - start) / 3600000, 0);
+
+  const others = await db.query(
+    `SELECT clock_in_time, clock_out_time FROM attendance_logs
+     WHERE user_id = $1 AND attendance_id != $2 AND clock_out_time IS NOT NULL
+       AND COALESCE(project_code, '') = COALESCE($3, '')
+       AND clock_in_time < $5 AND clock_out_time > $4`,
+    [userId, excludeAttendanceId || '00000000-0000-0000-0000-000000000000', projectCode || null, start.toISOString(), end.toISOString()]
+  );
+
+  const intervals = others.rows
+    .map((r) => [
+      new Date(Math.max(new Date(r.clock_in_time), start)),
+      new Date(Math.min(new Date(r.clock_out_time), end)),
+    ])
+    .filter(([s, e]) => e > s)
+    .sort((a, b) => a[0] - b[0]);
+
+  const merged = [];
+  for (const [s, e] of intervals) {
+    if (merged.length > 0 && s <= merged[merged.length - 1][1]) {
+      if (e > merged[merged.length - 1][1]) merged[merged.length - 1][1] = e;
+    } else {
+      merged.push([s, e]);
+    }
+  }
+  const coveredMs = merged.reduce((sum, [s, e]) => sum + (e - s), 0);
+  const clippedHours = Math.max(rawHours - coveredMs / 3600000, 0);
+  return { rawHours, clippedHours, ratio: rawHours > 0 ? clippedHours / rawHours : 1 };
+}
+
 // ========================================================================
 // ROUTE: CLOCK-IN ENDPOINT
 // ========================================================================
@@ -1428,22 +1470,22 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
   }
 });
 
-app.patch('/api/v1/admin/attendance-correction', async (req, res) => {
-  const { requesterId, attendanceId, clockInTime, dailyWorktimeHours, accumulatedHours } = req.body;
+app.delete('/api/v1/admin/attendance-history', async (req, res) => {
+  const { requesterId, userId } = req.body;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
-  if (!attendanceId || !clockInTime) return res.status(400).json({ error: 'attendanceId and clockInTime are required.' });
+  if (!userId) return res.status(400).json({ error: 'userId is required.' });
   try {
-    const logResult = await db.query(
-      'UPDATE attendance_logs SET clock_in_time = $1::timestamptz, daily_worktime_hours = $2 WHERE attendance_id = $3 RETURNING *',
-      [clockInTime, dailyWorktimeHours, attendanceId]
-    );
-    const allocResult = await db.query(
-      'UPDATE attendance_allocations SET started_at = $1::timestamptz, accumulated_hours = $2 WHERE attendance_id = $3 RETURNING *',
-      [clockInTime, accumulatedHours, attendanceId]
-    );
-    res.status(200).json({ success: true, log: logResult.rows[0], allocations: allocResult.rows });
+    const logs = await db.query('SELECT attendance_id FROM attendance_logs WHERE user_id = $1', [userId]);
+    const ids = logs.rows.map((r) => r.attendance_id);
+    let allocDeleted = 0;
+    if (ids.length > 0) {
+      const allocResult = await db.query('DELETE FROM attendance_allocations WHERE attendance_id = ANY($1::uuid[]) RETURNING allocation_id', [ids]);
+      allocDeleted = allocResult.rowCount;
+    }
+    const logResult = await db.query('DELETE FROM attendance_logs WHERE user_id = $1 RETURNING attendance_id', [userId]);
+    res.status(200).json({ success: true, deletedLogs: logResult.rowCount, deletedAllocations: allocDeleted });
   } catch (error) {
-    res.status(500).json({ error: 'Correction failed.', detail: error.message });
+    res.status(500).json({ error: 'Cleanup failed.', detail: error.message });
   }
 });
 
@@ -1455,7 +1497,7 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
 
   try {
     const logCheck = await db.query(
-      "SELECT clock_in_time FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2",
+      "SELECT clock_in_time, project_code FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2",
       [attendanceId, userId]
     );
 
@@ -1463,8 +1505,9 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
       return res.status(404).json({ error: 'No active clock-in entry found matching your device session state.' });
     }
 
+    const clockIn = new Date(logCheck.rows[0].clock_in_time);
+
     if (clockOutTime) {
-      const clockIn = new Date(logCheck.rows[0].clock_in_time);
       const clockOut = new Date(clockOutTime);
       // Manual Entry's time picker only has minute precision, so a clock-out submitted in the
       // same minute as a second-precise clock-in can look "earlier" by a few seconds — compare
@@ -1476,46 +1519,38 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
       }
     }
 
+    const currentOut = clockOutTime ? new Date(clockOutTime) : new Date();
+    const { clippedHours, ratio } = await clipOverlappingHours(
+      userId, logCheck.rows[0].project_code, clockIn.toISOString(), currentOut.toISOString(), attendanceId
+    );
+    const outHour = currentOut.getHours();
+    const dailyWorktimeHours = Math.round((clippedHours > 1 ? clippedHours - 1 : Math.max(clippedHours, 0)) * 100) / 100;
+    const otHoursAccrued = clippedHours > 9.5 && outHour >= 18 ? Math.round((clippedHours - 9.5) * 100) / 100 : 0;
+
     const updateQuery = `
-      WITH TimeCalculations AS (
-        SELECT
-          attendance_id,
-          clock_in_time,
-          COALESCE($3::timestamptz, CURRENT_TIMESTAMP) AS current_out,
-          EXTRACT(EPOCH FROM (COALESCE($3::timestamptz, CURRENT_TIMESTAMP) - clock_in_time)) / 3600 AS raw_hours,
-          EXTRACT(HOUR FROM COALESCE($3::timestamptz, CURRENT_TIMESTAMP)) AS out_hour
-        FROM attendance_logs
-        WHERE attendance_id = $1
-      )
       UPDATE attendance_logs
       SET
-        clock_out_time = TC.current_out,
-        daily_worktime_hours = CASE
-          WHEN TC.raw_hours > 1.00 THEN ROUND((TC.raw_hours - 1.00)::numeric, 2)
-          ELSE ROUND(GREATEST(TC.raw_hours, 0)::numeric, 2)
-        END,
-        ot_hours_accrued = CASE
-          WHEN TC.raw_hours > 9.50 AND TC.out_hour >= 18 THEN ROUND((TC.raw_hours - 9.50)::numeric, 2)
-          ELSE 0.00
-        END,
-        remark = COALESCE($2, attendance_logs.remark)
-      FROM TimeCalculations TC
-      WHERE attendance_logs.attendance_id = $1
-      RETURNING attendance_logs.attendance_id, attendance_logs.daily_worktime_hours, attendance_logs.ot_hours_accrued;
+        clock_out_time = $2::timestamptz,
+        daily_worktime_hours = $3,
+        ot_hours_accrued = $4,
+        remark = COALESCE($5, remark)
+      WHERE attendance_id = $1
+      RETURNING attendance_id, daily_worktime_hours, ot_hours_accrued;
     `;
 
-    const result = await db.query(updateQuery, [attendanceId, remark || null, clockOutTime || null]);
+    const result = await db.query(updateQuery, [attendanceId, currentOut.toISOString(), dailyWorktimeHours, otHoursAccrued, remark || null]);
     const attendanceRow = result.rows[0];
 
     // Close out whichever allocation was still running, and let the leftover ones stand as planned.
-    // Bank whatever time the ACTIVE block had tracked so it isn't lost on clock-out.
+    // Bank whatever time the ACTIVE block had tracked so it isn't lost on clock-out, scaled down
+    // by the same overlap ratio so double-booked time doesn't get double-counted here either.
     await db.query(
       `UPDATE attendance_allocations
-       SET status = 'COMPLETED', completed_at = COALESCE($2::timestamptz, CURRENT_TIMESTAMP),
+       SET status = 'COMPLETED', completed_at = $2::timestamptz,
            accumulated_hours = accumulated_hours + CASE WHEN status = 'ACTIVE' AND started_at IS NOT NULL
-             THEN EXTRACT(EPOCH FROM (COALESCE($2::timestamptz, CURRENT_TIMESTAMP) - started_at)) / 3600 ELSE 0 END
+             THEN EXTRACT(EPOCH FROM ($2::timestamptz - started_at)) / 3600 * $3::numeric ELSE 0 END
        WHERE attendance_id = $1 AND status IN ('ACTIVE', 'PENDING')`,
-      [attendanceId, clockOutTime || null]
+      [attendanceId, currentOut.toISOString(), ratio]
     );
 
     const allocResult = await db.query(
@@ -1570,10 +1605,10 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
       }
     }
 
-    const rawHours = (end.getTime() - start.getTime()) / (1000 * 60 * 60);
+    const { clippedHours } = await clipOverlappingHours(userId, projectCode, start.toISOString(), end.toISOString(), null);
     const outHour = end.getHours();
-    const dailyWorktimeHours = Math.round((rawHours > 1 ? rawHours - 1 : rawHours) * 100) / 100;
-    const otHoursAccrued = rawHours > 9.5 && outHour >= 18 ? Math.round((rawHours - 9.5) * 100) / 100 : 0;
+    const dailyWorktimeHours = Math.round((clippedHours > 1 ? clippedHours - 1 : Math.max(clippedHours, 0)) * 100) / 100;
+    const otHoursAccrued = clippedHours > 9.5 && outHour >= 18 ? Math.round((clippedHours - 9.5) * 100) / 100 : 0;
 
     const insertQuery = `
       INSERT INTO attendance_logs (
