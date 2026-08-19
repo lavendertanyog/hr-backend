@@ -1447,7 +1447,12 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
     if (clockOutTime) {
       const clockIn = new Date(logCheck.rows[0].clock_in_time);
       const clockOut = new Date(clockOutTime);
-      if (Number.isNaN(clockOut.getTime()) || clockOut <= clockIn) {
+      // Manual Entry's time picker only has minute precision, so a clock-out submitted in the
+      // same minute as a second-precise clock-in can look "earlier" by a few seconds — compare
+      // against the start of the clock-in's minute instead of the exact instant.
+      const clockInFloored = new Date(clockIn);
+      clockInFloored.setSeconds(0, 0);
+      if (Number.isNaN(clockOut.getTime()) || clockOut < clockInFloored) {
         return res.status(400).json({ error: 'Clock-out time must be after the clock-in time.' });
       }
     }
