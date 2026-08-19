@@ -1428,8 +1428,27 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
   }
 });
 
+app.delete('/api/v1/admin/attendance-history', async (req, res) => {
+  const { requesterId, userId } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!userId) return res.status(400).json({ error: 'userId is required.' });
+  try {
+    const logs = await db.query('SELECT attendance_id FROM attendance_logs WHERE user_id = $1', [userId]);
+    const ids = logs.rows.map((r) => r.attendance_id);
+    let allocDeleted = 0;
+    if (ids.length > 0) {
+      const allocResult = await db.query('DELETE FROM attendance_allocations WHERE attendance_id = ANY($1::uuid[]) RETURNING allocation_id', [ids]);
+      allocDeleted = allocResult.rowCount;
+    }
+    const logResult = await db.query('DELETE FROM attendance_logs WHERE user_id = $1 RETURNING attendance_id', [userId]);
+    res.status(200).json({ success: true, deletedLogs: logResult.rowCount, deletedAllocations: allocDeleted });
+  } catch (error) {
+    res.status(500).json({ error: 'Cleanup failed.', detail: error.message });
+  }
+});
+
 // ========================================================================
-// ROUTE: CLOCK-OUT ENDPOINT 
+// ROUTE: CLOCK-OUT ENDPOINT
 // ========================================================================
 app.post('/api/v1/attendance/clock-out', async (req, res) => {
   const { userId, attendanceId, remark, clockOutTime } = req.body;
