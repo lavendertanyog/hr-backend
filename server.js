@@ -1473,7 +1473,7 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
         clock_out_time = TC.current_out,
         daily_worktime_hours = CASE
           WHEN TC.raw_hours > 1.00 THEN ROUND((TC.raw_hours - 1.00)::numeric, 2)
-          ELSE ROUND(TC.raw_hours::numeric, 2)
+          ELSE ROUND(GREATEST(TC.raw_hours, 0)::numeric, 2)
         END,
         ot_hours_accrued = CASE
           WHEN TC.raw_hours > 9.50 AND TC.out_hour >= 18 THEN ROUND((TC.raw_hours - 9.50)::numeric, 2)
