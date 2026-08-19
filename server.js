@@ -1414,9 +1414,9 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
         : defaultHoursEach;
       const inserted = await db.query(
         `INSERT INTO attendance_allocations (attendance_id, project_code, allocated_hours, status, seq, started_at)
-         VALUES ($1, $2, $3, $4, $5, CASE WHEN $4 = 'ACTIVE' THEN CURRENT_TIMESTAMP ELSE NULL END)
+         VALUES ($1, $2, $3, $4, $5, CASE WHEN $4 = 'ACTIVE' THEN $6::timestamptz ELSE NULL END)
          RETURNING *`,
-        [attendanceRow.attendance_id, alloc.projectCode || null, Math.round(hours * 100) / 100, i === 0 ? 'ACTIVE' : 'PENDING', i]
+        [attendanceRow.attendance_id, alloc.projectCode || null, Math.round(hours * 100) / 100, i === 0 ? 'ACTIVE' : 'PENDING', i, attendanceRow.clock_in_time]
       );
       allocationRows.push(inserted.rows[0]);
     }
