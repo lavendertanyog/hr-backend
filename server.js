@@ -3552,9 +3552,13 @@ app.patch('/api/v1/projects/assignments/role', async (req, res) => {
 
 // POST /api/v1/projects/assign-bulk - assign multiple staff to a project at once
 app.post('/api/v1/projects/assign-bulk', async (req, res) => {
-  const { managerId, userIds, projectCode } = req.body;
+  const { managerId, userIds, projectCode, projectRole: forcedProjectRole } = req.body;
+  const VALID_PROJECT_ROLES = ['account_manager', 'manager', 'staff'];
   if (!managerId || !Array.isArray(userIds) || userIds.length === 0 || !projectCode) {
     return res.status(400).json({ error: 'managerId, userIds (array) and projectCode are required.' });
+  }
+  if (forcedProjectRole && !VALID_PROJECT_ROLES.includes(forcedProjectRole)) {
+    return res.status(400).json({ error: 'projectRole, if given, must be account_manager, manager, or staff.' });
   }
   try {
     const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
@@ -3566,16 +3570,21 @@ app.post('/api/v1/projects/assign-bulk', async (req, res) => {
 
     const results = [];
     for (const userId of userIds) {
-      // Determine project role for each user being assigned
-      // HR/AM/Manager assigns => assign as 'staff' by default unless explicitly given
-      const assigneeRow = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
-      const assigneeRoles = assigneeRow.rows[0]
-        ? (Array.isArray(assigneeRow.rows[0].user_roles) && assigneeRow.rows[0].user_roles.length > 0
-          ? assigneeRow.rows[0].user_roles : [assigneeRow.rows[0].user_role].filter(Boolean))
-        : ['staff'];
-      // Default project_role: use the user's highest-privilege role that makes sense for a project
-      const PROJECT_ROLE_PRIORITY = ['account_manager', 'manager', 'staff'];
-      const defaultProjectRole = PROJECT_ROLE_PRIORITY.find((r) => assigneeRoles.includes(r)) || 'staff';
+      let defaultProjectRole = forcedProjectRole;
+      if (!defaultProjectRole) {
+        // No explicit role given — fall back to guessing from the user's own account role.
+        // (Callers that already know the intended project role, like the Hierarchy tree's
+        // "+ Add Manager/Staff" controls, should pass projectRole directly instead of relying
+        // on this guess — using this default and correcting it with a second call let the AM
+        // demotion below fire against the guessed role instead of the real intended one.)
+        const assigneeRow = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+        const assigneeRoles = assigneeRow.rows[0]
+          ? (Array.isArray(assigneeRow.rows[0].user_roles) && assigneeRow.rows[0].user_roles.length > 0
+            ? assigneeRow.rows[0].user_roles : [assigneeRow.rows[0].user_role].filter(Boolean))
+          : ['staff'];
+        const PROJECT_ROLE_PRIORITY = ['account_manager', 'manager', 'staff'];
+        defaultProjectRole = PROJECT_ROLE_PRIORITY.find((r) => assigneeRoles.includes(r)) || 'staff';
+      }
 
       // A project has at most one Account Manager — demote any existing one when a new person takes the role.
       if (defaultProjectRole === 'account_manager') {
