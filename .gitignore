@@ -9,3 +9,5 @@ pnpm-debug.log*
 coverage/
 .DS_Store
 .next/
+local_server.log
+local_server_err.log
