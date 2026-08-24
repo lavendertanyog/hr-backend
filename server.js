@@ -14,6 +14,26 @@ if (!isRenderEnvironment) {
 const { Expo } = require('expo-server-sdk');
 const expo = new Expo();
 
+// Self-service password reset email — falls back to logging the link when no API key is
+// configured, so the flow is fully testable locally without sending real email.
+const { Resend } = require('resend');
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const RESET_EMAIL_FROM = process.env.RESET_EMAIL_FROM || 'onboarding@resend.dev';
+async function sendPasswordResetEmail(toEmail, resetUrl) {
+  if (!resend) {
+    console.log(`[password reset] No RESEND_API_KEY set — reset link for ${toEmail}: ${resetUrl}`);
+    return;
+  }
+  await resend.emails.send({
+    from: RESET_EMAIL_FROM,
+    to: toEmail,
+    subject: 'Reset your Nextan HR password',
+    html: `<p>Click the link below to reset your password. This link expires in 30 minutes.</p>
+           <p><a href="${resetUrl}">${resetUrl}</a></p>
+           <p>If you didn't request this, you can ignore this email.</p>`,
+  });
+}
+
 // Send push notification to a user via their stored Expo push token
 async function sendPushToUser(userId, title, body) {
   try {
@@ -283,6 +303,21 @@ async function ensureOperationalTables() {
     );
   `);
 
+  // Self-service "forgot password" via emailed link — separate from password_reset_requests
+  // (which is the manual, HR-approved flow used when someone can't prove email ownership).
+  // A token here proves the requester controls the inbox, so it applies immediately with no
+  // HR approval step.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      token_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      token TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
   // HR-configurable per-employee leave entitlement (replaces hardcoded 12-day balance)
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS leave_entitlement_days INTEGER NOT NULL DEFAULT 12;`);
 
@@ -490,6 +525,72 @@ app.post('/api/v1/auth/reset-password', async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ error: 'Password reset request failed.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: FORGOT PASSWORD (self-service, via emailed link)
+// ========================================================================
+// `portalUrl` is the origin of whichever portal the request came from (e.g.
+// https://hr-staff-portal.vercel.app), so the emailed link sends the user back to the same
+// portal they were trying to log into — the backend doesn't otherwise know which of the 4
+// portals a given user belongs to.
+app.post('/api/v1/auth/forgot-password', async (req, res) => {
+  const { email, portalUrl } = req.body;
+  if (!email || !portalUrl) {
+    return res.status(400).json({ error: 'Email and portalUrl are required.' });
+  }
+  const normalized = email.trim().toLowerCase();
+
+  try {
+    const userRes = await db.query('SELECT user_id FROM users WHERE LOWER(email) = $1 LIMIT 1', [normalized]);
+    const user = userRes.rows[0];
+    // Always respond success even if the email isn't found, so this endpoint can't be used
+    // to check which emails have accounts.
+    if (user) {
+      const token = randomUUID() + randomUUID();
+      await db.query(
+        `INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, CURRENT_TIMESTAMP + INTERVAL '30 minutes')`,
+        [user.user_id, token]
+      );
+      const resetUrl = `${portalUrl.replace(/\/$/, '')}/reset-password?token=${token}`;
+      await sendPasswordResetEmail(normalized, resetUrl);
+    }
+    return res.status(200).json({ success: true, message: 'If an account exists for that email, a reset link has been sent.' });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to process reset request.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: RESET PASSWORD WITH TOKEN (applies immediately — email ownership already proven)
+// ========================================================================
+app.post('/api/v1/auth/reset-password-token', async (req, res) => {
+  const { token, newPassword } = req.body;
+  if (!token || !newPassword) {
+    return res.status(400).json({ error: 'Token and newPassword are required.' });
+  }
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'New password must be at least 6 characters.' });
+  }
+
+  try {
+    const tokenRes = await db.query(
+      `SELECT token_id, user_id FROM password_reset_tokens
+       WHERE token = $1 AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP`,
+      [token]
+    );
+    const row = tokenRes.rows[0];
+    if (!row) {
+      return res.status(400).json({ error: 'This reset link is invalid or has expired. Request a new one.' });
+    }
+
+    const hash = await bcrypt.hash(newPassword, 10);
+    await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, row.user_id]);
+    await db.query('UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP WHERE token_id = $1', [row.token_id]);
+    return res.status(200).json({ success: true, message: 'Password updated. You can now log in.' });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to reset password.', detail: error.message });
   }
 });
 
