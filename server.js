@@ -327,6 +327,11 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS is_manual_entry BOOLEAN NOT NULL DEFAULT FALSE;`);
   await db.query(`ALTER TABLE attendance_logs ALTER COLUMN project_code DROP NOT NULL;`);
 
+  // "Still working?" liveness check for long-running sessions — resets each time the staff
+  // member presses Continue. Used to prompt at 4h since last confirmation and auto-clock-out
+  // at 6h, so a forgotten clock-out can't silently run overnight.
+  await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS last_activity_confirmed_at TIMESTAMPTZ;`);
+
   // Multi-project time allocation per clock-in session: staff can split one session's
   // planned hours across several projects (or General), add projects mid-session, and
   // mark/extend individual allocations without re-splitting time already used up.
@@ -1527,12 +1532,12 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
     const insertQuery = `
       INSERT INTO attendance_logs (
         attendance_id, user_id, project_code, clock_in_time, raw_coordinates,
-        location_name, country_code, is_manual_location, travel_mode, status, entry_type, remark, is_manual_entry, created_at
+        location_name, country_code, is_manual_location, travel_mode, status, entry_type, remark, is_manual_entry, created_at, last_activity_confirmed_at
       ) VALUES (
         $1, $2, $3, COALESCE($12::timestamptz, CURRENT_TIMESTAMP),
         CASE WHEN $4::numeric IS NOT NULL AND $5::numeric IS NOT NULL
              THEN ST_SetSRID(ST_MakePoint($5::numeric, $4::numeric), 4326) ELSE NULL END,
-        $6, $7, $8, $9, 'ACTIVE', $10, $11, $13, CURRENT_TIMESTAMP
+        $6, $7, $8, $9, 'ACTIVE', $10, $11, $13, CURRENT_TIMESTAMP, COALESCE($12::timestamptz, CURRENT_TIMESTAMP)
       ) RETURNING *;
     `;
 
@@ -1741,7 +1746,8 @@ app.get('/api/v1/attendance/active-session/:userId', async (req, res) => {
          is_manual_location,
          travel_mode,
          status,
-         created_at
+         created_at,
+         last_activity_confirmed_at
        FROM attendance_logs
        WHERE user_id = $1 AND status = 'ACTIVE' AND clock_out_time IS NULL
        ORDER BY created_at DESC
@@ -1762,6 +1768,25 @@ app.get('/api/v1/attendance/active-session/:userId', async (req, res) => {
     return res.status(200).json({ success: true, data: session });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch active attendance session.', detail: error.message });
+  }
+});
+
+// Staff presses "Continue" on the "Still working?" prompt — resets the 4h/6h liveness clock.
+app.post('/api/v1/attendance/:attendanceId/confirm-continue', async (req, res) => {
+  const { attendanceId } = req.params;
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId is required.' });
+  try {
+    const result = await db.query(
+      `UPDATE attendance_logs SET last_activity_confirmed_at = CURRENT_TIMESTAMP
+       WHERE attendance_id = $1 AND user_id = $2 AND status = 'ACTIVE' AND clock_out_time IS NULL
+       RETURNING attendance_id, last_activity_confirmed_at`,
+      [attendanceId, userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'No active session found matching this id.' });
+    return res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to confirm activity.', detail: error.message });
   }
 });
 
@@ -3000,8 +3025,8 @@ app.get('/api/v1/projects/budget-requests/history', async (req, res) => {
 
 // UPDATED: APPROVE/REJECT BUDGET REQUEST (Manager step — sets MANAGER_APPROVED, not final)
 app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
-  const { requestId, reviewerId, action } = req.body; 
-  
+  const { requestId, reviewerId, action } = req.body;
+
   const validActions = ['MANAGER_APPROVED', 'REJECTED', 'REFER_TO_AM'];
   if (!validActions.includes(action?.toUpperCase())) {
     return res.status(400).json({ error: "Invalid action. Must be MANAGER_APPROVED or REJECTED." });
@@ -3013,25 +3038,60 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
       return res.status(503).json({ error: 'budget_requests table is not initialized in this environment.' });
     }
 
+    // A project without an Account Manager has no one to hand the second approval step to —
+    // in that case the manager's approval is final, same effect as the AM review endpoint
+    // (bump project budget_hours + the requester's own hour_allocations, status straight to
+    // APPROVED) rather than leaving the request stuck at MANAGER_APPROVED forever.
+    let finalAction = action.toUpperCase();
+    let projectHasAM = true;
+    if (finalAction === 'MANAGER_APPROVED') {
+      const pending = await db.query('SELECT project_code FROM budget_requests WHERE request_id = $1', [requestId]);
+      if (pending.rows.length > 0) {
+        const proj = await db.query(
+          'SELECT account_manager_id, account_manager_ids FROM projects WHERE project_code = $1',
+          [pending.rows[0].project_code]
+        );
+        const amIds = proj.rows[0]?.account_manager_ids || [];
+        projectHasAM = Boolean(proj.rows[0]?.account_manager_id) || amIds.length > 0;
+        if (!projectHasAM) finalAction = 'APPROVED';
+      }
+    }
+
     const result = await db.query(
       "UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP WHERE request_id = $3 AND status = 'PENDING' RETURNING *",
-      [action.toUpperCase(), reviewerId, requestId]
+      [finalAction, reviewerId, requestId]
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: "Request not found or already processed." });
 
     const budgetRow = result.rows[0];
 
+    if (finalAction === 'APPROVED') {
+      await db.query('UPDATE projects SET budget_hours = budget_hours + $1 WHERE project_code = $2', [budgetRow.requested_hours, budgetRow.project_code]);
+      await db.query(
+        `UPDATE hour_allocations
+         SET hours_per_week = hours_per_week + $1
+         WHERE user_id = $2 AND project_code = $3
+           AND account_manager_status = 'APPROVED'`,
+        [budgetRow.requested_hours, budgetRow.user_id, budgetRow.project_code]
+      );
+    }
+
     await auditInterceptor('budget_requests', requestId, reviewerId, budgetRow);
 
     try {
       if (budgetRow.user_id) {
-        const notifTitle = action.toUpperCase() === 'MANAGER_APPROVED'
-          ? 'Request for Additional Hours — Manager Approved'
-          : 'Request for Additional Hours Rejected';
-        const notifBody = action.toUpperCase() === 'MANAGER_APPROVED'
-          ? `Your request for additional hours of ${budgetRow.requested_hours}hrs for project ${budgetRow.project_code} has been approved by your manager, and is pending Account Manager approval.`
-          : `Your request for additional hours for project ${budgetRow.project_code} has been rejected by the manager.`;
+        let notifTitle, notifBody;
+        if (finalAction === 'APPROVED') {
+          notifTitle = 'Request for Additional Hours — Fully Approved!';
+          notifBody = `Your request for additional hours of ${budgetRow.requested_hours}hrs for project ${budgetRow.project_code} has been fully approved by your manager (no Account Manager is assigned to this project).`;
+        } else if (finalAction === 'MANAGER_APPROVED') {
+          notifTitle = 'Request for Additional Hours — Manager Approved';
+          notifBody = `Your request for additional hours of ${budgetRow.requested_hours}hrs for project ${budgetRow.project_code} has been approved by your manager, and is pending Account Manager approval.`;
+        } else {
+          notifTitle = 'Request for Additional Hours Rejected';
+          notifBody = `Your request for additional hours for project ${budgetRow.project_code} has been rejected by the manager.`;
+        }
         await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [budgetRow.user_id, notifTitle, notifBody]);
         await sendPushToUser(budgetRow.user_id, notifTitle, notifBody);
       }
@@ -3134,6 +3194,34 @@ app.patch('/api/v1/hr/update-leave-entitlement', async (req, res) => {
 
 // HR: permanently delete a user and every record tied to them. Irreversible — the frontend
 // gates this behind a confirmation modal.
+// HR: edit a user's basic info (name/email) — for correcting data entry mistakes
+// (e.g. an email that doesn't actually belong to the listed staff member).
+app.patch('/api/v1/hr/users/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { requesterId, fullName, email } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!fullName || !fullName.trim()) return res.status(400).json({ error: 'Full name is required.' });
+  if (!email || !email.trim()) return res.status(400).json({ error: 'Email is required.' });
+  const normalizedEmail = email.trim().toLowerCase();
+  if (!normalizedEmail.endsWith('@nextan.com.sg')) {
+    return res.status(400).json({ error: 'Only @nextan.com.sg emails are allowed.' });
+  }
+
+  try {
+    const dupe = await db.query('SELECT user_id FROM users WHERE LOWER(email) = $1 AND user_id != $2', [normalizedEmail, userId]);
+    if (dupe.rows.length > 0) return res.status(409).json({ error: 'Another user already has this email.' });
+
+    const result = await db.query(
+      'UPDATE users SET full_name = $1, email = $2 WHERE user_id = $3 RETURNING user_id, full_name, email',
+      [fullName.trim(), normalizedEmail, userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    return res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update user.', detail: err.message });
+  }
+});
+
 app.delete('/api/v1/hr/users/:userId', async (req, res) => {
   const { userId } = req.params;
   const { requesterId } = req.body;
