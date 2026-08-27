@@ -1,5 +1,11 @@
 const dotenv = require('dotenv');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// DATE columns (OID 1082): return the raw 'YYYY-MM-DD' string instead of node-postgres's
+// default JS Date object, which is constructed in the server process's LOCAL timezone and
+// then serialized to UTC by res.json() — shifting the calendar date back a day whenever the
+// server's local timezone is ahead of UTC (e.g. Asia/Singapore, Asia/Kuala_Lumpur).
+types.setTypeParser(1082, (val) => val);
 
 const isRenderEnvironment = Boolean(process.env.RENDER) || Boolean(process.env.RENDER_SERVICE_NAME);
 if (!isRenderEnvironment) {

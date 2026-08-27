@@ -107,7 +107,9 @@ function formatDateDMY(dateLike) {
   if (!dateLike) return '';
   const d = dateLike instanceof Date ? dateLike : new Date(dateLike);
   if (Number.isNaN(d.getTime())) return String(dateLike);
-  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+  // timeZone pinned explicitly so notification text reads the same regardless of what timezone
+  // the server process itself happens to be running under (local dev vs. Render in production).
+  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Singapore' });
 }
 
 function deriveNameFromEmail(email) {
@@ -242,6 +244,15 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reason TEXT;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reviewed_by UUID REFERENCES users(user_id);`);
+  // start_date/end_date were created as TIMESTAMPTZ instead of DATE. A leave request's dates
+  // have no meaningful time-of-day or timezone component, but storing them as TIMESTAMPTZ meant
+  // "2026-09-10" got stored as midnight in the server's LOCAL timezone (e.g. 2026-09-10 00:00+08),
+  // which then displayed as the previous day everywhere the value got converted to UTC (JSON
+  // responses, notification text, etc.) — a one-day-early date shown for every leave request.
+  // Casting to DATE truncates the time/timezone component using the same session timezone that
+  // created the row, so this preserves the intended calendar date for existing rows too.
+  await db.query(`ALTER TABLE leave_applications ALTER COLUMN start_date TYPE DATE USING start_date::date;`);
+  await db.query(`ALTER TABLE leave_applications ALTER COLUMN end_date TYPE DATE USING end_date::date;`);
 
   // workflow_status is actually a Postgres enum (leave_workflow_status) on the live table, not
   // the TEXT the ADD COLUMN IF NOT EXISTS above assumes — that ALTER is a no-op once the column
@@ -288,6 +299,9 @@ async function ensureOperationalTables() {
       reviewer_remarks TEXT
     );
   `);
+  // Justification is optional in the UI ("Justification (optional)") but was created NOT NULL —
+  // submitting without one previously crashed with a 500. DROP NOT NULL is a no-op if already dropped.
+  await db.query(`ALTER TABLE budget_requests ALTER COLUMN justification DROP NOT NULL;`);
 
   // Password reset requests table
   await db.query(`
@@ -613,13 +627,19 @@ app.post('/api/v1/auth/login', async (req, res) => {
     );
     const user = result.rows[0];
     if (!user) return res.status(401).json({ error: 'No account found for this email. Please sign up first.' });
-    // Check approval status (allow null/missing = legacy active users)
+    // Check approval status (allow null/missing = legacy active users). Deny-by-default rather
+    // than checking specific statuses: previously only 'pending'/'rejected' were blocked, so a
+    // deactivated account (any other non-active status, e.g. 'inactive') could still log in —
+    // only the separate, slower verify-session poll would eventually catch it after the fact.
     const status = String(user.account_status || 'active').toLowerCase();
     if (status === 'pending') {
       return res.status(403).json({ error: 'Your account is pending admin approval. Please wait for Rebecca Lau or hr.admin@nextan.com.sg to approve your account.' });
     }
     if (status === 'rejected') {
       return res.status(403).json({ error: 'Your account registration was not approved. Please contact hr.admin@nextan.com.sg.' });
+    }
+    if (status !== 'active') {
+      return res.status(403).json({ error: 'This account is not active. Please contact hr.admin@nextan.com.sg.' });
     }
     if (!user.password_hash) {
       const hash = await bcrypt.hash(password, 10);
@@ -644,12 +664,15 @@ app.post('/api/v1/auth/login', async (req, res) => {
 // ADMIN ROUTES (is_admin = true required)
 // ========================================================================
 
-// Helper: verify requester is admin
+// Helper: verify requester is admin. Note: this used to also pass any 'hr'-role user via an
+// "|| userHasRole(row, 'hr')" fallback, which meant EVERY HR user — not just Rebecca Lau /
+// hr.admin@nextan.com.sg — had full admin access despite the frontend's own "Access Denied"
+// messaging implying otherwise. is_admin is the only real gate now.
 async function requireAdmin(adminId, res) {
   if (!adminId) { res.status(400).json({ error: 'adminId is required.' }); return false; }
   const r = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1 LIMIT 1', [adminId]);
   const row = r.rows[0];
-  if (!row || (!row.is_admin && !userHasRole(row, 'hr'))) {
+  if (!row || !row.is_admin) {
     res.status(403).json({ error: 'Admin access required.' });
     return false;
   }
@@ -768,10 +791,10 @@ async function requireRoleCheck(requesterId, role, res) {
   return row;
 }
 
-// HR: get pending Manager & Account Manager registrations
+// HR Admin only: get pending Manager & Account Manager registrations
 app.get('/api/v1/hr/pending-registrations', async (req, res) => {
   const { requesterId } = req.query;
-  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!await requireAdmin(requesterId, res)) return;
   try {
     const result = await db.query(
       `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at
@@ -785,10 +808,10 @@ app.get('/api/v1/hr/pending-registrations', async (req, res) => {
   }
 });
 
-// HR: approve or reject any pending registration (Manager, Account Manager, or Staff)
+// HR Admin only: approve or reject any pending registration (Manager, Account Manager, or Staff)
 app.patch('/api/v1/hr/approve-registration', async (req, res) => {
   const { requesterId, userId, action } = req.body;
-  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!await requireAdmin(requesterId, res)) return;
   if (!userId || !['approve', 'reject'].includes(action)) {
     return res.status(400).json({ error: 'userId and action (approve|reject) are required.' });
   }
@@ -2340,6 +2363,115 @@ app.post('/api/v1/leave/apply', async (req, res) => {
 
 // ========================================================================
 // ========================================================================
+// ROUTE: UNIFIED LEAVE WORKFLOW REVIEW (Manager Restrictions Enforced)
+// ========================================================================
+// NOTE: these MUST be registered before the generic PATCH /leave/:leaveId route below —
+// Express matches routes in registration order, and ":leaveId" is a wildcard that would
+// otherwise swallow "review" and "re-review" as if they were literal leave IDs, making
+// these handlers permanently unreachable.
+// PATCH /api/v1/leave/re-review - re-review an already-reviewed leave request
+app.patch('/api/v1/leave/re-review', async (req, res) => {
+  const { leaveId, reviewerId, action, reviewerRemarks } = req.body;
+  const validActions = ['APPROVED', 'REJECTED'];
+  if (!validActions.includes(action?.toUpperCase())) {
+    return res.status(400).json({ error: 'Invalid action. Must be APPROVED or REJECTED.' });
+  }
+  try {
+    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
+    if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
+    const role = normalizeRole(reviewerProfile.rows[0].user_role);
+    if (role === 'staff') return res.status(403).json({ error: 'Staff users cannot review leave.' });
+    const result = await db.query(
+      `UPDATE leave_applications SET workflow_status = $1, reviewer_remarks = $2, reviewed_by = $3, updated_at = CURRENT_TIMESTAMP WHERE leave_id = $4 RETURNING *`,
+      [action.toUpperCase(), reviewerRemarks || '', reviewerId, leaveId]
+    );
+    const updated = result.rows[0];
+    if (!updated) return res.status(404).json({ error: 'Leave request not found.' });
+    try {
+      const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Decision Updated (Approved)' : 'Leave Decision Updated (Rejected)';
+      const notifBody = `Your leave request has been re-reviewed and is now ${action.toLowerCase()}${reviewerRemarks ? ': ' + reviewerRemarks : '.'}`;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updated.user_id, notifTitle, notifBody]);
+    } catch (_) {}
+    res.status(200).json({ success: true, data: updated });
+  } catch (error) {
+    res.status(500).json({ error: 'Re-review failed.', detail: error.message });
+  }
+});
+
+app.patch('/api/v1/leave/review', async (req, res) => {
+  const { leaveId, reviewerId, action, reviewerRemarks } = req.body;
+
+  const approvedActions = ['APPROVED', 'REJECTED', 'FORWARD_TO_ACCOUNT_MANAGER'];
+  if (!approvedActions.includes(action?.toUpperCase())) {
+    return res.status(400).json({ error: "Invalid review action." });
+  }
+
+  try {
+    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
+    if (reviewerProfile.rows.length === 0) {
+      return res.status(404).json({ error: 'Reviewer profile not found in system directory.' });
+    }
+
+    // Block staff from approving leave; HR staff may not approve direct leave either
+    if (!userIsManagerial(reviewerProfile.rows[0])) {
+      return res.status(403).json({ error: `Access Denied: Only manager-level users can process workflow leave decisions.` });
+    }
+
+    // Verify the leave belongs to a staff member in this manager's team
+    const ownershipCheck = await db.query(
+      `SELECT la.leave_id FROM leave_applications la
+       JOIN users u ON la.user_id = u.user_id
+       WHERE la.leave_id = $1 AND u.supervisor_id = $2`,
+      [leaveId, reviewerId]
+    );
+    if (ownershipCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'This leave request does not belong to a member of your team. Use the Approvals page to manage it, or first add this staff member to your team via My Team on the Dashboard.' });
+    }
+
+   const reviewQuery = `
+      UPDATE leave_applications
+      SET workflow_status = $1, reviewer_remarks = $2, reviewed_by = $3, updated_at = CURRENT_TIMESTAMP
+      WHERE leave_id = $4 AND workflow_status = 'PENDING'
+      RETURNING *;
+    `;
+
+    const result = await db.query(reviewQuery, [action.toUpperCase(), reviewerRemarks || 'Processed via Manager Dashboard.', reviewerId, leaveId]);
+    const updatedLeave = result.rows[0];
+
+    if (!updatedLeave) {
+      return res.status(404).json({ error: 'No pending leave request found or it has already been processed.' });
+    }
+
+    await auditInterceptor('leave_applications', leaveId, reviewerId, updatedLeave);
+
+    // Notify the leave applicant
+    try {
+      const startStr = updatedLeave.start_date
+        ? new Date(updatedLeave.start_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Singapore' })
+        : '';
+      const endStr = updatedLeave.end_date
+        ? new Date(updatedLeave.end_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Singapore' })
+        : '';
+      const category = updatedLeave.category || 'ANNUAL';
+      const hasCustomRemark = reviewerRemarks && reviewerRemarks !== 'Processed via Manager Dashboard.';
+      const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Application Approved' : 'Leave Application Rejected';
+      const notifBody = action.toUpperCase() === 'APPROVED'
+        ? `${category} • ${startStr} → ${endStr} • Approved${hasCustomRemark ? '\nNote: ' + reviewerRemarks : ''}`
+        : `${category} • ${startStr} → ${endStr} • Rejected${hasCustomRemark ? '\nReason: ' + reviewerRemarks : ''}`;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updatedLeave.user_id, notifTitle, notifBody]);
+      await sendPushToUser(updatedLeave.user_id, notifTitle, notifBody);
+    } catch (_) {}
+
+    res.status(200).json({ success: true, message: `Workflow state updated successfully.`, data: updatedLeave });
+  } catch (error) {
+  // This will print the exact line and file that is failing
+  console.error("--- CRITICAL ERROR ---");
+  console.error(error);
+  res.status(500).json({ error: 'Internal system routing execution breakdown.', detail: error.message });
+}
+});
+
+// ========================================================================
 // ROUTE: EDIT PENDING LEAVE APPLICATION
 // ========================================================================
 app.patch('/api/v1/leave/:leaveId', async (req, res) => {
@@ -2475,111 +2607,6 @@ app.get('/api/v1/leave/balance/:userId', async (req, res) => {
   } catch (error) {
     return res.status(500).json({ error: 'Failed to calculate leave balance.', detail: error.message });
   }
-});
-
-// ========================================================================
-// ROUTE: UNIFIED LEAVE WORKFLOW REVIEW (Manager Restrictions Enforced) 
-// ========================================================================
-// PATCH /api/v1/leave/re-review - re-review an already-reviewed leave request
-app.patch('/api/v1/leave/re-review', async (req, res) => {
-  const { leaveId, reviewerId, action, reviewerRemarks } = req.body;
-  const validActions = ['APPROVED', 'REJECTED'];
-  if (!validActions.includes(action?.toUpperCase())) {
-    return res.status(400).json({ error: 'Invalid action. Must be APPROVED or REJECTED.' });
-  }
-  try {
-    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
-    if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
-    const role = normalizeRole(reviewerProfile.rows[0].user_role);
-    if (role === 'staff') return res.status(403).json({ error: 'Staff users cannot review leave.' });
-    const result = await db.query(
-      `UPDATE leave_applications SET workflow_status = $1, reviewer_remarks = $2, reviewed_by = $3, updated_at = CURRENT_TIMESTAMP WHERE leave_id = $4 RETURNING *`,
-      [action.toUpperCase(), reviewerRemarks || '', reviewerId, leaveId]
-    );
-    const updated = result.rows[0];
-    if (!updated) return res.status(404).json({ error: 'Leave request not found.' });
-    try {
-      const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Decision Updated (Approved)' : 'Leave Decision Updated (Rejected)';
-      const notifBody = `Your leave request has been re-reviewed and is now ${action.toLowerCase()}${reviewerRemarks ? ': ' + reviewerRemarks : '.'}`;
-      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updated.user_id, notifTitle, notifBody]);
-    } catch (_) {}
-    res.status(200).json({ success: true, data: updated });
-  } catch (error) {
-    res.status(500).json({ error: 'Re-review failed.', detail: error.message });
-  }
-});
-
-app.patch('/api/v1/leave/review', async (req, res) => {
-  const { leaveId, reviewerId, action, reviewerRemarks } = req.body;
-
-  const approvedActions = ['APPROVED', 'REJECTED', 'FORWARD_TO_ACCOUNT_MANAGER'];
-  if (!approvedActions.includes(action?.toUpperCase())) {
-    return res.status(400).json({ error: "Invalid review action." });
-  }
-
-  try {
-    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
-    if (reviewerProfile.rows.length === 0) {
-      return res.status(404).json({ error: 'Reviewer profile not found in system directory.' });
-    }
-
-    // Block staff from approving leave; HR staff may not approve direct leave either
-    if (!userIsManagerial(reviewerProfile.rows[0])) {
-      return res.status(403).json({ error: `Access Denied: Only manager-level users can process workflow leave decisions.` });
-    }
-
-    // Verify the leave belongs to a staff member in this manager's team
-    const ownershipCheck = await db.query(
-      `SELECT la.leave_id FROM leave_applications la
-       JOIN users u ON la.user_id = u.user_id
-       WHERE la.leave_id = $1 AND u.supervisor_id = $2`,
-      [leaveId, reviewerId]
-    );
-    if (ownershipCheck.rows.length === 0) {
-      return res.status(403).json({ error: 'This leave request does not belong to a member of your team. Use the Approvals page to manage it, or first add this staff member to your team via My Team on the Dashboard.' });
-    }
-
-   const reviewQuery = `
-      UPDATE leave_applications
-      SET workflow_status = $1, reviewer_remarks = $2, reviewed_by = $3, updated_at = CURRENT_TIMESTAMP
-      WHERE leave_id = $4 AND workflow_status = 'PENDING'
-      RETURNING *;
-    `;
-
-    const result = await db.query(reviewQuery, [action.toUpperCase(), reviewerRemarks || 'Processed via Manager Dashboard.', reviewerId, leaveId]);
-    const updatedLeave = result.rows[0];
-
-    if (!updatedLeave) {
-      return res.status(404).json({ error: 'No pending leave request found or it has already been processed.' });
-    }
-
-    await auditInterceptor('leave_applications', leaveId, reviewerId, updatedLeave);
-
-    // Notify the leave applicant
-    try {
-      const startStr = updatedLeave.start_date
-        ? new Date(updatedLeave.start_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
-        : '';
-      const endStr = updatedLeave.end_date
-        ? new Date(updatedLeave.end_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
-        : '';
-      const category = updatedLeave.category || 'ANNUAL';
-      const hasCustomRemark = reviewerRemarks && reviewerRemarks !== 'Processed via Manager Dashboard.';
-      const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Application Approved' : 'Leave Application Rejected';
-      const notifBody = action.toUpperCase() === 'APPROVED'
-        ? `${category} • ${startStr} → ${endStr} • Approved${hasCustomRemark ? '\nNote: ' + reviewerRemarks : ''}`
-        : `${category} • ${startStr} → ${endStr} • Rejected${hasCustomRemark ? '\nReason: ' + reviewerRemarks : ''}`;
-      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updatedLeave.user_id, notifTitle, notifBody]);
-      await sendPushToUser(updatedLeave.user_id, notifTitle, notifBody);
-    } catch (_) {}
-
-    res.status(200).json({ success: true, message: `Workflow state updated successfully.`, data: updatedLeave });
-  } catch (error) {
-  // This will print the exact line and file that is failing
-  console.error("--- CRITICAL ERROR ---");
-  console.error(error); 
-  res.status(500).json({ error: 'Internal system routing execution breakdown.', detail: error.message });
-}
 });
 
 // ========================================================================
@@ -3486,7 +3513,22 @@ app.patch('/api/v1/users/set-supervisor', async (req, res) => {
   }
   try {
     const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
-    if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
+    if (managerCheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Only manager-role users can set supervisor assignments.' });
+    }
+    // A project's org tree lets HR assign someone as that project's Manager/Account Manager
+    // regardless of their global account role (intentionally — project role is independent of
+    // account role). So eligibility here also accepts anyone holding a manager/account_manager
+    // project_role on at least one project, not just users whose global role is managerial.
+    let isEligible = userIsManagerial(managerCheck.rows[0]);
+    if (!isEligible) {
+      const projectRoleCheck = await db.query(
+        `SELECT 1 FROM project_assignments WHERE user_id = $1 AND project_role IN ('manager', 'account_manager') LIMIT 1`,
+        [managerId]
+      );
+      isEligible = projectRoleCheck.rows.length > 0;
+    }
+    if (!isEligible) {
       return res.status(403).json({ error: 'Only manager-role users can set supervisor assignments.' });
     }
     await db.query(
@@ -4119,12 +4161,49 @@ app.get('/api/v1/admin/audit-logs', async (req, res) => {
   }
 });
 
+// ========================================================================
+// SERVER-SIDE BACKSTOP: complete clock-out at midnight (SGT) for any session that
+// spans past 12am, so nobody stays clocked in overnight — regardless of whether their
+// browser/laptop is even open. Runs independently of any client, checked every minute.
+// Each stale session is closed out exactly at the midnight boundary it crossed, not at
+// whatever moment this job happens to notice it (so the recorded hours are correct even
+// if the job is a few minutes late catching it).
+// ========================================================================
+async function autoClockOutOvernightSessions() {
+  try {
+    const stale = await db.query(
+      `SELECT attendance_id, user_id,
+              (date_trunc('day', clock_in_time AT TIME ZONE 'Asia/Singapore') + INTERVAL '1 day')
+                AT TIME ZONE 'Asia/Singapore' AS midnight_cutoff
+       FROM attendance_logs
+       WHERE status = 'ACTIVE' AND clock_out_time IS NULL
+         AND (clock_in_time AT TIME ZONE 'Asia/Singapore')::date < (NOW() AT TIME ZONE 'Asia/Singapore')::date`
+    );
+    for (const row of stale.rows) {
+      try {
+        await axios.post(`http://localhost:${process.env.PORT || 5000}/api/v1/attendance/clock-out`, {
+          userId: row.user_id,
+          attendanceId: row.attendance_id,
+          clockOutTime: row.midnight_cutoff,
+        });
+        console.log(`[auto-clockout] Force-clocked-out overnight session ${row.attendance_id} at midnight (${row.midnight_cutoff}).`);
+      } catch (err) {
+        console.error(`[auto-clockout] Failed to clock out ${row.attendance_id}:`, err.message);
+      }
+    }
+  } catch (error) {
+    console.error('[auto-clockout] Sweep failed:', error.message);
+  }
+}
+
 // In server.js
 const PORT = process.env.PORT || 5000; // Changed from 3000
 ensureOperationalTables()
   .then(() => {
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`Backend API Server running on port ${PORT}`);
+      setInterval(autoClockOutOvernightSessions, 60 * 1000);
+      autoClockOutOvernightSessions();
     });
   })
   .catch((error) => {
