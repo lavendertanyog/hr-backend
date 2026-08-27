@@ -4161,40 +4161,11 @@ app.get('/api/v1/admin/audit-logs', async (req, res) => {
   }
 });
 
-// ========================================================================
-// SERVER-SIDE BACKSTOP: complete clock-out at midnight (SGT) for any session that
-// spans past 12am, so nobody stays clocked in overnight — regardless of whether their
-// browser/laptop is even open. Runs independently of any client, checked every minute.
-// Each stale session is closed out exactly at the midnight boundary it crossed, not at
-// whatever moment this job happens to notice it (so the recorded hours are correct even
-// if the job is a few minutes late catching it).
-// ========================================================================
-async function autoClockOutOvernightSessions() {
-  try {
-    const stale = await db.query(
-      `SELECT attendance_id, user_id,
-              (date_trunc('day', clock_in_time AT TIME ZONE 'Asia/Singapore') + INTERVAL '1 day')
-                AT TIME ZONE 'Asia/Singapore' AS midnight_cutoff
-       FROM attendance_logs
-       WHERE status = 'ACTIVE' AND clock_out_time IS NULL
-         AND (clock_in_time AT TIME ZONE 'Asia/Singapore')::date < (NOW() AT TIME ZONE 'Asia/Singapore')::date`
-    );
-    for (const row of stale.rows) {
-      try {
-        await axios.post(`http://localhost:${process.env.PORT || 5000}/api/v1/attendance/clock-out`, {
-          userId: row.user_id,
-          attendanceId: row.attendance_id,
-          clockOutTime: row.midnight_cutoff,
-        });
-        console.log(`[auto-clockout] Force-clocked-out overnight session ${row.attendance_id} at midnight (${row.midnight_cutoff}).`);
-      } catch (err) {
-        console.error(`[auto-clockout] Failed to clock out ${row.attendance_id}:`, err.message);
-      }
-    }
-  } catch (error) {
-    console.error('[auto-clockout] Sweep failed:', error.message);
-  }
-}
+// Note: there is deliberately no server-side midnight cutoff here. Overnight sessions are
+// prevented by the Staff Portal's repeating 3.5h/3.75h/4h "still working?" cycle instead
+// (AttendanceReminders.js) — it re-arms every time Continue is pressed rather than firing once,
+// so a session can't silently run past its next 4-hour check no matter how long someone stays
+// clocked in.
 
 // In server.js
 const PORT = process.env.PORT || 5000; // Changed from 3000
@@ -4202,8 +4173,6 @@ ensureOperationalTables()
   .then(() => {
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`Backend API Server running on port ${PORT}`);
-      setInterval(autoClockOutOvernightSessions, 60 * 1000);
-      autoClockOutOvernightSessions();
     });
   })
   .catch((error) => {
