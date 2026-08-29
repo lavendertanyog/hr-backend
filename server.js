@@ -4161,11 +4161,59 @@ app.get('/api/v1/admin/audit-logs', async (req, res) => {
   }
 });
 
-// Note: there is deliberately no server-side midnight cutoff here. Overnight sessions are
-// prevented by the Staff Portal's repeating 3.5h/3.75h/4h "still working?" cycle instead
-// (AttendanceReminders.js) — it re-arms every time Continue is pressed rather than firing once,
-// so a session can't silently run past its next 4-hour check no matter how long someone stays
-// clocked in.
+// ========================================================================
+// SERVER-SIDE BACKSTOP: force clock-out any session that's gone 4+ hours since its last
+// confirmation (Continue press, or clock-in if never confirmed) — independent of whether
+// anyone still has the Staff Portal open in a browser. The client-side "still working?" cycle
+// in AttendanceReminders.js only runs while a tab is open and polling; once that tab/browser
+// closes, its checkpoints stop firing entirely and a session can sit ACTIVE indefinitely with
+// nothing to catch it. This sweep is that catch, checked every minute regardless of any client.
+// Mirrors the client's own exceptions: skip entirely on weekends, and during lunch (12pm-2pm
+// SGT) hold off the clock-out (but not weekend sessions, which just stay untouched) so someone
+// back from lunch still gets a chance to press Continue before being cut off.
+// ========================================================================
+function sgtNowServer() {
+  // Singapore has no DST, so a fixed +8h offset from UTC is always correct — see the matching
+  // comment in AttendanceReminders.js for why only the UTC getters on the result are valid.
+  const now = new Date();
+  return new Date(now.getTime() + 8 * 60 * 60 * 1000);
+}
+function isSgtWeekday(sgt) {
+  const day = sgt.getUTCDay();
+  return day !== 0 && day !== 6;
+}
+function isSgtLunchWindow(sgt) {
+  const hourDecimal = sgt.getUTCHours() + sgt.getUTCMinutes() / 60;
+  return hourDecimal >= 12 && hourDecimal < 14;
+}
+
+async function autoClockOutStaleSessions() {
+  const sgt = sgtNowServer();
+  if (!isSgtWeekday(sgt)) return; // weekends: entire sequence pauses, same as the client
+  if (isSgtLunchWindow(sgt)) return; // lunch: hold off the forced clock-out, same as the client
+
+  try {
+    const stale = await db.query(
+      `SELECT attendance_id, user_id
+       FROM attendance_logs
+       WHERE status = 'ACTIVE' AND clock_out_time IS NULL
+         AND COALESCE(last_activity_confirmed_at, clock_in_time) <= NOW() - INTERVAL '4 hours'`
+    );
+    for (const row of stale.rows) {
+      try {
+        await axios.post(`http://localhost:${process.env.PORT || 5000}/api/v1/attendance/clock-out`, {
+          userId: row.user_id,
+          attendanceId: row.attendance_id,
+        });
+        console.log(`[auto-clockout] Force-clocked-out stale session ${row.attendance_id} (4+ hours since last confirmation).`);
+      } catch (err) {
+        console.error(`[auto-clockout] Failed to clock out ${row.attendance_id}:`, err.message);
+      }
+    }
+  } catch (error) {
+    console.error('[auto-clockout] Sweep failed:', error.message);
+  }
+}
 
 // In server.js
 const PORT = process.env.PORT || 5000; // Changed from 3000
@@ -4173,6 +4221,8 @@ ensureOperationalTables()
   .then(() => {
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`Backend API Server running on port ${PORT}`);
+      setInterval(autoClockOutStaleSessions, 60 * 1000);
+      autoClockOutStaleSessions();
     });
   })
   .catch((error) => {
