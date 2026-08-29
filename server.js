@@ -2036,7 +2036,7 @@ app.get('/api/v1/attendance/sessions/:userId', async (req, res) => {
          al.clock_in_time,
          al.clock_out_time,
          COALESCE(
-           (SELECT json_agg(json_build_object('project_code', COALESCE(aa.project_code, 'General'), 'hours', aa.accumulated_hours))
+           (SELECT json_agg(json_build_object('project_code', COALESCE(aa.project_code, 'General'), 'hours', aa.accumulated_hours) ORDER BY aa.seq)
             FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id),
            json_build_array(json_build_object('project_code', COALESCE(al.project_code, 'General'), 'hours', al.daily_worktime_hours))
          ) AS allocations
