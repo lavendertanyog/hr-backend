@@ -346,6 +346,12 @@ async function ensureOperationalTables() {
   // at 6h, so a forgotten clock-out can't silently run overnight.
   await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS last_activity_confirmed_at TIMESTAMPTZ;`);
 
+  // Real wall-clock moment a Manual Entry was actually submitted — kept separate from the
+  // staff-entered clock_in_time (which can be hours/days in the past) and never shown to
+  // staff themselves, only available for HR/manager reporting on when a backdated entry was
+  // really made.
+  await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS manual_entry_actual_submitted_at TIMESTAMPTZ;`);
+
   // Multi-project time allocation per clock-in session: staff can split one session's
   // planned hours across several projects (or General), add projects mid-session, and
   // mark/extend individual allocations without re-splitting time already used up.
@@ -374,6 +380,11 @@ async function ensureOperationalTables() {
   // reopen or a demotion back to PENDING (e.g. reopening a different block) so switching
   // between projects mid-session never silently discards progress already tracked.
   await db.query(`ALTER TABLE attendance_allocations ADD COLUMN IF NOT EXISTS accumulated_hours NUMERIC(6,2) NOT NULL DEFAULT 0;`);
+
+  // A staff-entered correction to a completed block's actual worked hours — kept separate from
+  // accumulated_hours (the original system-recorded value) so reports can show both the system
+  // record and the correction, rather than overwriting history.
+  await db.query(`ALTER TABLE attendance_allocations ADD COLUMN IF NOT EXISTS corrected_hours NUMERIC(6,2);`);
 }
 
 const STANDARD_WORKDAY_HOURS = 8;
@@ -1690,57 +1701,104 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
 });
 
 // ========================================================================
-// ROUTE: MANUAL TIME ENTRY (Log Time — enter actual start/end times directly)
+// ROUTE: MANUAL TIME ENTRY (Log Time — records an already-finished block of work directly)
 // ========================================================================
+// Unlike Clock In/Out, this never creates a live/open session — the moment it's submitted,
+// the entry is done: clock_out_time is derived as clockInTime + the sum of the requested
+// allocations' hours, and every allocation is inserted already COMPLETED with its full
+// planned hours as its accumulated (actual) hours. There is no ticking, no "active" block,
+// and nothing left to later clock out of.
 app.post('/api/v1/attendance/manual-entry', async (req, res) => {
-  const { userId, startTime, endTime, remark } = req.body;
-  const projectCode = normalizeProjectCode(req.body.projectCode);
-  const entryType = projectCode ? 'PROJECT' : 'GENERAL';
+  const { userId, clockInTime, clockOutTime, remark } = req.body;
+  const allocationsInput = Array.isArray(req.body.allocations) && req.body.allocations.length > 0
+    ? req.body.allocations.map((a) => ({ ...a, projectCode: normalizeProjectCode(a.projectCode) }))
+    : null;
 
-  if (!userId || !startTime || !endTime) {
-    return res.status(400).json({ error: 'userId, startTime, and endTime are required.' });
+  if (!userId || !clockInTime || !allocationsInput) {
+    return res.status(400).json({ error: 'userId, clockInTime, and at least one allocation are required.' });
   }
-  const start = new Date(startTime);
-  const end = new Date(endTime);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) {
-    return res.status(400).json({ error: 'endTime must be a valid time after startTime.' });
+  const start = new Date(clockInTime);
+  if (Number.isNaN(start.getTime())) {
+    return res.status(400).json({ error: 'clockInTime is not a valid date/time.' });
   }
+  if (allocationsInput.some((a) => !(Number(a.allocatedHours) > 0))) {
+    return res.status(400).json({ error: 'Every project needs a positive number of hours.' });
+  }
+  const totalHours = allocationsInput.reduce((sum, a) => sum + Number(a.allocatedHours), 0);
+  // The overall attendance period defaults to start + the projects' total hours, but staff can
+  // override the actual end time directly — e.g. clocked in 8:30am, project only took 8 hours,
+  // but didn't actually clock off until 6pm. That extra time isn't attributed to any project,
+  // it just extends how long the day is recorded as, for daily hours/OT purposes.
+  let end;
+  if (clockOutTime) {
+    end = new Date(clockOutTime);
+    if (Number.isNaN(end.getTime()) || end <= start) {
+      return res.status(400).json({ error: 'End time must be a valid time after the start time.' });
+    }
+  } else {
+    end = new Date(start.getTime() + totalHours * 3600000);
+  }
+  const actualDurationHours = (end.getTime() - start.getTime()) / 3600000;
 
   try {
     const userProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
     if (userProfile.rows.length === 0) {
       return res.status(404).json({ error: 'User profile not found' });
     }
-
-    if (entryType === 'PROJECT' && !userIsManagerial(userProfile.rows[0])) {
-      const assignCheck = await db.query(
-        'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
-        [userId, projectCode]
-      );
-      if (assignCheck.rows.length === 0) {
-        return res.status(403).json({ error: `You are not assigned to project ${projectCode}. Please ask your manager to assign you first.` });
+    if (!userIsManagerial(userProfile.rows[0])) {
+      for (const alloc of allocationsInput) {
+        if (!alloc.projectCode) continue;
+        const assignCheck = await db.query(
+          'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
+          [userId, alloc.projectCode]
+        );
+        if (assignCheck.rows.length === 0) {
+          return res.status(403).json({ error: `You are not assigned to project ${alloc.projectCode}. Please ask your manager to assign you first.` });
+        }
       }
     }
 
-    const { clippedHours } = await clipOverlappingHours(userId, projectCode, start.toISOString(), end.toISOString(), null);
+    const primaryProjectCode = allocationsInput[0].projectCode || null;
+    const entryType = primaryProjectCode ? 'PROJECT' : 'GENERAL';
+    // Unlike live clock-out, a Manual Entry always credits exactly what was entered — no
+    // overlap-deduplication against other sessions. It's a deliberate, precise record the staff
+    // member is entering by hand, not a live timer that could double-count a forgotten clock-out.
     const outHour = end.getHours();
-    const dailyWorktimeHours = Math.round((clippedHours > 1 ? clippedHours - 1 : Math.max(clippedHours, 0)) * 100) / 100;
-    const otHoursAccrued = clippedHours > 9.5 && outHour >= 18 ? Math.round((clippedHours - 9.5) * 100) / 100 : 0;
+    const dailyWorktimeHours = Math.round((actualDurationHours > 1 ? actualDurationHours - 1 : Math.max(actualDurationHours, 0)) * 100) / 100;
+    const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
 
     const insertQuery = `
       INSERT INTO attendance_logs (
         attendance_id, user_id, project_code, clock_in_time, clock_out_time,
-        daily_worktime_hours, ot_hours_accrued, status, entry_type, is_manual_entry, remark, created_at
+        daily_worktime_hours, ot_hours_accrued, status, entry_type, is_manual_entry,
+        manual_entry_actual_submitted_at, remark, created_at
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, 'ACTIVE', $8, TRUE, $9, CURRENT_TIMESTAMP
+        $1, $2, $3, $4, $5, $6, $7, 'ACTIVE', $8, TRUE, CURRENT_TIMESTAMP, $9, CURRENT_TIMESTAMP
       ) RETURNING *;
     `;
     const result = await db.query(insertQuery, [
-      randomUUID(), userId, projectCode || null, start.toISOString(), end.toISOString(),
+      randomUUID(), userId, primaryProjectCode, start.toISOString(), end.toISOString(),
       dailyWorktimeHours, otHoursAccrued, entryType, remark || null
     ]);
+    const attendanceRow = result.rows[0];
 
-    res.status(201).json({ success: true, data: result.rows[0] });
+    const allocationRows = [];
+    for (let i = 0; i < allocationsInput.length; i++) {
+      const alloc = allocationsInput[i];
+      // Credited in full — allocated_hours (the plan) and accumulated_hours (the actual) start
+      // out identical, since a Manual Entry records the hours exactly as entered.
+      const plannedHours = Math.round(Number(alloc.allocatedHours) * 100) / 100;
+      const actualHours = plannedHours;
+      const inserted = await db.query(
+        `INSERT INTO attendance_allocations (attendance_id, project_code, allocated_hours, accumulated_hours, status, seq, started_at, completed_at)
+         VALUES ($1, $2, $3, $4, 'COMPLETED', $5, $6::timestamptz, $7::timestamptz)
+         RETURNING *`,
+        [attendanceRow.attendance_id, alloc.projectCode || null, plannedHours, actualHours, i, start.toISOString(), end.toISOString()]
+      );
+      allocationRows.push(inserted.rows[0]);
+    }
+
+    res.status(201).json({ success: true, data: { ...attendanceRow, allocations: allocationRows } });
   } catch (error) {
     res.status(500).json({ error: 'Manual time entry failed.', detail: error.message });
   }
@@ -1781,7 +1839,7 @@ app.get('/api/v1/attendance/active-session/:userId', async (req, res) => {
     const session = result.rows[0] || null;
     if (session) {
       const allocResult = await db.query(
-        `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+        `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
          FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
         [session.attendance_id]
       );
@@ -1852,6 +1910,29 @@ app.get('/api/v1/attendance/project-log/:userId', async (req, res) => {
   }
 });
 
+// Raw clock-in/out time ranges already logged for one SGT calendar day — used by Manual Entry
+// to warn "you've already logged time today" with the actual period, before creating a
+// possibly-duplicate entry.
+app.get('/api/v1/attendance/day-entries/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { date } = req.query;
+  if (!date) {
+    return res.status(400).json({ error: 'date query param is required (YYYY-MM-DD).' });
+  }
+  try {
+    const result = await db.query(
+      `SELECT attendance_id, clock_in_time, clock_out_time
+       FROM attendance_logs
+       WHERE user_id = $1 AND (clock_in_time AT TIME ZONE 'Asia/Singapore')::date = $2::date
+       ORDER BY clock_in_time ASC`,
+      [userId, date]
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch day entries.', detail: error.message });
+  }
+});
+
 // ========================================================================
 // ROUTE: MULTI-PROJECT TIME ALLOCATION MANAGEMENT
 // ========================================================================
@@ -1914,7 +1995,7 @@ app.post('/api/v1/attendance/allocations', async (req, res) => {
     );
 
     const all = await db.query(
-      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
        FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
       [attendanceId]
     );
@@ -1925,14 +2006,43 @@ app.post('/api/v1/attendance/allocations', async (req, res) => {
   }
 });
 
-// Direct manual edit — "editable at every stage" — overwrite one allocation's planned hours.
+// Direct manual edit — "editable at every stage" — overwrite one allocation's planned hours,
+// or (only once it's COMPLETED) record a correction to what was actually worked. The correction
+// is kept in its own column rather than overwriting accumulated_hours, so a report can always
+// show both what the system originally recorded and what the staff member says really happened.
 app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
   const { allocationId } = req.params;
-  const { userId, allocatedHours } = req.body;
-  if (!userId || typeof allocatedHours !== 'number' || allocatedHours <= 0) {
-    return res.status(400).json({ error: 'userId and a positive allocatedHours are required.' });
+  const { userId, allocatedHours, correctedHours } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required.' });
   }
+  if (allocatedHours == null && correctedHours == null) {
+    return res.status(400).json({ error: 'Provide allocatedHours or correctedHours to update.' });
+  }
+
   try {
+    if (correctedHours != null) {
+      if (typeof correctedHours !== 'number' || correctedHours <= 0) {
+        return res.status(400).json({ error: 'correctedHours must be a positive number.' });
+      }
+      const result = await db.query(
+        `UPDATE attendance_allocations aa
+         SET corrected_hours = $1, last_edited_at = CURRENT_TIMESTAMP
+         FROM attendance_logs al
+         WHERE aa.allocation_id = $2 AND aa.attendance_id = al.attendance_id AND al.user_id = $3
+           AND aa.status = 'COMPLETED'
+         RETURNING aa.*`,
+        [Math.round(correctedHours * 100) / 100, allocationId, userId]
+      );
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Completed allocation not found — only completed projects can have their actual hours corrected.' });
+      }
+      return res.status(200).json({ success: true, data: result.rows[0] });
+    }
+
+    if (typeof allocatedHours !== 'number' || allocatedHours <= 0) {
+      return res.status(400).json({ error: 'allocatedHours must be a positive number.' });
+    }
     const result = await db.query(
       `UPDATE attendance_allocations aa
        SET allocated_hours = $1,
@@ -1950,6 +2060,82 @@ app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
     res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update allocation.', detail: error.message });
+  }
+});
+
+// Delete a project allocation entirely — e.g. staff added it by mistake, or wants to redo it
+// from scratch. Its hours are folded back in and re-split evenly across whatever open
+// (not-yet-completed) allocations remain, the same way adding a project re-splits the
+// remaining budget. If the deleted block was the one actively running, the earliest still-
+// pending block is promoted to ACTIVE so the session always has something running (unless
+// everything left is already COMPLETED, in which case nothing needs to be active).
+app.delete('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
+  const { allocationId } = req.params;
+  const { userId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required.' });
+  }
+
+  try {
+    const target = await db.query(
+      `SELECT aa.attendance_id, aa.status
+       FROM attendance_allocations aa
+       JOIN attendance_logs al ON al.attendance_id = aa.attendance_id
+       WHERE aa.allocation_id = $1 AND al.user_id = $2`,
+      [allocationId, userId]
+    );
+    if (target.rows.length === 0) {
+      return res.status(404).json({ error: 'Allocation not found.' });
+    }
+    const { attendance_id: attendanceId, status: deletedStatus } = target.rows[0];
+
+    const siblingCount = await db.query(
+      'SELECT COUNT(*)::int AS n FROM attendance_allocations WHERE attendance_id = $1',
+      [attendanceId]
+    );
+    if (siblingCount.rows[0].n <= 1) {
+      return res.status(400).json({ error: 'Can\'t delete the only project on this entry.' });
+    }
+
+    await db.query('DELETE FROM attendance_allocations WHERE allocation_id = $1', [allocationId]);
+
+    const remaining = await db.query(
+      `SELECT allocation_id, allocated_hours, status FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
+      [attendanceId]
+    );
+    const completedHours = remaining.rows
+      .filter((r) => r.status === 'COMPLETED')
+      .reduce((sum, r) => sum + Number(r.allocated_hours || 0), 0);
+    const openRows = remaining.rows.filter((r) => r.status !== 'COMPLETED');
+    if (openRows.length > 0) {
+      const remainingHours = Math.max(STANDARD_WORKDAY_HOURS - completedHours, 0);
+      const evenShare = Math.round((remainingHours / openRows.length) * 100) / 100;
+      for (const row of openRows) {
+        await db.query('UPDATE attendance_allocations SET allocated_hours = $1 WHERE allocation_id = $2', [evenShare, row.allocation_id]);
+      }
+    }
+
+    if (deletedStatus === 'ACTIVE') {
+      const stillHasActive = remaining.rows.some((r) => r.status === 'ACTIVE');
+      if (!stillHasActive) {
+        const nextPending = remaining.rows.find((r) => r.status === 'PENDING');
+        if (nextPending) {
+          await db.query(
+            `UPDATE attendance_allocations SET status = 'ACTIVE', started_at = CURRENT_TIMESTAMP WHERE allocation_id = $1`,
+            [nextPending.allocation_id]
+          );
+        }
+      }
+    }
+
+    const all = await db.query(
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+       FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
+      [attendanceId]
+    );
+    res.status(200).json({ success: true, data: { allocations: all.rows } });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete allocation.', detail: error.message });
   }
 });
 
@@ -1992,7 +2178,7 @@ app.post('/api/v1/attendance/allocations/:allocationId/reopen', async (req, res)
     );
 
     const all = await db.query(
-      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
        FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
       [row.attendance_id]
     );
@@ -2041,7 +2227,7 @@ app.post('/api/v1/attendance/allocations/:allocationId/complete', async (req, re
     }
 
     const all = await db.query(
-      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
        FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
       [row.attendance_id]
     );
