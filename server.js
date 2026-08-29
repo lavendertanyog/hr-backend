@@ -352,6 +352,13 @@ async function ensureOperationalTables() {
   // really made.
   await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS manual_entry_actual_submitted_at TIMESTAMPTZ;`);
 
+  // Preserves a log's clock-in/out times exactly as first recorded, the moment staff first
+  // edits them — clock_in_time/clock_out_time always hold the current (possibly edited) value
+  // shown to staff, while these two are the untouched audit trail, never shown in the UI.
+  // COALESCE'd on every edit so only the very first original is ever captured.
+  await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS original_clock_in_time TIMESTAMPTZ;`);
+  await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS original_clock_out_time TIMESTAMPTZ;`);
+
   // Multi-project time allocation per clock-in session: staff can split one session's
   // planned hours across several projects (or General), add projects mid-session, and
   // mark/extend individual allocations without re-splitting time already used up.
@@ -1481,6 +1488,23 @@ function normalizeProjectCode(code) {
 // same-category session, so the same minute never gets counted twice in daily/weekly totals.
 // The clock-in/out timestamps themselves are left untouched (they're the record of what the
 // user actually entered) — only the derived hour totals are adjusted.
+// Finds a staff member's existing attendance log whose time range genuinely overlaps
+// [startIso, endIso) — used to block a new Manual Entry (or edit) from being logged on top of
+// time already recorded, rather than silently allowing duplicates. An open (still-active) log
+// has no clock_out_time yet, so it's treated as covering up to "now".
+async function findOverlappingAttendanceLog(userId, startIso, endIso, excludeAttendanceId) {
+  const result = await db.query(
+    `SELECT attendance_id, clock_in_time, clock_out_time FROM attendance_logs
+     WHERE user_id = $1 AND attendance_id != $2
+       AND clock_in_time < $4::timestamptz
+       AND COALESCE(clock_out_time, CURRENT_TIMESTAMP) > $3::timestamptz
+     ORDER BY clock_in_time ASC
+     LIMIT 1`,
+    [userId, excludeAttendanceId || '00000000-0000-0000-0000-000000000000', startIso, endIso]
+  );
+  return result.rows[0] || null;
+}
+
 async function clipOverlappingHours(userId, projectCode, startIso, endIso, excludeAttendanceId) {
   const start = new Date(startIso);
   const end = new Date(endIso);
@@ -1549,6 +1573,18 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
           return res.status(403).json({ error: `You are not assigned to project ${alloc.projectCode}. Please ask your manager to assign you first.` });
         }
       }
+    }
+
+    // A backdated clock-in (clockInTime provided) can land inside time already recorded
+    // elsewhere — block it the same way Manual Entry is blocked, rather than allowing a
+    // duplicate, open-ended session on top of an existing entry.
+    const newSessionStart = clockInTime ? new Date(clockInTime) : new Date();
+    const overlap = await findOverlappingAttendanceLog(userId, newSessionStart.toISOString(), 'infinity');
+    if (overlap) {
+      return res.status(409).json({
+        error: 'This time overlaps an entry you\'ve already logged. Edit that entry instead of creating a new one.',
+        overlap: { attendance_id: overlap.attendance_id, clock_in_time: overlap.clock_in_time, clock_out_time: overlap.clock_out_time },
+      });
     }
 
     const homeCountry = userProfile.rows[0].home_office_country;
@@ -1758,6 +1794,16 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
       }
     }
 
+    // Block logging a new entry on top of time already recorded — staff should edit the
+    // existing entry instead of creating an overlapping duplicate.
+    const overlap = await findOverlappingAttendanceLog(userId, start.toISOString(), end.toISOString());
+    if (overlap) {
+      return res.status(409).json({
+        error: 'This time range overlaps an entry you\'ve already logged. Edit that entry instead of creating a new one.',
+        overlap: { attendance_id: overlap.attendance_id, clock_in_time: overlap.clock_in_time, clock_out_time: overlap.clock_out_time },
+      });
+    }
+
     const primaryProjectCode = allocationsInput[0].projectCode || null;
     const entryType = primaryProjectCode ? 'PROJECT' : 'GENERAL';
     // Unlike live clock-out, a Manual Entry always credits exactly what was entered — no
@@ -1801,6 +1847,69 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
     res.status(201).json({ success: true, data: { ...attendanceRow, allocations: allocationRows } });
   } catch (error) {
     res.status(500).json({ error: 'Manual time entry failed.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: EDIT AN ALREADY-LOGGED ENTRY'S CLOCK-IN/OUT TIMES
+// ========================================================================
+// Lets staff correct a finished attendance log's times instead of logging a second, overlapping
+// entry. The pre-edit values are preserved in original_clock_in_time/original_clock_out_time
+// (captured once, on the first edit only) purely for record-keeping — staff themselves only ever
+// see clock_in_time/clock_out_time, which always hold the current, edited version.
+app.patch('/api/v1/attendance/:attendanceId/edit-times', async (req, res) => {
+  const { attendanceId } = req.params;
+  const { userId, clockInTime, clockOutTime } = req.body;
+  if (!userId || !clockInTime || !clockOutTime) {
+    return res.status(400).json({ error: 'userId, clockInTime and clockOutTime are required.' });
+  }
+  const start = new Date(clockInTime);
+  const end = new Date(clockOutTime);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) {
+    return res.status(400).json({ error: 'End time must be a valid time after the start time.' });
+  }
+
+  try {
+    const existing = await db.query(
+      'SELECT attendance_id, clock_in_time, clock_out_time FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2',
+      [attendanceId, userId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Attendance entry not found.' });
+    }
+    if (!existing.rows[0].clock_out_time) {
+      return res.status(400).json({ error: 'This session is still active — clock it out before editing its times.' });
+    }
+
+    const overlap = await findOverlappingAttendanceLog(userId, start.toISOString(), end.toISOString(), attendanceId);
+    if (overlap) {
+      return res.status(409).json({
+        error: 'This time range overlaps another entry you\'ve already logged.',
+        overlap: { attendance_id: overlap.attendance_id, clock_in_time: overlap.clock_in_time, clock_out_time: overlap.clock_out_time },
+      });
+    }
+
+    const actualDurationHours = (end.getTime() - start.getTime()) / 3600000;
+    const outHour = end.getHours();
+    const dailyWorktimeHours = Math.round((actualDurationHours > 1 ? actualDurationHours - 1 : Math.max(actualDurationHours, 0)) * 100) / 100;
+    const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
+
+    const result = await db.query(
+      `UPDATE attendance_logs
+       SET original_clock_in_time = COALESCE(original_clock_in_time, clock_in_time),
+           original_clock_out_time = COALESCE(original_clock_out_time, clock_out_time),
+           clock_in_time = $2::timestamptz,
+           clock_out_time = $3::timestamptz,
+           daily_worktime_hours = $4,
+           ot_hours_accrued = $5
+       WHERE attendance_id = $1
+       RETURNING attendance_id, clock_in_time, clock_out_time, daily_worktime_hours, ot_hours_accrued`,
+      [attendanceId, start.toISOString(), end.toISOString(), dailyWorktimeHours, otHoursAccrued]
+    );
+
+    res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to edit attendance entry.', detail: error.message });
   }
 });
 
@@ -1907,6 +2016,39 @@ app.get('/api/v1/attendance/project-log/:userId', async (req, res) => {
     return res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch project log.', detail: error.message });
+  }
+});
+
+// Per-session clock-in/out times (plus each session's project-hour breakdown) for the Weekly
+// Project Log's timeline chart — one row per attendance log, so the chart can position a bar at
+// its real start/end time instead of a plain accumulated-hours total.
+app.get('/api/v1/attendance/sessions/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { start, end } = req.query;
+  if (!start || !end) {
+    return res.status(400).json({ error: 'start and end date query params are required (YYYY-MM-DD).' });
+  }
+  try {
+    const result = await db.query(
+      `SELECT
+         al.attendance_id,
+         to_char((al.clock_in_time AT TIME ZONE 'Asia/Singapore')::date, 'YYYY-MM-DD') AS day,
+         al.clock_in_time,
+         al.clock_out_time,
+         COALESCE(
+           (SELECT json_agg(json_build_object('project_code', COALESCE(aa.project_code, 'General'), 'hours', aa.accumulated_hours))
+            FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id),
+           json_build_array(json_build_object('project_code', COALESCE(al.project_code, 'General'), 'hours', al.daily_worktime_hours))
+         ) AS allocations
+       FROM attendance_logs al
+       WHERE al.user_id = $1 AND al.clock_out_time IS NOT NULL
+         AND (al.clock_in_time AT TIME ZONE 'Asia/Singapore')::date BETWEEN $2::date AND $3::date
+       ORDER BY al.clock_in_time ASC`,
+      [userId, start, end]
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch attendance sessions.', detail: error.message });
   }
 });
 
