@@ -1929,6 +1929,33 @@ app.patch('/api/v1/attendance/:attendanceId/edit-times', async (req, res) => {
 });
 
 // ========================================================================
+// ROUTE: DELETE ATTENDANCE ENTRY
+// ========================================================================
+app.delete('/api/v1/attendance/:attendanceId', async (req, res) => {
+  const { attendanceId } = req.params;
+  const { userId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required.' });
+  }
+  try {
+    const existing = await db.query(
+      'SELECT attendance_id, clock_out_time FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2',
+      [attendanceId, userId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Attendance entry not found.' });
+    }
+    if (!existing.rows[0].clock_out_time) {
+      return res.status(400).json({ error: 'This session is still active — clock it out before deleting it.' });
+    }
+    await db.query('DELETE FROM attendance_logs WHERE attendance_id = $1', [attendanceId]);
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete attendance entry.', detail: error.message });
+  }
+});
+
+// ========================================================================
 // ROUTE: ACTIVE ATTENDANCE SESSION CHECK
 // ========================================================================
 app.get('/api/v1/attendance/active-session/:userId', async (req, res) => {
