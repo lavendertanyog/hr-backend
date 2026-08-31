@@ -337,6 +337,8 @@ async function ensureOperationalTables() {
 
   // Log Time: remarks + general (non-project) vs project entries + manual entry flag
   await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS remark TEXT;`);
+  // Mandatory description for General (non-project) work — separate from the optional remark.
+  await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS description TEXT;`);
   await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS entry_type TEXT NOT NULL DEFAULT 'PROJECT';`);
   await db.query(`ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS is_manual_entry BOOLEAN NOT NULL DEFAULT FALSE;`);
   await db.query(`ALTER TABLE attendance_logs ALTER COLUMN project_code DROP NOT NULL;`);
@@ -1543,7 +1545,7 @@ async function clipOverlappingHours(userId, projectCode, startIso, endIso, exclu
 // ROUTE: CLOCK-IN ENDPOINT
 // ========================================================================
 app.post('/api/v1/attendance/clock-in', async (req, res) => {
-  const { userId, projectCode, latitude, longitude, isManualLocation, manualLocationText, remark, clockInTime, allocations } = req.body;
+  const { userId, projectCode, latitude, longitude, isManualLocation, manualLocationText, remark, description, clockInTime, allocations } = req.body;
   // `allocations`, if provided, is [{ projectCode: string|null, allocatedHours: number }, ...] —
   // lets staff split this session's planned hours across several projects/General up front.
   // `projectCode` stays as the single-project fallback for older clients (mobile app, etc.).
@@ -1553,6 +1555,12 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
   const primaryProjectCode = requestedProjects[0].projectCode || null;
   const entryType = primaryProjectCode ? 'PROJECT' : 'GENERAL';
   const isManualEntry = Boolean(clockInTime);
+
+  // General (non-project) work has no project name to explain what was done, so a description
+  // is mandatory whenever any requested allocation is General — separate from the optional remark.
+  if (requestedProjects.some((a) => !a.projectCode) && !(description || '').trim()) {
+    return res.status(400).json({ error: 'A description is required when logging General (non-project) work.' });
+  }
 
   try {
     const userProfile = await db.query('SELECT home_office_country, user_role, user_roles FROM users WHERE user_id = $1', [userId]);
@@ -1608,17 +1616,17 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
     const insertQuery = `
       INSERT INTO attendance_logs (
         attendance_id, user_id, project_code, clock_in_time, raw_coordinates,
-        location_name, country_code, is_manual_location, travel_mode, status, entry_type, remark, is_manual_entry, created_at, last_activity_confirmed_at
+        location_name, country_code, is_manual_location, travel_mode, status, entry_type, remark, is_manual_entry, description, created_at, last_activity_confirmed_at
       ) VALUES (
         $1, $2, $3, COALESCE($12::timestamptz, CURRENT_TIMESTAMP),
         CASE WHEN $4::numeric IS NOT NULL AND $5::numeric IS NOT NULL
              THEN ST_SetSRID(ST_MakePoint($5::numeric, $4::numeric), 4326) ELSE NULL END,
-        $6, $7, $8, $9, 'ACTIVE', $10, $11, $13, CURRENT_TIMESTAMP, COALESCE($12::timestamptz, CURRENT_TIMESTAMP)
+        $6, $7, $8, $9, 'ACTIVE', $10, $11, $13, $14, CURRENT_TIMESTAMP, COALESCE($12::timestamptz, CURRENT_TIMESTAMP)
       ) RETURNING *;
     `;
 
     const result = await db.query(insertQuery, [
-      randomUUID(), userId, primaryProjectCode, latitude, longitude, locationName, countryCode, isManualLocation || false, travelMode, entryType, remark || null, clockInTime || null, isManualEntry
+      randomUUID(), userId, primaryProjectCode, latitude, longitude, locationName, countryCode, isManualLocation || false, travelMode, entryType, remark || null, clockInTime || null, isManualEntry, description || null
     ]);
 
     const attendanceRow = result.rows[0];
@@ -1751,13 +1759,18 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
 // planned hours as its accumulated (actual) hours. There is no ticking, no "active" block,
 // and nothing left to later clock out of.
 app.post('/api/v1/attendance/manual-entry', async (req, res) => {
-  const { userId, clockInTime, clockOutTime, remark } = req.body;
+  const { userId, clockInTime, clockOutTime, remark, description } = req.body;
   const allocationsInput = Array.isArray(req.body.allocations) && req.body.allocations.length > 0
     ? req.body.allocations.map((a) => ({ ...a, projectCode: normalizeProjectCode(a.projectCode) }))
     : null;
 
   if (!userId || !clockInTime || !allocationsInput) {
     return res.status(400).json({ error: 'userId, clockInTime, and at least one allocation are required.' });
+  }
+  // General (non-project) work has no project name to explain what was done, so a description
+  // is mandatory whenever any allocation is General — separate from the optional remark.
+  if (allocationsInput.some((a) => !a.projectCode) && !(description || '').trim()) {
+    return res.status(400).json({ error: 'A description is required when logging General (non-project) work.' });
   }
   const start = new Date(clockInTime);
   if (Number.isNaN(start.getTime())) {
@@ -1828,14 +1841,14 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
       INSERT INTO attendance_logs (
         attendance_id, user_id, project_code, clock_in_time, clock_out_time,
         daily_worktime_hours, ot_hours_accrued, status, entry_type, is_manual_entry,
-        manual_entry_actual_submitted_at, remark, created_at
+        manual_entry_actual_submitted_at, remark, description, created_at
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, 'ACTIVE', $8, TRUE, CURRENT_TIMESTAMP, $9, CURRENT_TIMESTAMP
+        $1, $2, $3, $4, $5, $6, $7, 'ACTIVE', $8, TRUE, CURRENT_TIMESTAMP, $9, $10, CURRENT_TIMESTAMP
       ) RETURNING *;
     `;
     const result = await db.query(insertQuery, [
       randomUUID(), userId, primaryProjectCode, start.toISOString(), end.toISOString(),
-      dailyWorktimeHours, otHoursAccrued, entryType, remark || null
+      dailyWorktimeHours, otHoursAccrued, entryType, remark || null, description || null
     ]);
     const attendanceRow = result.rows[0];
 
