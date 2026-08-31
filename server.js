@@ -1555,12 +1555,8 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
   const primaryProjectCode = requestedProjects[0].projectCode || null;
   const entryType = primaryProjectCode ? 'PROJECT' : 'GENERAL';
   const isManualEntry = Boolean(clockInTime);
-
-  // General (non-project) work has no project name to explain what was done, so a description
-  // is mandatory whenever any requested allocation is General — separate from the optional remark.
-  if (requestedProjects.some((a) => !a.projectCode) && !(description || '').trim()) {
-    return res.status(400).json({ error: 'A description is required when logging General (non-project) work.' });
-  }
+  // A description is required for General (non-project) work, but only once the session is
+  // closed out (see /clock-out) — the work isn't known yet at the moment of clocking in.
 
   try {
     const userProfile = await db.query('SELECT home_office_country, user_role, user_roles FROM users WHERE user_id = $1', [userId]);
@@ -1671,16 +1667,27 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
 // ROUTE: CLOCK-OUT ENDPOINT
 // ========================================================================
 app.post('/api/v1/attendance/clock-out', async (req, res) => {
-  const { userId, attendanceId, remark, clockOutTime } = req.body;
+  const { userId, attendanceId, remark, description, clockOutTime } = req.body;
 
   try {
     const logCheck = await db.query(
-      "SELECT clock_in_time, project_code FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2",
+      "SELECT clock_in_time, project_code, description FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2",
       [attendanceId, userId]
     );
 
     if (logCheck.rows.length === 0) {
       return res.status(404).json({ error: 'No active clock-in entry found matching your device session state.' });
+    }
+
+    // General (non-project) work has no project name to explain what was done, so a description
+    // is required before closing out a session that includes a General allocation — asked for
+    // here rather than at clock-in, since the work is only known once it's actually underway.
+    const generalCheck = await db.query(
+      'SELECT 1 FROM attendance_allocations WHERE attendance_id = $1 AND project_code IS NULL LIMIT 1',
+      [attendanceId]
+    );
+    if (generalCheck.rows.length > 0 && !(description || logCheck.rows[0].description || '').trim()) {
+      return res.status(400).json({ error: 'A description is required when logging General (non-project) work.' });
     }
 
     const clockIn = new Date(logCheck.rows[0].clock_in_time);
@@ -1711,12 +1718,13 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
         clock_out_time = $2::timestamptz,
         daily_worktime_hours = $3,
         ot_hours_accrued = $4,
-        remark = COALESCE($5, remark)
+        remark = COALESCE($5, remark),
+        description = COALESCE($6, description)
       WHERE attendance_id = $1
       RETURNING attendance_id, daily_worktime_hours, ot_hours_accrued;
     `;
 
-    const result = await db.query(updateQuery, [attendanceId, currentOut.toISOString(), dailyWorktimeHours, otHoursAccrued, remark || null]);
+    const result = await db.query(updateQuery, [attendanceId, currentOut.toISOString(), dailyWorktimeHours, otHoursAccrued, remark || null, description || null]);
     const attendanceRow = result.rows[0];
 
     // Close out whichever allocation was still running, and let the leftover ones stand as planned.
