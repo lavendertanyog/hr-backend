@@ -1575,10 +1575,16 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
       }
     }
 
+    const newSessionStart = clockInTime ? new Date(clockInTime) : new Date();
+    // Staff can log a past or present shift, never a future one — a 60s tolerance absorbs
+    // ordinary clock skew between the staff member's device and the server.
+    if (clockInTime && newSessionStart.getTime() > Date.now() + 60000) {
+      return res.status(400).json({ error: 'You can only log attendance for today or a past date, not the future.' });
+    }
+
     // A backdated clock-in (clockInTime provided) can land inside time already recorded
     // elsewhere — block it the same way Manual Entry is blocked, rather than allowing a
     // duplicate, open-ended session on top of an existing entry.
-    const newSessionStart = clockInTime ? new Date(clockInTime) : new Date();
     const overlap = await findOverlappingAttendanceLog(userId, newSessionStart.toISOString(), 'infinity');
     if (overlap) {
       return res.status(409).json({
@@ -1757,6 +1763,11 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
   if (Number.isNaN(start.getTime())) {
     return res.status(400).json({ error: 'clockInTime is not a valid date/time.' });
   }
+  // Staff can log a past or present shift, never a future one — a 60s tolerance absorbs
+  // ordinary clock skew between the staff member's device and the server.
+  if (start.getTime() > Date.now() + 60000) {
+    return res.status(400).json({ error: 'You can only log attendance for today or a past date, not the future.' });
+  }
   if (allocationsInput.some((a) => !(Number(a.allocatedHours) > 0))) {
     return res.status(400).json({ error: 'Every project needs a positive number of hours.' });
   }
@@ -1867,6 +1878,10 @@ app.patch('/api/v1/attendance/:attendanceId/edit-times', async (req, res) => {
   const end = new Date(clockOutTime);
   if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) {
     return res.status(400).json({ error: 'End time must be a valid time after the start time.' });
+  }
+  // Editing can't move an entry into the future either — same rule as creating one.
+  if (start.getTime() > Date.now() + 60000) {
+    return res.status(400).json({ error: 'You can only log attendance for today or a past date, not the future.' });
   }
 
   try {
@@ -4496,19 +4511,17 @@ app.get('/api/v1/admin/audit-logs', async (req, res) => {
 // in AttendanceReminders.js only runs while a tab is open and polling; once that tab/browser
 // closes, its checkpoints stop firing entirely and a session can sit ACTIVE indefinitely with
 // nothing to catch it. This sweep is that catch, checked every minute regardless of any client.
-// Mirrors the client's own exceptions: skip entirely on weekends, and during lunch (12pm-2pm
-// SGT) hold off the clock-out (but not weekend sessions, which just stay untouched) so someone
-// back from lunch still gets a chance to press Continue before being cut off.
+// Mirrors the client's own exception: during lunch (12pm-2pm SGT), hold off the clock-out so
+// someone back from lunch still gets a chance to press Continue before being cut off. Runs every
+// day including weekends — staff aren't expected to clock in at 8:30am on a weekend (that
+// reminder stays weekend-suppressed), but if someone does clock in, this backstop applies to
+// them exactly as on a weekday.
 // ========================================================================
 function sgtNowServer() {
   // Singapore has no DST, so a fixed +8h offset from UTC is always correct — see the matching
   // comment in AttendanceReminders.js for why only the UTC getters on the result are valid.
   const now = new Date();
   return new Date(now.getTime() + 8 * 60 * 60 * 1000);
-}
-function isSgtWeekday(sgt) {
-  const day = sgt.getUTCDay();
-  return day !== 0 && day !== 6;
 }
 function isSgtLunchWindow(sgt) {
   const hourDecimal = sgt.getUTCHours() + sgt.getUTCMinutes() / 60;
@@ -4517,7 +4530,6 @@ function isSgtLunchWindow(sgt) {
 
 async function autoClockOutStaleSessions() {
   const sgt = sgtNowServer();
-  if (!isSgtWeekday(sgt)) return; // weekends: entire sequence pauses, same as the client
   if (isSgtLunchWindow(sgt)) return; // lunch: hold off the forced clock-out, same as the client
 
   try {
