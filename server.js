@@ -1670,7 +1670,7 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
 // ROUTE: CLOCK-OUT ENDPOINT
 // ========================================================================
 app.post('/api/v1/attendance/clock-out', async (req, res) => {
-  const { userId, attendanceId, remark, description, clockOutTime } = req.body;
+  const { userId, attendanceId, remark, description, clockOutTime, isAutoClockOut } = req.body;
 
   try {
     const logCheck = await db.query(
@@ -1685,12 +1685,17 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
     // General (non-project) work has no project name to explain what was done, so a description
     // is required before closing out a session that includes a General allocation — asked for
     // here rather than at clock-in, since the work is only known once it's actually underway.
-    const generalCheck = await db.query(
-      'SELECT 1 FROM attendance_allocations WHERE attendance_id = $1 AND project_code IS NULL LIMIT 1',
-      [attendanceId]
-    );
-    if (generalCheck.rows.length > 0 && !(description || logCheck.rows[0].description || '').trim()) {
-      return res.status(400).json({ error: 'A description is required when logging General (non-project) work.' });
+    // The system's own 4-hour stale-session backstop is exempt: nobody's present to type one, and
+    // a session that can never auto-close because it's missing a description is worse than one
+    // that closes with the description left blank.
+    if (!isAutoClockOut) {
+      const generalCheck = await db.query(
+        'SELECT 1 FROM attendance_allocations WHERE attendance_id = $1 AND project_code IS NULL LIMIT 1',
+        [attendanceId]
+      );
+      if (generalCheck.rows.length > 0 && !(description || logCheck.rows[0].description || '').trim()) {
+        return res.status(400).json({ error: 'A description is required when logging General (non-project) work.' });
+      }
     }
 
     const clockIn = new Date(logCheck.rows[0].clock_in_time);
@@ -4717,6 +4722,7 @@ async function autoClockOutStaleSessions() {
         await axios.post(`http://localhost:${process.env.PORT || 5000}/api/v1/attendance/clock-out`, {
           userId: row.user_id,
           attendanceId: row.attendance_id,
+          isAutoClockOut: true,
         });
         console.log(`[auto-clockout] Force-clocked-out stale session ${row.attendance_id} (4+ hours since last confirmation).`);
       } catch (err) {
