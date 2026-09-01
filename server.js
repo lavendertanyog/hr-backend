@@ -394,6 +394,10 @@ async function ensureOperationalTables() {
   // accumulated_hours (the original system-recorded value) so reports can show both the system
   // record and the correction, rather than overwriting history.
   await db.query(`ALTER TABLE attendance_allocations ADD COLUMN IF NOT EXISTS corrected_hours NUMERIC(6,2);`);
+  // What staff actually worked on for this project block — required for General (no project
+  // name to explain it), optional for a named project. Lives per-allocation rather than per
+  // session, since one session can hold several project blocks each with their own note.
+  await db.query(`ALTER TABLE attendance_allocations ADD COLUMN IF NOT EXISTS description TEXT;`);
 }
 
 const STANDARD_WORKDAY_HOURS = 8;
@@ -1682,18 +1686,19 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
       return res.status(404).json({ error: 'No active clock-in entry found matching your device session state.' });
     }
 
-    // General (non-project) work has no project name to explain what was done, so a description
-    // is required before closing out a session that includes a General allocation — asked for
-    // here rather than at clock-in, since the work is only known once it's actually underway.
+    // General (non-project) work has no project name to explain what was done, so its own
+    // allocation-level description (typed live on that card, saved via PATCH /allocations/:id)
+    // is required before closing out — every other project's description stays optional. Asked
+    // for here rather than at clock-in, since the work is only known once it's actually underway.
     // The system's own 4-hour stale-session backstop is exempt: nobody's present to type one, and
     // a session that can never auto-close because it's missing a description is worse than one
     // that closes with the description left blank.
     if (!isAutoClockOut) {
       const generalCheck = await db.query(
-        'SELECT 1 FROM attendance_allocations WHERE attendance_id = $1 AND project_code IS NULL LIMIT 1',
+        'SELECT description FROM attendance_allocations WHERE attendance_id = $1 AND project_code IS NULL LIMIT 1',
         [attendanceId]
       );
-      if (generalCheck.rows.length > 0 && !(description || logCheck.rows[0].description || '').trim()) {
+      if (generalCheck.rows.length > 0 && !(generalCheck.rows[0].description || '').trim()) {
         return res.status(400).json({ error: 'A description is required when logging General (non-project) work.' });
       }
     }
@@ -2019,7 +2024,7 @@ app.get('/api/v1/attendance/active-session/:userId', async (req, res) => {
     const session = result.rows[0] || null;
     if (session) {
       const allocResult = await db.query(
-        `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+        `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion, description
          FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
         [session.attendance_id]
       );
@@ -2208,7 +2213,7 @@ app.post('/api/v1/attendance/allocations', async (req, res) => {
     );
 
     const all = await db.query(
-      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion, description
        FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
       [attendanceId]
     );
@@ -2225,12 +2230,30 @@ app.post('/api/v1/attendance/allocations', async (req, res) => {
 // show both what the system originally recorded and what the staff member says really happened.
 app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
   const { allocationId } = req.params;
-  const { userId, allocatedHours, correctedHours } = req.body;
+  const { userId, allocatedHours, correctedHours, description } = req.body;
   if (!userId) {
     return res.status(400).json({ error: 'userId is required.' });
   }
-  if (allocatedHours == null && correctedHours == null) {
-    return res.status(400).json({ error: 'Provide allocatedHours or correctedHours to update.' });
+  if (allocatedHours == null && correctedHours == null && description === undefined) {
+    return res.status(400).json({ error: 'Provide allocatedHours, correctedHours, or description to update.' });
+  }
+
+  if (description !== undefined) {
+    try {
+      const result = await db.query(
+        `UPDATE attendance_allocations aa SET description = $1
+         FROM attendance_logs al
+         WHERE aa.allocation_id = $2 AND aa.attendance_id = al.attendance_id AND al.user_id = $3
+         RETURNING aa.*`,
+        [(description || '').trim() || null, allocationId, userId]
+      );
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Allocation not found.' });
+      }
+      return res.status(200).json({ success: true, data: result.rows[0] });
+    } catch (error) {
+      return res.status(500).json({ error: 'Failed to update description.', detail: error.message });
+    }
   }
 
   try {
@@ -2342,7 +2365,7 @@ app.delete('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
     }
 
     const all = await db.query(
-      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion, description
        FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
       [attendanceId]
     );
@@ -2391,7 +2414,7 @@ app.post('/api/v1/attendance/allocations/:allocationId/reopen', async (req, res)
     );
 
     const all = await db.query(
-      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion, description
        FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
       [row.attendance_id]
     );
@@ -2440,7 +2463,7 @@ app.post('/api/v1/attendance/allocations/:allocationId/complete', async (req, re
     }
 
     const all = await db.query(
-      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion
+      `SELECT allocation_id, attendance_id, project_code, allocated_hours, accumulated_hours, corrected_hours, status, seq, started_at, completed_at, notified_at, last_edited_at, edited_after_completion, description
        FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
       [row.attendance_id]
     );
