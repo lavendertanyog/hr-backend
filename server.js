@@ -404,6 +404,10 @@ async function tableExists(tableName) {
   return !!result.rows?.[0]?.regclass;
 }
 
+function isAutoProgressEntry(progressSummary) {
+  return String(progressSummary || '').startsWith('Auto-progress baseline');
+}
+
 async function applyDailyProgressBaselineForReporter(reporterId, projectCode = null) {
   if (!reporterId) return;
 
@@ -2642,6 +2646,64 @@ app.post('/api/v1/projects/budget-request', async (req, res) => {
 });
 
 // ========================================================================
+// ROUTE: EDIT / DELETE A BUDGET REQUEST (the requester's own, while still PENDING —
+// once a manager or account manager has acted on it, it's no longer editable)
+// ========================================================================
+app.patch('/api/v1/projects/budget-request/:requestId', async (req, res) => {
+  const { requestId } = req.params;
+  const { userId, requestedHours, justification } = req.body;
+  const requestedNumber = parseFloat(requestedHours);
+
+  if (isNaN(requestedNumber) || requestedNumber <= 0) {
+    return res.status(400).json({ error: 'requestedHours must be a positive number.' });
+  }
+
+  try {
+    const existing = await db.query('SELECT user_id, status FROM budget_requests WHERE request_id = $1', [requestId]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Budget request not found.' });
+    }
+    if (existing.rows[0].user_id !== userId) {
+      return res.status(403).json({ error: 'You can only edit your own budget requests.' });
+    }
+    if (existing.rows[0].status !== 'PENDING') {
+      return res.status(400).json({ error: 'This request has already been reviewed and can no longer be edited.' });
+    }
+
+    const result = await db.query(
+      `UPDATE budget_requests SET requested_hours = $2, justification = $3 WHERE request_id = $1 RETURNING *`,
+      [requestId, requestedNumber, justification?.trim() || null]
+    );
+    res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update budget request.', detail: error.message });
+  }
+});
+
+app.delete('/api/v1/projects/budget-request/:requestId', async (req, res) => {
+  const { requestId } = req.params;
+  const { userId } = req.body;
+
+  try {
+    const existing = await db.query('SELECT user_id, status FROM budget_requests WHERE request_id = $1', [requestId]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Budget request not found.' });
+    }
+    if (existing.rows[0].user_id !== userId) {
+      return res.status(403).json({ error: 'You can only delete your own budget requests.' });
+    }
+    if (existing.rows[0].status !== 'PENDING') {
+      return res.status(400).json({ error: 'This request has already been reviewed and can no longer be deleted.' });
+    }
+
+    await db.query('DELETE FROM budget_requests WHERE request_id = $1', [requestId]);
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete budget request.', detail: error.message });
+  }
+});
+
+// ========================================================================
 // ROUTE: FETCH MANAGER'S DIRECT TEAM PENDING LEAVE REQUESTS 
 // ========================================================================
 // GET all leave (not just pending) for history view
@@ -3059,6 +3121,65 @@ app.post('/api/v1/projects/progress-log', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: 'Internal pipeline transaction block failure.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: EDIT / DELETE A PROGRESS LOG ENTRY (the reporter's own manual entries only —
+// system-generated "Auto-progress baseline" rows can't be edited or deleted)
+// ========================================================================
+app.patch('/api/v1/projects/progress-log/:logId', async (req, res) => {
+  const { logId } = req.params;
+  const { userId, completionPercentage, progressSummary } = req.body;
+
+  const percentage = parseFloat(completionPercentage);
+  if (isNaN(percentage) || percentage < 0 || percentage > 100) {
+    return res.status(400).json({ error: 'Completion % must be between 0 and 100.' });
+  }
+
+  try {
+    const existing = await db.query('SELECT reporter_id, progress_summary FROM project_progress_logs WHERE log_id = $1', [logId]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Progress log entry not found.' });
+    }
+    if (existing.rows[0].reporter_id !== userId) {
+      return res.status(403).json({ error: 'You can only edit your own progress entries.' });
+    }
+    if (isAutoProgressEntry(existing.rows[0].progress_summary)) {
+      return res.status(400).json({ error: 'System-generated progress entries cannot be edited.' });
+    }
+
+    const result = await db.query(
+      `UPDATE project_progress_logs SET completion_percentage = $2, progress_summary = $3 WHERE log_id = $1
+       RETURNING log_id, project_code, completion_percentage, progress_summary, logged_at`,
+      [logId, percentage, progressSummary?.trim() || `Progress update: ${percentage}%`]
+    );
+    res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update progress entry.', detail: error.message });
+  }
+});
+
+app.delete('/api/v1/projects/progress-log/:logId', async (req, res) => {
+  const { logId } = req.params;
+  const { userId } = req.body;
+
+  try {
+    const existing = await db.query('SELECT reporter_id, progress_summary FROM project_progress_logs WHERE log_id = $1', [logId]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Progress log entry not found.' });
+    }
+    if (existing.rows[0].reporter_id !== userId) {
+      return res.status(403).json({ error: 'You can only delete your own progress entries.' });
+    }
+    if (isAutoProgressEntry(existing.rows[0].progress_summary)) {
+      return res.status(400).json({ error: 'System-generated progress entries cannot be deleted.' });
+    }
+
+    await db.query('DELETE FROM project_progress_logs WHERE log_id = $1', [logId]);
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete progress entry.', detail: error.message });
   }
 });
 
