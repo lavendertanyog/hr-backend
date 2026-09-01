@@ -3068,9 +3068,11 @@ app.get('/api/v1/leave/balance/:userId', async (req, res) => {
 app.post('/api/v1/projects/progress-log', async (req, res) => {
   const { projectCode, reporterId, completionPercentage, progressSummary } = req.body;
 
-  const percentage = parseFloat(completionPercentage);
-  if (isNaN(percentage) || percentage < 0 || percentage > 100) {
-    return res.status(400).json({ error: "Validation Exception: metrics must sit strictly between 0.00% and 100.00%." });
+  // completionPercentage is the progress MADE this update (e.g. "10" for +10%), not the new
+  // running total — staff shouldn't have to remember and re-type where they already were.
+  const increment = parseFloat(completionPercentage);
+  if (isNaN(increment) || increment <= 0 || increment > 100) {
+    return res.status(400).json({ error: "Validation Exception: progress added must be greater than 0% and at most 100%." });
   }
 
   try {
@@ -3103,7 +3105,10 @@ app.post('/api/v1/projects/progress-log', async (req, res) => {
     );
 
     const baseline = latestProgress.rows.length > 0 ? Number(latestProgress.rows[0].completion_percentage || 0) : 0;
-    const effectivePercentage = Math.max(percentage, baseline);
+    if (baseline >= 100) {
+      return res.status(400).json({ error: 'This project is already at 100% completion.' });
+    }
+    const effectivePercentage = Math.min(100, baseline + increment);
 
     const insertLogQuery = `
       INSERT INTO project_progress_logs (log_id, project_code, reporter_id, completion_percentage, progress_summary, logged_at)
