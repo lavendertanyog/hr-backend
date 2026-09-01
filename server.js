@@ -688,15 +688,14 @@ app.post('/api/v1/auth/login', async (req, res) => {
 // ADMIN ROUTES (is_admin = true required)
 // ========================================================================
 
-// Helper: verify requester is admin. Note: this used to also pass any 'hr'-role user via an
-// "|| userHasRole(row, 'hr')" fallback, which meant EVERY HR user — not just Rebecca Lau /
-// hr.admin@nextan.com.sg — had full admin access despite the frontend's own "Access Denied"
-// messaging implying otherwise. is_admin is the only real gate now.
+// Helper: verify requester is admin. Any user holding the 'hr' role gets full admin access —
+// HR is a single tier, not split between a designated admin and everyone else — with is_admin
+// as an additional (not exclusive) way in for anyone specifically flagged that way.
 async function requireAdmin(adminId, res) {
   if (!adminId) { res.status(400).json({ error: 'adminId is required.' }); return false; }
   const r = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1 LIMIT 1', [adminId]);
   const row = r.rows[0];
-  if (!row || !row.is_admin) {
+  if (!row || (!row.is_admin && !userHasRole(row, 'hr'))) {
     res.status(403).json({ error: 'Admin access required.' });
     return false;
   }
