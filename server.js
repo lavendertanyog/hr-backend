@@ -4550,7 +4550,7 @@ app.get('/api/v1/manager/:managerId/attendance-logs', async (req, res) => {
          al.remark,
          al.created_at,
          COALESCE(
-           (SELECT json_agg(json_build_object('project_code', aa.project_code, 'allocated_hours', aa.allocated_hours, 'accumulated_hours', aa.accumulated_hours, 'status', aa.status, 'edited_after_completion', aa.edited_after_completion, 'last_edited_at', aa.last_edited_at) ORDER BY aa.seq)
+           (SELECT json_agg(json_build_object('project_code', aa.project_code, 'allocated_hours', aa.allocated_hours, 'accumulated_hours', aa.accumulated_hours, 'status', aa.status, 'edited_after_completion', aa.edited_after_completion, 'last_edited_at', aa.last_edited_at, 'description', aa.description) ORDER BY aa.seq)
             FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id),
            '[]'
          ) AS allocations
@@ -4597,7 +4597,7 @@ app.get('/api/v1/hr/attendance-logs', async (req, res) => {
          al.remark,
          al.created_at,
          COALESCE(
-           (SELECT json_agg(json_build_object('project_code', aa.project_code, 'allocated_hours', aa.allocated_hours, 'accumulated_hours', aa.accumulated_hours, 'status', aa.status, 'edited_after_completion', aa.edited_after_completion, 'last_edited_at', aa.last_edited_at) ORDER BY aa.seq)
+           (SELECT json_agg(json_build_object('project_code', aa.project_code, 'allocated_hours', aa.allocated_hours, 'accumulated_hours', aa.accumulated_hours, 'status', aa.status, 'edited_after_completion', aa.edited_after_completion, 'last_edited_at', aa.last_edited_at, 'description', aa.description) ORDER BY aa.seq)
             FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id),
            '[]'
          ) AS allocations
