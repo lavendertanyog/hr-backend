@@ -2231,11 +2231,60 @@ app.post('/api/v1/attendance/allocations', async (req, res) => {
 app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
   const { allocationId } = req.params;
   const { userId, allocatedHours, correctedHours, description } = req.body;
+  const projectCodeProvided = req.body.projectCode !== undefined;
+  const projectCode = projectCodeProvided ? normalizeProjectCode(req.body.projectCode) : undefined;
   if (!userId) {
     return res.status(400).json({ error: 'userId is required.' });
   }
-  if (allocatedHours == null && correctedHours == null && description === undefined) {
-    return res.status(400).json({ error: 'Provide allocatedHours, correctedHours, or description to update.' });
+  if (allocatedHours == null && correctedHours == null && description === undefined && !projectCodeProvided) {
+    return res.status(400).json({ error: 'Provide allocatedHours, correctedHours, description, or projectCode to update.' });
+  }
+
+  if (projectCodeProvided) {
+    try {
+      const target = await db.query(
+        `SELECT aa.attendance_id FROM attendance_allocations aa
+         JOIN attendance_logs al ON al.attendance_id = aa.attendance_id
+         WHERE aa.allocation_id = $1 AND al.user_id = $2`,
+        [allocationId, userId]
+      );
+      if (target.rows.length === 0) {
+        return res.status(404).json({ error: 'Allocation not found.' });
+      }
+      const { attendance_id: attendanceId } = target.rows[0];
+
+      if (projectCode) {
+        const userProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
+        if (!userIsManagerial(userProfile.rows[0])) {
+          const assignCheck = await db.query(
+            'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
+            [userId, projectCode]
+          );
+          if (assignCheck.rows.length === 0) {
+            return res.status(403).json({ error: `You are not assigned to project ${projectCode}. Please ask your manager to assign you first.` });
+          }
+        }
+      }
+
+      const sibling = await db.query(
+        `SELECT allocation_id FROM attendance_allocations
+         WHERE attendance_id = $1 AND allocation_id != $2
+           AND project_code IS NOT DISTINCT FROM $3`,
+        [attendanceId, allocationId, projectCode]
+      );
+      if (sibling.rows.length > 0) {
+        return res.status(409).json({ error: `${projectCode || 'General'} is already on this entry — delete the other block first, or edit that one instead.` });
+      }
+
+      const result = await db.query(
+        `UPDATE attendance_allocations SET project_code = $1, last_edited_at = CURRENT_TIMESTAMP
+         WHERE allocation_id = $2 RETURNING *`,
+        [projectCode, allocationId]
+      );
+      return res.status(200).json({ success: true, data: result.rows[0] });
+    } catch (error) {
+      return res.status(500).json({ error: 'Failed to update project code.', detail: error.message });
+    }
   }
 
   if (description !== undefined) {
