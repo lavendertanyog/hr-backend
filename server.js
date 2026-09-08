@@ -303,6 +303,22 @@ async function ensureOperationalTables() {
   // submitting without one previously crashed with a 500. DROP NOT NULL is a no-op if already dropped.
   await db.query(`ALTER TABLE budget_requests ALTER COLUMN justification DROP NOT NULL;`);
 
+  // Generic audit trail — every edit to user-facing data (attendance times, allocation
+  // project/hours, progress %, leave requests, budget/project approvals, ...) is recorded here
+  // as a before/after snapshot, via auditInterceptor(). One shared table rather than a
+  // per-feature original_* column, so new editable fields don't need their own schema change.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      audit_id SERIAL PRIMARY KEY,
+      table_name TEXT NOT NULL,
+      record_id TEXT NOT NULL,
+      altered_by UUID REFERENCES users(user_id),
+      pre_value JSONB,
+      post_value JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
   // Password reset requests table
   await db.query(`
     CREATE TABLE IF NOT EXISTS password_reset_requests (
@@ -1387,24 +1403,16 @@ app.get('/api/v1/leave/my-requests/:userId', async (req, res) => {
 });
 
 // ========================================================================
-// CORE UTILITY: AUDIT INTERCEPTOR (Void-and-Replace)
+// CORE UTILITY: AUDIT INTERCEPTOR
 // ========================================================================
-async function auditInterceptor(tableName, recordId, userId, postValue) {
+// Records a before/after snapshot of an edit. preValue MUST be read by the caller BEFORE
+// running its UPDATE — reading it here (after the fact) would just capture the new row twice,
+// which is exactly the bug this used to have (pre_value and post_value were always identical).
+async function auditInterceptor(tableName, recordId, userId, preValue, postValue) {
     try {
-        // Determine the correct ID column based on table
-        const idCol = tableName === 'projects'
-          ? 'project_code'
-          : tableName === 'leave_applications'
-            ? 'leave_id'
-            : tableName === 'budget_requests'
-              ? 'request_id'
-              : 'id';
-        const oldRecord = await db.query(`SELECT * FROM ${tableName} WHERE ${idCol} = $1`, [recordId]);
-        
-        // NOTE: audit_logs.pre_value and audit_logs.post_value should be JSONB in PostgreSQL
         await db.query(
             'INSERT INTO audit_logs (table_name, record_id, altered_by, pre_value, post_value, created_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)',
-            [tableName, recordId.toString(), userId, JSON.stringify(oldRecord.rows[0]), JSON.stringify(postValue)]
+            [tableName, String(recordId), userId, JSON.stringify(preValue ?? null), JSON.stringify(postValue ?? null)]
         );
     } catch (err) {
         console.error("Audit Interceptor Failure:", err.message);
@@ -1920,7 +1928,7 @@ app.patch('/api/v1/attendance/:attendanceId/edit-times', async (req, res) => {
 
   try {
     const existing = await db.query(
-      'SELECT attendance_id, clock_in_time, clock_out_time FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2',
+      'SELECT * FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2',
       [attendanceId, userId]
     );
     if (existing.rows.length === 0) {
@@ -1955,6 +1963,8 @@ app.patch('/api/v1/attendance/:attendanceId/edit-times', async (req, res) => {
        RETURNING attendance_id, clock_in_time, clock_out_time, daily_worktime_hours, ot_hours_accrued`,
       [attendanceId, start.toISOString(), end.toISOString(), dailyWorktimeHours, otHoursAccrued]
     );
+
+    await auditInterceptor('attendance_logs', attendanceId, userId, existing.rows[0], result.rows[0]);
 
     res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
@@ -2240,6 +2250,8 @@ app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
     return res.status(400).json({ error: 'Provide allocatedHours, correctedHours, description, or projectCode to update.' });
   }
 
+  const beforeAllocation = await db.query('SELECT * FROM attendance_allocations WHERE allocation_id = $1', [allocationId]);
+
   if (projectCodeProvided) {
     try {
       const target = await db.query(
@@ -2281,6 +2293,7 @@ app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
          WHERE allocation_id = $2 RETURNING *`,
         [projectCode, allocationId]
       );
+      await auditInterceptor('attendance_allocations', allocationId, userId, beforeAllocation.rows[0], result.rows[0]);
       return res.status(200).json({ success: true, data: result.rows[0] });
     } catch (error) {
       return res.status(500).json({ error: 'Failed to update project code.', detail: error.message });
@@ -2299,6 +2312,7 @@ app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
       if (result.rows.length === 0) {
         return res.status(404).json({ error: 'Allocation not found.' });
       }
+      await auditInterceptor('attendance_allocations', allocationId, userId, beforeAllocation.rows[0], result.rows[0]);
       return res.status(200).json({ success: true, data: result.rows[0] });
     } catch (error) {
       return res.status(500).json({ error: 'Failed to update description.', detail: error.message });
@@ -2322,6 +2336,7 @@ app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
       if (result.rows.length === 0) {
         return res.status(404).json({ error: 'Completed allocation not found — only completed projects can have their actual hours corrected.' });
       }
+      await auditInterceptor('attendance_allocations', allocationId, userId, beforeAllocation.rows[0], result.rows[0]);
       return res.status(200).json({ success: true, data: result.rows[0] });
     }
 
@@ -2342,6 +2357,7 @@ app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Allocation not found.' });
     }
+    await auditInterceptor('attendance_allocations', allocationId, userId, beforeAllocation.rows[0], result.rows[0]);
     res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update allocation.', detail: error.message });
@@ -2642,7 +2658,7 @@ app.patch('/api/v1/account-manager/projects/allocate-budget', async (req, res) =
   }
 
   try {
-    const projectCheck = await db.query('SELECT account_manager_id, account_manager_ids FROM projects WHERE project_code = $1', [projectCode]);
+    const projectCheck = await db.query('SELECT * FROM projects WHERE project_code = $1', [projectCode]);
     if (projectCheck.rows.length === 0) {
       return res.status(404).json({ error: `Project reference lookup failed for code: ${projectCode}` });
     }
@@ -2653,16 +2669,16 @@ app.patch('/api/v1/account-manager/projects/allocate-budget', async (req, res) =
     }
 
     const updateBudgetHoursQuery = `
-      UPDATE projects 
-      SET budget_hours = budget_hours + $1 
-      WHERE project_code = $2 
+      UPDATE projects
+      SET budget_hours = budget_hours + $1
+      WHERE project_code = $2
       RETURNING *;
     `;
 
     const result = await db.query(updateBudgetHoursQuery, [hoursNum, projectCode]);
     const updatedProject = result.rows[0];
 
-    await auditInterceptor('projects', projectCode, accountManagerId, updatedProject);
+    await auditInterceptor('projects', projectCode, accountManagerId, projectCheck.rows[0], updatedProject);
 
     res.status(200).json({ success: true, message: "Project resource budget updated successfully.", data: updatedProject });
   } catch (error) {
@@ -2910,12 +2926,14 @@ app.patch('/api/v1/leave/re-review', async (req, res) => {
     if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
     const role = normalizeRole(reviewerProfile.rows[0].user_role);
     if (role === 'staff') return res.status(403).json({ error: 'Staff users cannot review leave.' });
+    const beforeLeave = await db.query('SELECT * FROM leave_applications WHERE leave_id = $1', [leaveId]);
     const result = await db.query(
       `UPDATE leave_applications SET workflow_status = $1, reviewer_remarks = $2, reviewed_by = $3, updated_at = CURRENT_TIMESTAMP WHERE leave_id = $4 RETURNING *`,
       [action.toUpperCase(), reviewerRemarks || '', reviewerId, leaveId]
     );
     const updated = result.rows[0];
     if (!updated) return res.status(404).json({ error: 'Leave request not found.' });
+    await auditInterceptor('leave_applications', leaveId, reviewerId, beforeLeave.rows[0], updated);
     try {
       const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Decision Updated (Approved)' : 'Leave Decision Updated (Rejected)';
       const notifBody = `Your leave request has been re-reviewed and is now ${action.toLowerCase()}${reviewerRemarks ? ': ' + reviewerRemarks : '.'}`;
@@ -2957,6 +2975,8 @@ app.patch('/api/v1/leave/review', async (req, res) => {
       return res.status(403).json({ error: 'This leave request does not belong to a member of your team. Use the Approvals page to manage it, or first add this staff member to your team via My Team on the Dashboard.' });
     }
 
+    const beforeLeave = await db.query('SELECT * FROM leave_applications WHERE leave_id = $1', [leaveId]);
+
    const reviewQuery = `
       UPDATE leave_applications
       SET workflow_status = $1, reviewer_remarks = $2, reviewed_by = $3, updated_at = CURRENT_TIMESTAMP
@@ -2971,7 +2991,7 @@ app.patch('/api/v1/leave/review', async (req, res) => {
       return res.status(404).json({ error: 'No pending leave request found or it has already been processed.' });
     }
 
-    await auditInterceptor('leave_applications', leaveId, reviewerId, updatedLeave);
+    await auditInterceptor('leave_applications', leaveId, reviewerId, beforeLeave.rows[0], updatedLeave);
 
     // Notify the leave applicant
     try {
@@ -3037,12 +3057,14 @@ app.patch('/api/v1/leave/:leaveId', async (req, res) => {
       return res.status(409).json({ error: 'These dates overlap with another existing leave application.' });
     }
     const categoryUpper = category.toUpperCase();
-    await db.query(
+    const updated = await db.query(
       `UPDATE leave_applications SET category = $1, start_date = $2, end_date = $3, reason = $4,
        mc_file_url = CASE WHEN $6::text = 'SICK' THEN COALESCE($7, mc_file_url) ELSE NULL END,
-       updated_at = CURRENT_TIMESTAMP WHERE leave_id = $5`,
+       updated_at = CURRENT_TIMESTAMP WHERE leave_id = $5
+       RETURNING *`,
       [categoryUpper, startDate, endDate, reason || null, leaveId, categoryUpper, mcFileUrl || null]
     );
+    await auditInterceptor('leave_applications', leaveId, actingId, check.rows[0], updated.rows[0]);
     return res.status(200).json({ success: true });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to update leave application.', detail: error.message });
@@ -3219,7 +3241,7 @@ app.patch('/api/v1/projects/progress-log/:logId', async (req, res) => {
   }
 
   try {
-    const existing = await db.query('SELECT reporter_id, progress_summary FROM project_progress_logs WHERE log_id = $1', [logId]);
+    const existing = await db.query('SELECT * FROM project_progress_logs WHERE log_id = $1', [logId]);
     if (existing.rows.length === 0) {
       return res.status(404).json({ error: 'Progress log entry not found.' });
     }
@@ -3235,6 +3257,7 @@ app.patch('/api/v1/projects/progress-log/:logId', async (req, res) => {
        RETURNING log_id, project_code, completion_percentage, progress_summary, logged_at`,
       [logId, percentage, progressSummary?.trim() || `Progress update: ${percentage}%`]
     );
+    await auditInterceptor('project_progress_logs', logId, userId, existing.rows[0], result.rows[0]);
     res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update progress entry.', detail: error.message });
@@ -3677,6 +3700,8 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
       }
     }
 
+    const beforeBudgetRequest = await db.query('SELECT * FROM budget_requests WHERE request_id = $1', [requestId]);
+
     const result = await db.query(
       "UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP WHERE request_id = $3 AND status = 'PENDING' RETURNING *",
       [finalAction, reviewerId, requestId]
@@ -3697,7 +3722,7 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
       );
     }
 
-    await auditInterceptor('budget_requests', requestId, reviewerId, budgetRow);
+    await auditInterceptor('budget_requests', requestId, reviewerId, beforeBudgetRequest.rows[0], budgetRow);
 
     try {
       if (budgetRow.user_id) {
@@ -3981,6 +4006,8 @@ app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
     if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
     if (!userHasRole(reviewerProfile.rows[0], 'account_manager')) return res.status(403).json({ error: 'Only Account Managers can perform final budget approval.' });
 
+    const beforeBudgetRequest = await db.query('SELECT * FROM budget_requests WHERE request_id = $1', [requestId]);
+
     const result = await db.query(
       "UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP WHERE request_id = $3 AND status = 'MANAGER_APPROVED' RETURNING *",
       [action.toUpperCase(), reviewerId, requestId]
@@ -4003,7 +4030,7 @@ app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
       );
     }
 
-    await auditInterceptor('budget_requests', requestId, reviewerId, budgetRow);
+    await auditInterceptor('budget_requests', requestId, reviewerId, beforeBudgetRequest.rows[0], budgetRow);
 
     try {
       if (budgetRow.user_id) {
