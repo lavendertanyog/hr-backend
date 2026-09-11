@@ -177,6 +177,36 @@ async function ensureOperationalTables() {
     );
   `);
 
+  // Public holidays — editable by HR, read by every portal (attendance calendars, reports, and
+  // the annual reminder job below). Seeded once with the known 2026 SG gazetted dates so nothing
+  // regresses for existing users; HR can add/edit/delete freely from here on.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS public_holidays (
+      holiday_date DATE PRIMARY KEY,
+      name TEXT NOT NULL,
+      updated_by UUID REFERENCES users(user_id),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  await db.query(`
+    INSERT INTO public_holidays (holiday_date, name) VALUES
+      ('2026-01-01', 'New Year''s Day'),
+      ('2026-02-17', 'Chinese New Year'),
+      ('2026-02-18', 'Chinese New Year'),
+      ('2026-03-21', 'Hari Raya Puasa'),
+      ('2026-04-03', 'Good Friday'),
+      ('2026-05-01', 'Labour Day'),
+      ('2026-05-27', 'Hari Raya Haji'),
+      ('2026-05-31', 'Vesak Day'),
+      ('2026-06-01', 'Vesak Day (in lieu)'),
+      ('2026-08-09', 'National Day'),
+      ('2026-08-10', 'National Day (in lieu)'),
+      ('2026-11-08', 'Deepavali'),
+      ('2026-11-09', 'Deepavali (in lieu)'),
+      ('2026-12-25', 'Christmas Day')
+    ON CONFLICT (holiday_date) DO NOTHING;
+  `);
+
   // Hour allocations table
   await db.query(`
     CREATE TABLE IF NOT EXISTS hour_allocations (
@@ -2107,7 +2137,9 @@ app.get('/api/v1/attendance/project-log/:userId', async (req, res) => {
 
 // Per-session clock-in/out times (plus each session's project-hour breakdown) for the Weekly
 // Project Log's timeline chart — one row per attendance log, so the chart can position a bar at
-// its real start/end time instead of a plain accumulated-hours total.
+// its real start/end time instead of a plain accumulated-hours total. Includes a session that's
+// still clocked in (clock_out_time NULL) so a just-started session shows up immediately instead
+// of waiting for clock-out — the frontend already renders a null clock_out_time as "still active".
 app.get('/api/v1/attendance/sessions/:userId', async (req, res) => {
   const { userId } = req.params;
   const { start, end } = req.query;
@@ -2127,7 +2159,7 @@ app.get('/api/v1/attendance/sessions/:userId', async (req, res) => {
            json_build_array(json_build_object('project_code', COALESCE(al.project_code, 'General'), 'hours', al.daily_worktime_hours))
          ) AS allocations
        FROM attendance_logs al
-       WHERE al.user_id = $1 AND al.clock_out_time IS NOT NULL
+       WHERE al.user_id = $1
          AND (al.clock_in_time AT TIME ZONE 'Asia/Singapore')::date BETWEEN $2::date AND $3::date
        ORDER BY al.clock_in_time ASC`,
       [userId, start, end]
@@ -3748,7 +3780,9 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
   }
 });
 
-// GET budget requests pending Account Manager final approval (status = MANAGER_APPROVED)
+// GET budget requests pending Account Manager final approval — normally status = MANAGER_APPROVED
+// (the manager already reviewed it), but also includes a still-PENDING request on a project that
+// has no manager to review it, mirroring the "only one approver exists" logic in am-review.
 app.get('/api/v1/projects/budget-requests/pending-am', async (req, res) => {
   try {
     const hasBudgetRequestsTable = await tableExists('public.budget_requests');
@@ -3761,6 +3795,7 @@ app.get('/api/v1/projects/budget-requests/pending-am', async (req, res) => {
        JOIN projects p ON br.project_code = p.project_code
        LEFT JOIN users u ON u.user_id = br.user_id
        WHERE br.status = 'MANAGER_APPROVED'
+          OR (br.status = 'PENDING' AND (p.manager_ids IS NULL OR array_length(p.manager_ids, 1) IS NULL))
        ORDER BY br.created_at ASC`
     );
     res.status(200).json({ success: true, data: result.rows });
@@ -3834,6 +3869,113 @@ app.patch('/api/v1/hr/update-leave-entitlement', async (req, res) => {
     return res.status(200).json({ success: true, data: updated.rows[0] });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update leave entitlement.', detail: err.message });
+  }
+});
+
+// Public holidays — read is open to every portal (attendance calendars, reports); writes are
+// HR-only. Optional ?year=2027 filters to just that calendar year.
+app.get('/api/v1/public-holidays', async (req, res) => {
+  const { year } = req.query;
+  try {
+    const result = year
+      ? await db.query(`SELECT holiday_date, name FROM public_holidays WHERE EXTRACT(YEAR FROM holiday_date) = $1 ORDER BY holiday_date ASC`, [year])
+      : await db.query(`SELECT holiday_date, name FROM public_holidays ORDER BY holiday_date ASC`);
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch public holidays.', detail: error.message });
+  }
+});
+
+app.post('/api/v1/hr/public-holidays', async (req, res) => {
+  const { requesterId, holidayDate, name } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!holidayDate || !name || !String(name).trim()) {
+    return res.status(400).json({ error: 'holidayDate and name are required.' });
+  }
+  try {
+    const result = await db.query(
+      `INSERT INTO public_holidays (holiday_date, name, updated_by, updated_at)
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+       ON CONFLICT (holiday_date) DO UPDATE SET name = $2, updated_by = $3, updated_at = CURRENT_TIMESTAMP
+       RETURNING holiday_date, name`,
+      [holidayDate, String(name).trim(), requesterId]
+    );
+    return res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to save public holiday.', detail: error.message });
+  }
+});
+
+app.delete('/api/v1/hr/public-holidays/:holidayDate', async (req, res) => {
+  const { holidayDate } = req.params;
+  const { requesterId } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  try {
+    await db.query('DELETE FROM public_holidays WHERE holiday_date = $1', [holidayDate]);
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to delete public holiday.', detail: error.message });
+  }
+});
+
+// Fetches Singapore's official public holidays for a given year from data.gov.sg's consolidated
+// public-holidays dataset (2020-2027, refreshed annually by MOM) and flags which ones are
+// already in our own table, so the frontend can preview before writing anything.
+app.get('/api/v1/hr/public-holidays/fetch-official', async (req, res) => {
+  const { requesterId, year } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!year) return res.status(400).json({ error: 'year is required.' });
+  try {
+    const officialRes = await axios.get('https://data.gov.sg/api/action/datastore_search', {
+      params: { resource_id: 'd_8ef23381f9417e4d4254ee8b4dcdb176', limit: 1000 },
+    });
+    const records = officialRes.data?.result?.records || [];
+    const forYear = records
+      .filter((r) => String(r.date || '').startsWith(String(year)))
+      .map((r) => ({ holiday_date: r.date, name: r.holiday }));
+
+    const existingRes = await db.query(
+      `SELECT holiday_date, name FROM public_holidays WHERE EXTRACT(YEAR FROM holiday_date) = $1`,
+      [year]
+    );
+    const existingByDate = {};
+    existingRes.rows.forEach((h) => { existingByDate[h.holiday_date] = h.name; });
+
+    const data = forYear.map((h) => ({
+      ...h,
+      alreadyExists: Object.prototype.hasOwnProperty.call(existingByDate, h.holiday_date),
+    }));
+
+    return res.status(200).json({ success: true, data, source: 'data.gov.sg — Ministry of Manpower' });
+  } catch (error) {
+    return res.status(502).json({ error: 'Failed to fetch official holidays from data.gov.sg.', detail: error.message });
+  }
+});
+
+// Bulk-upserts holidays in one request — used after the "fetch official holidays" preview is
+// confirmed, so N holidays don't need N separate round trips.
+app.post('/api/v1/hr/public-holidays/bulk', async (req, res) => {
+  const { requesterId, holidays } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!Array.isArray(holidays) || holidays.length === 0) {
+    return res.status(400).json({ error: 'holidays must be a non-empty array.' });
+  }
+  try {
+    const saved = [];
+    for (const h of holidays) {
+      if (!h.holiday_date || !h.name || !String(h.name).trim()) continue;
+      const result = await db.query(
+        `INSERT INTO public_holidays (holiday_date, name, updated_by, updated_at)
+         VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+         ON CONFLICT (holiday_date) DO UPDATE SET name = $2, updated_by = $3, updated_at = CURRENT_TIMESTAMP
+         RETURNING holiday_date, name`,
+        [h.holiday_date, String(h.name).trim(), requesterId]
+      );
+      saved.push(result.rows[0]);
+    }
+    return res.status(200).json({ success: true, data: saved });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to save public holidays.', detail: error.message });
   }
 });
 
@@ -3994,7 +4136,135 @@ app.get('/api/v1/account-manager/:userId/my-projects', async (req, res) => {
   }
 });
 
-// Account Manager final approval of budget requests (MANAGER_APPROVED → APPROVED/REJECTED)
+// Per-staff budget usage report, for every project this Account Manager manages: hours
+// allocated vs. tracked, over-budget flag, and any approved budget extensions for that
+// staff member on that project.
+app.get('/api/v1/account-manager/:userId/staff-usage-report', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const userRow = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    if (!userRow.rows[0] || !userHasRole(userRow.rows[0], 'account_manager')) {
+      return res.status(403).json({ error: 'Account Manager access required.' });
+    }
+    const result = await db.query(`
+      WITH latest_allocation AS (
+        SELECT DISTINCT ON (user_id, project_code) user_id, project_code, hours_per_week
+        FROM hour_allocations
+        WHERE account_manager_status = 'APPROVED'
+        ORDER BY user_id, project_code, created_at DESC
+      ),
+      tracked AS (
+        SELECT al.user_id, aa.project_code,
+               SUM(COALESCE(aa.corrected_hours, aa.accumulated_hours, 0)) AS used_hours
+        FROM attendance_allocations aa
+        JOIN attendance_logs al ON al.attendance_id = aa.attendance_id
+        WHERE aa.project_code IS NOT NULL
+        GROUP BY al.user_id, aa.project_code
+      ),
+      extensions AS (
+        SELECT user_id, project_code, SUM(requested_hours) AS extension_hours
+        FROM budget_requests
+        WHERE status = 'APPROVED'
+        GROUP BY user_id, project_code
+      )
+      SELECT
+        p.project_code, p.project_name, p.budget_hours AS project_budget_hours,
+        u.user_id, u.full_name,
+        COALESCE(la.hours_per_week, 0) AS allocated_hours,
+        COALESCE(t.used_hours, 0) AS used_hours,
+        COALESCE(ext.extension_hours, 0) AS extension_hours
+      FROM project_assignments pa
+      JOIN projects p ON p.project_code = pa.project_code
+      JOIN users u ON u.user_id = pa.user_id
+      LEFT JOIN latest_allocation la ON la.user_id = pa.user_id AND la.project_code = pa.project_code
+      LEFT JOIN tracked t ON t.user_id = pa.user_id AND t.project_code = pa.project_code
+      LEFT JOIN extensions ext ON ext.user_id = pa.user_id AND ext.project_code = pa.project_code
+      WHERE p.account_manager_id = $1::uuid OR $1::uuid = ANY(p.account_manager_ids::uuid[])
+      ORDER BY p.project_name ASC, u.full_name ASC
+    `, [userId]);
+
+    const rows = result.rows.map((r) => {
+      const allocated = Number(r.allocated_hours || 0);
+      const used = Number(r.used_hours || 0);
+      return {
+        ...r,
+        allocated_hours: allocated,
+        used_hours: used,
+        extension_hours: Number(r.extension_hours || 0),
+        percent_used: allocated > 0 ? Math.round((used / allocated) * 1000) / 10 : 0,
+        over_budget: allocated > 0 && used > allocated,
+      };
+    });
+    return res.status(200).json({ success: true, data: rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to build staff usage report.', detail: error.message });
+  }
+});
+
+// Per-employee budget/project usage report, across ALL of that employee's assigned projects
+// (not scoped to any single Account Manager's ownership) — used by report generators (HR/AM PDF).
+app.get('/api/v1/reports/budget-usage/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await db.query(`
+      WITH latest_allocation AS (
+        SELECT DISTINCT ON (user_id, project_code) user_id, project_code, hours_per_week
+        FROM hour_allocations
+        WHERE account_manager_status = 'APPROVED'
+        ORDER BY user_id, project_code, created_at DESC
+      ),
+      tracked AS (
+        SELECT al.user_id, aa.project_code,
+               SUM(COALESCE(aa.corrected_hours, aa.accumulated_hours, 0)) AS used_hours
+        FROM attendance_allocations aa
+        JOIN attendance_logs al ON al.attendance_id = aa.attendance_id
+        WHERE aa.project_code IS NOT NULL
+        GROUP BY al.user_id, aa.project_code
+      ),
+      extensions AS (
+        SELECT user_id, project_code, SUM(requested_hours) AS extension_hours
+        FROM budget_requests
+        WHERE status = 'APPROVED'
+        GROUP BY user_id, project_code
+      )
+      SELECT
+        p.project_code, p.project_name,
+        COALESCE(la.hours_per_week, 0) AS allocated_hours,
+        COALESCE(t.used_hours, 0) AS used_hours,
+        COALESCE(ext.extension_hours, 0) AS extension_hours
+      FROM project_assignments pa
+      JOIN projects p ON p.project_code = pa.project_code
+      LEFT JOIN latest_allocation la ON la.user_id = pa.user_id AND la.project_code = pa.project_code
+      LEFT JOIN tracked t ON t.user_id = pa.user_id AND t.project_code = pa.project_code
+      LEFT JOIN extensions ext ON ext.user_id = pa.user_id AND ext.project_code = pa.project_code
+      WHERE pa.user_id = $1::uuid
+      ORDER BY p.project_name ASC
+    `, [userId]);
+
+    const rows = result.rows.map((r) => {
+      const allocated = Number(r.allocated_hours || 0);
+      const used = Number(r.used_hours || 0);
+      return {
+        ...r,
+        allocated_hours: allocated,
+        used_hours: used,
+        extension_hours: Number(r.extension_hours || 0),
+        percent_used: allocated > 0 ? Math.round((used / allocated) * 1000) / 10 : 0,
+        over_budget: allocated > 0 && used > allocated,
+      };
+    });
+    return res.status(200).json({ success: true, data: rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to build budget usage report.', detail: error.message });
+  }
+});
+
+// Account Manager final approval of budget requests. Normally MANAGER_APPROVED → APPROVED/
+// REJECTED (the manager reviews first, AM gives final sign-off). But a project can have an AM
+// and no manager — the mirror image of a project with a manager and no AM, which manager-review
+// already handles by finalizing on its own. Here, if the project has no manager, there's no one
+// to produce a MANAGER_APPROVED state, so the AM is also allowed to act directly on a PENDING
+// request — same "only one approver exists, so their approval is final" principle either way.
 app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
   const { requestId, reviewerId, action } = req.body;
   const validActions = ['APPROVED', 'REJECTED'];
@@ -4007,10 +4277,16 @@ app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
     if (!userHasRole(reviewerProfile.rows[0], 'account_manager')) return res.status(403).json({ error: 'Only Account Managers can perform final budget approval.' });
 
     const beforeBudgetRequest = await db.query('SELECT * FROM budget_requests WHERE request_id = $1', [requestId]);
+    if (beforeBudgetRequest.rows.length === 0) return res.status(404).json({ error: 'Budget request not found.' });
+
+    const proj = await db.query('SELECT manager_ids FROM projects WHERE project_code = $1', [beforeBudgetRequest.rows[0].project_code]);
+    const projectHasManager = (proj.rows[0]?.manager_ids || []).length > 0;
+    const acceptedSourceStatus = projectHasManager ? 'MANAGER_APPROVED' : 'PENDING';
 
     const result = await db.query(
-      "UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP WHERE request_id = $3 AND status = 'MANAGER_APPROVED' RETURNING *",
-      [action.toUpperCase(), reviewerId, requestId]
+      `UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP
+       WHERE request_id = $3 AND status = $4 RETURNING *`,
+      [action.toUpperCase(), reviewerId, requestId, acceptedSourceStatus]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Budget request not found or not awaiting AM approval.' });
 
@@ -4644,6 +4920,63 @@ app.get('/api/v1/manager/:managerId/attendance-logs', async (req, res) => {
   }
 });
 
+// Account Manager: attendance logs for staff on projects this AM manages — powers the AM
+// Portal's report generator (same shape as the manager/HR variants above, scoped by project
+// ownership instead of supervisor_id).
+app.get('/api/v1/account-manager/:userId/attendance-logs', async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const amCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
+    if (amCheck.rows.length === 0 || !userHasRole(amCheck.rows[0], 'account_manager')) {
+      return res.status(403).json({ error: 'Account Manager access required.' });
+    }
+
+    const result = await db.query(
+      `SELECT
+         al.attendance_id,
+         al.user_id,
+         u.full_name,
+         al.project_code,
+         al.clock_in_time,
+         al.clock_out_time,
+         ST_Y(al.raw_coordinates::geometry) AS latitude,
+         ST_X(al.raw_coordinates::geometry) AS longitude,
+         al.location_name,
+         al.country_code,
+         al.is_manual_location,
+         al.travel_mode,
+         al.daily_worktime_hours,
+         al.ot_hours_accrued,
+         al.status,
+         al.entry_type,
+         al.is_manual_entry,
+         al.remark,
+         al.created_at,
+         COALESCE(
+           (SELECT json_agg(json_build_object('project_code', aa.project_code, 'allocated_hours', aa.allocated_hours, 'accumulated_hours', aa.accumulated_hours, 'status', aa.status, 'edited_after_completion', aa.edited_after_completion, 'last_edited_at', aa.last_edited_at, 'description', aa.description) ORDER BY aa.seq)
+            FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id),
+           '[]'
+         ) AS allocations
+       FROM attendance_logs al
+       JOIN users u ON u.user_id = al.user_id
+       WHERE EXISTS (
+         SELECT 1 FROM project_assignments pa
+         JOIN projects p ON p.project_code = pa.project_code
+         WHERE pa.user_id = al.user_id
+           AND (p.account_manager_id = $1::uuid OR $1::uuid = ANY(p.account_manager_ids::uuid[]))
+       )
+       ORDER BY al.created_at DESC
+       LIMIT 500`,
+      [userId]
+    );
+
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch attendance logs.', detail: error.message });
+  }
+});
+
 // HR: attendance logs across ALL employees (unlike the manager-scoped endpoint above,
 // which is limited to direct reports)
 app.get('/api/v1/hr/attendance-logs', async (req, res) => {
@@ -4805,6 +5138,59 @@ function isSgtLunchWindow(sgt) {
   return hourDecimal >= 12 && hourDecimal < 14;
 }
 
+// A budget request reaches MANAGER_APPROVED expecting an Account Manager to give the final
+// sign-off — but if the project has no AM (removed after the manager's review, or the project
+// never had one), nothing can ever move it past MANAGER_APPROVED: the AM-review endpoint only
+// accepts requests already at that status, and there's no AM to call it. This sweep finds any
+// such orphaned request and finalizes it exactly like a normal approval (bump budget_hours +
+// the requester's hour_allocations, notify them) — the same effect as manager-review's own
+// "no AM on this project" auto-finalize, just catching requests that got stuck before or after
+// that check ran.
+async function finalizeOrphanedBudgetApprovals() {
+  try {
+    const orphaned = await db.query(
+      `SELECT br.* FROM budget_requests br
+       JOIN projects p ON p.project_code = br.project_code
+       WHERE br.status = 'MANAGER_APPROVED'
+         AND p.account_manager_id IS NULL
+         AND (p.account_manager_ids IS NULL OR array_length(p.account_manager_ids, 1) IS NULL)`
+    );
+    for (const budgetRow of orphaned.rows) {
+      const before = { ...budgetRow };
+      const result = await db.query(
+        `UPDATE budget_requests SET status = 'APPROVED', reviewed_at = CURRENT_TIMESTAMP
+         WHERE request_id = $1 AND status = 'MANAGER_APPROVED' RETURNING *`,
+        [budgetRow.request_id]
+      );
+      if (result.rows.length === 0) continue; // already handled by a concurrent request
+      const finalized = result.rows[0];
+
+      await db.query('UPDATE projects SET budget_hours = budget_hours + $1 WHERE project_code = $2', [finalized.requested_hours, finalized.project_code]);
+      await db.query(
+        `UPDATE hour_allocations
+         SET hours_per_week = hours_per_week + $1
+         WHERE user_id = $2 AND project_code = $3
+           AND account_manager_status = 'APPROVED'`,
+        [finalized.requested_hours, finalized.user_id, finalized.project_code]
+      );
+      await auditInterceptor('budget_requests', finalized.request_id, finalized.reviewed_by, before, finalized);
+
+      try {
+        if (finalized.user_id) {
+          const title = 'Request for Additional Hours — Fully Approved!';
+          const body = `Your request for additional hours of ${finalized.requested_hours}hrs for project ${finalized.project_code} has been fully approved (no Account Manager is assigned to this project).`;
+          await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [finalized.user_id, title, body]);
+          await sendPushToUser(finalized.user_id, title, body);
+        }
+      } catch (_) {}
+
+      console.log(`[budget-approval] Auto-finalized orphaned MANAGER_APPROVED request ${finalized.request_id} (project ${finalized.project_code} has no Account Manager).`);
+    }
+  } catch (error) {
+    console.error('[budget-approval] Orphaned-request sweep failed:', error.message);
+  }
+}
+
 async function autoClockOutStaleSessions() {
   const sgt = sgtNowServer();
   if (isSgtLunchWindow(sgt)) return; // lunch: hold off the forced clock-out, same as the client
@@ -4833,6 +5219,33 @@ async function autoClockOutStaleSessions() {
   }
 }
 
+// ANNUAL REMINDER: on 1 December (SGT) each year — one month before New Year — nudge every HR
+// user to add next year's public holidays. Guarded against re-sending by checking whether a
+// notification with that exact title already exists, so checking hourly (cheap insurance against
+// a restart landing right on the day) never produces duplicates.
+async function checkAnnualHolidayReminder() {
+  const sgt = sgtNowServer();
+  if (sgt.getUTCMonth() !== 11 || sgt.getUTCDate() !== 1) return; // December 1st only
+  const nextYear = sgt.getUTCFullYear() + 1;
+  const title = `Update public holidays for ${nextYear}`;
+  try {
+    const already = await db.query('SELECT 1 FROM notifications WHERE title = $1 LIMIT 1', [title]);
+    if (already.rows.length > 0) return;
+
+    const hrUsers = await db.query(
+      `SELECT user_id FROM users WHERE account_status = 'active' AND (user_role = 'hr' OR 'hr' = ANY(user_roles))`
+    );
+    const body = `New Year is about a month away — add ${nextYear}'s public holidays in the Calendar page so attendance and reports reflect them correctly.`;
+    for (const row of hrUsers.rows) {
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [row.user_id, title, body]);
+      sendPushToUser(row.user_id, title, body).catch(() => {});
+    }
+    console.log(`[holiday-reminder] Sent ${hrUsers.rows.length} reminder(s) for ${nextYear} public holidays.`);
+  } catch (error) {
+    console.error('[holiday-reminder] Failed:', error.message);
+  }
+}
+
 // In server.js
 const PORT = process.env.PORT || 5000; // Changed from 3000
 ensureOperationalTables()
@@ -4841,6 +5254,10 @@ ensureOperationalTables()
       console.log(`Backend API Server running on port ${PORT}`);
       setInterval(autoClockOutStaleSessions, 60 * 1000);
       autoClockOutStaleSessions();
+      setInterval(checkAnnualHolidayReminder, 60 * 60 * 1000);
+      checkAnnualHolidayReminder();
+      setInterval(finalizeOrphanedBudgetApprovals, 5 * 60 * 1000);
+      finalizeOrphanedBudgetApprovals();
     });
   })
   .catch((error) => {
