@@ -570,7 +570,9 @@ app.post('/api/v1/auth/signup', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
   const normalized = email.trim().toLowerCase();
-  if (!normalized.endsWith('@nextan.com.sg')) {
+  // Temporary allowance for testing the SES email flow end-to-end — remove once done.
+  const SIGNUP_DOMAIN_EXCEPTIONS = ['unicorntanyongnie@gmail.com'];
+  if (!normalized.endsWith('@nextan.com.sg') && !SIGNUP_DOMAIN_EXCEPTIONS.includes(normalized)) {
     return res.status(403).json({ error: 'Only @nextan.com.sg emails are allowed.' });
   }
   try {
