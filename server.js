@@ -90,10 +90,10 @@ async function sendVerificationEmail(toEmail, verifyUrl) {
   const html = brandedEmailHtml({
     linkOrigin: new URL(verifyUrl).origin,
     heading: 'Verify your email',
-    bodyHtml: 'Welcome to Nextan HR. Confirm this is your email address to finish setting up your account - this link expires in 24 hours.',
+    bodyHtml: `Confirm this is your email address (${toEmail}) to finish setting up your account - this link expires in 24 hours.`,
     buttonText: 'Verify email',
     buttonUrl: verifyUrl,
-    footerText: "If you didn't create a Nextan HR account, you can safely ignore this email.",
+    footerText: "If you didn't create an account, you can safely ignore this email.",
   });
   await sendEmail(toEmail, 'Verify your Nextan HR email', html);
 }
