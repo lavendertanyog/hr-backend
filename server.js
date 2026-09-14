@@ -38,11 +38,11 @@ async function sendEmail(toEmail, subject, html) {
   }));
 }
 
-async function sendPasswordResetEmail(toEmail, resetUrl) {
-  // Logo is pulled from the same portal the reset was requested on (staff/manager/HR/account
-  // manager each serve their own copy at /nextan-logo.png), so the email always matches.
-  const logoUrl = `${new URL(resetUrl).origin}/nextan-logo.png`;
-  const html = `<!doctype html>
+// Shared branded shell for transactional emails — logo, heading, body copy, one primary button,
+// a footer note. `linkOrigin` picks the logo to match whichever portal triggered the email.
+function brandedEmailHtml({ linkOrigin, heading, bodyHtml, buttonText, buttonUrl, footerText }) {
+  const logoUrl = `${linkOrigin}/nextan-logo.png`;
+  return `<!doctype html>
 <html><head><meta charset="utf-8" /></head>
 <body style="margin:0;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 16px;font-family:Arial,Helvetica,sans-serif;">
@@ -52,25 +52,50 @@ async function sendPasswordResetEmail(toEmail, resetUrl) {
         <img src="${logoUrl}" alt="Nextan" height="32" style="height:32px;width:auto;" />
       </td></tr>
       <tr><td style="padding:28px 40px 0 40px;">
-        <h1 style="margin:0;font-size:20px;line-height:1.3;color:#0f172a;font-weight:700;">Reset your password</h1>
+        <h1 style="margin:0;font-size:20px;line-height:1.3;color:#0f172a;font-weight:700;">${heading}</h1>
         <p style="margin:12px 0 0 0;font-size:14px;line-height:1.6;color:#475569;">
-          We received a request to reset the password for your Nextan HR account. Click the button below to choose a new one - this link expires in 30 minutes.
+          ${bodyHtml}
         </p>
       </td></tr>
       <tr><td style="padding:24px 40px 0 40px;text-align:center;">
-        <a href="${resetUrl}" style="display:inline-block;background:#0c3b8f;color:#ffffff;text-decoration:none;font-size:14px;font-weight:700;padding:12px 28px;border-radius:12px;">Reset password</a>
+        <a href="${buttonUrl}" style="display:inline-block;background:#0c3b8f;color:#ffffff;text-decoration:none;font-size:14px;font-weight:700;padding:12px 28px;border-radius:12px;">${buttonText}</a>
       </td></tr>
       <tr><td style="padding:28px 40px 32px 40px;">
         <hr style="border:none;border-top:1px solid #e2e8f0;margin:0 0 20px 0;" />
         <p style="margin:0;font-size:12px;line-height:1.6;color:#94a3b8;">
-          If you didn't request a password reset, you can safely ignore this email - your password won't change.
+          ${footerText}
         </p>
       </td></tr>
     </table>
   </td></tr>
 </table>
 </body></html>`;
+}
+
+async function sendPasswordResetEmail(toEmail, resetUrl) {
+  // Logo is pulled from the same portal the reset was requested on (staff/manager/HR/account
+  // manager each serve their own copy at /nextan-logo.png), so the email always matches.
+  const html = brandedEmailHtml({
+    linkOrigin: new URL(resetUrl).origin,
+    heading: 'Reset your password',
+    bodyHtml: 'We received a request to reset the password for your Nextan HR account. Click the button below to choose a new one - this link expires in 30 minutes.',
+    buttonText: 'Reset password',
+    buttonUrl: resetUrl,
+    footerText: "If you didn't request a password reset, you can safely ignore this email - your password won't change.",
+  });
   await sendEmail(toEmail, 'Reset your Nextan HR password', html);
+}
+
+async function sendVerificationEmail(toEmail, verifyUrl) {
+  const html = brandedEmailHtml({
+    linkOrigin: new URL(verifyUrl).origin,
+    heading: 'Verify your email',
+    bodyHtml: 'Welcome to Nextan HR. Confirm this is your email address to finish setting up your account - this link expires in 24 hours.',
+    buttonText: 'Verify email',
+    buttonUrl: verifyUrl,
+    footerText: "If you didn't create a Nextan HR account, you can safely ignore this email.",
+  });
+  await sendEmail(toEmail, 'Verify your Nextan HR email', html);
 }
 
 // Send push notification to a user via their stored Expo push token
@@ -421,6 +446,20 @@ async function ensureOperationalTables() {
     );
   `);
 
+  // Self-service email verification, proving the signup email is real and owned by the
+  // signer-upper — replaces admin approval as the login gate for new accounts. HR can still
+  // revoke access afterward via the existing approve-account (reject) endpoint.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS email_verification_tokens (
+      token_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      token TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
   // HR-configurable per-employee leave entitlement (replaces hardcoded 12-day balance)
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS leave_entitlement_days INTEGER NOT NULL DEFAULT 12;`);
 
@@ -567,7 +606,7 @@ async function applyDailyProgressBaselineForManagerTeam(managerId) {
 // ROUTE: EMAIL/PASSWORD SIGNUP
 // ========================================================================
 app.post('/api/v1/auth/signup', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, portalUrl } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
   const normalized = email.trim().toLowerCase();
   // Temporary allowance for testing the SES email flow end-to-end — remove once done.
@@ -602,8 +641,12 @@ app.post('/api/v1/auth/signup', async (req, res) => {
     const fullName = deriveNameFromEmail(normalized);
     const resolvedRole = await getDefaultUserRole(signupRole);
 
+    // 'unverified' replaces 'pending' as the default for new signups — the login gate is now
+    // self-service email verification (see /auth/verify-email) rather than admin approval.
+    // 'pending' stays supported for any accounts already sitting in that state, and admins can
+    // still revoke a verified account by rejecting it via /admin/approve-account.
     const insertCols = ['user_id', 'full_name', 'user_role', 'user_roles', 'email', 'password_hash', 'account_status'];
-    const insertVals = [userId, fullName, resolvedRole, allRoles, normalized, passwordHash, 'pending'];
+    const insertVals = [userId, fullName, resolvedRole, allRoles, normalized, passwordHash, 'unverified'];
     if (columns.has('phone')) {
       insertCols.push('phone');
       insertVals.push('');
@@ -618,14 +661,87 @@ app.post('/api/v1/auth/signup', async (req, res) => {
       `INSERT INTO users (${insertCols.join(', ')}) VALUES (${placeholders}) RETURNING user_id, full_name, user_role, user_roles, email`,
       insertVals
     );
+
+    const verifyToken = randomUUID() + randomUUID();
+    await db.query(
+      `INSERT INTO email_verification_tokens (user_id, token, expires_at) VALUES ($1, $2, CURRENT_TIMESTAMP + INTERVAL '24 hours')`,
+      [userId, verifyToken]
+    );
+    const origin = (portalUrl || 'https://hr.nextantech.com').replace(/\/$/, '');
+    const verifyUrl = `${origin}/verify-email?token=${verifyToken}`;
+    try {
+      await sendVerificationEmail(normalized, verifyUrl);
+    } catch (emailError) {
+      console.error('[signup] verification email failed for', normalized, emailError);
+    }
+
     return res.status(201).json({
       success: true,
-      pending: true,
-      message: 'Account created. Awaiting admin approval from rebecca.lau@nextan.com.sg to approve before signing in.',
+      unverified: true,
+      message: 'Account created. Check your email for a link to verify your account before signing in.',
       data: result.rows[0],
     });
   } catch (error) {
     return res.status(500).json({ error: 'Signup failed.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: VERIFY EMAIL (activates the account — no admin approval needed)
+// ========================================================================
+app.post('/api/v1/auth/verify-email', async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'Token is required.' });
+
+  try {
+    const tokenRes = await db.query(
+      `SELECT token_id, user_id FROM email_verification_tokens
+       WHERE token = $1 AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP`,
+      [token]
+    );
+    const row = tokenRes.rows[0];
+    if (!row) {
+      return res.status(400).json({ error: 'This verification link is invalid or has expired. Request a new one.' });
+    }
+
+    await db.query(`UPDATE users SET account_status = 'active' WHERE user_id = $1 AND account_status = 'unverified'`, [row.user_id]);
+    await db.query('UPDATE email_verification_tokens SET used_at = CURRENT_TIMESTAMP WHERE token_id = $1', [row.token_id]);
+    return res.status(200).json({ success: true, message: 'Email verified. You can now log in.' });
+  } catch (error) {
+    console.error('[verify-email] failed', error);
+    return res.status(500).json({ error: 'Failed to verify email.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: RESEND VERIFICATION EMAIL
+// ========================================================================
+app.post('/api/v1/auth/resend-verification', async (req, res) => {
+  const { email, portalUrl } = req.body;
+  if (!email || !portalUrl) return res.status(400).json({ error: 'Email and portalUrl are required.' });
+  const normalized = email.trim().toLowerCase();
+
+  try {
+    const userRes = await db.query(`SELECT user_id FROM users WHERE LOWER(email) = $1 AND account_status = 'unverified' LIMIT 1`, [normalized]);
+    const user = userRes.rows[0];
+    // Same generic response regardless of match, so this can't be used to probe accounts.
+    if (user) {
+      const verifyToken = randomUUID() + randomUUID();
+      await db.query(
+        `INSERT INTO email_verification_tokens (user_id, token, expires_at) VALUES ($1, $2, CURRENT_TIMESTAMP + INTERVAL '24 hours')`,
+        [user.user_id, verifyToken]
+      );
+      const origin = portalUrl.replace(/\/$/, '');
+      const verifyUrl = `${origin}/verify-email?token=${verifyToken}`;
+      await sendVerificationEmail(normalized, verifyUrl);
+      console.log('[resend-verification] sent to', normalized);
+    } else {
+      console.log('[resend-verification] no unverified account for', normalized);
+    }
+    return res.status(200).json({ success: true, message: 'If an unverified account exists for that email, a new verification link has been sent.' });
+  } catch (error) {
+    console.error('[resend-verification] failed for', normalized, error);
+    return res.status(500).json({ error: 'Failed to resend verification email.', detail: error.message });
   }
 });
 
@@ -755,6 +871,9 @@ app.post('/api/v1/auth/login', async (req, res) => {
     // deactivated account (any other non-active status, e.g. 'inactive') could still log in —
     // only the separate, slower verify-session poll would eventually catch it after the fact.
     const status = String(user.account_status || 'active').toLowerCase();
+    if (status === 'unverified') {
+      return res.status(403).json({ error: 'Please verify your email first. Check your inbox for the verification link, or request a new one.', unverified: true });
+    }
     if (status === 'pending') {
       return res.status(403).json({ error: 'Your account is pending admin approval. Please wait for Rebecca Lau or hr.admin@nextan.com.sg to approve your account.' });
     }
