@@ -666,6 +666,7 @@ app.post('/api/v1/auth/forgot-password', async (req, res) => {
     }
     return res.status(200).json({ success: true, message: 'If an account exists for that email, a reset link has been sent.' });
   } catch (error) {
+    console.error('[forgot-password] failed for', normalized, error);
     return res.status(500).json({ error: 'Failed to process reset request.', detail: error.message });
   }
 });
