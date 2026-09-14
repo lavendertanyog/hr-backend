@@ -268,6 +268,10 @@ async function ensureOperationalTables() {
     );
   `);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS mc_file_url TEXT;`);
+  // ADD COLUMN IF NOT EXISTS above is a no-op on databases where mc_file_url already existed as
+  // varchar(512) from an older migration — that cap silently rejects any real base64-encoded MC
+  // image (thousands of chars), so widen it explicitly. TEXT->TEXT is a harmless no-op elsewhere.
+  await db.query(`ALTER TABLE leave_applications ALTER COLUMN mc_file_url TYPE TEXT;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS is_late_submission BOOLEAN NOT NULL DEFAULT FALSE;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reviewer_remarks TEXT;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS workflow_status TEXT NOT NULL DEFAULT 'PENDING';`);
