@@ -691,6 +691,9 @@ app.post('/api/v1/auth/forgot-password', async (req, res) => {
       );
       const resetUrl = `${portalUrl.replace(/\/$/, '')}/reset-password?token=${token}`;
       await sendPasswordResetEmail(normalized, resetUrl);
+      console.log('[forgot-password] sent reset email to', normalized);
+    } else {
+      console.log('[forgot-password] no account found for', normalized);
     }
     return res.status(200).json({ success: true, message: 'If an account exists for that email, a reset link has been sent.' });
   } catch (error) {
