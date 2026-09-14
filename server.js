@@ -14,24 +14,35 @@ if (!isRenderEnvironment) {
 const { Expo } = require('expo-server-sdk');
 const expo = new Expo();
 
-// Self-service password reset email — falls back to logging the link when no API key is
-// configured, so the flow is fully testable locally without sending real email.
-const { Resend } = require('resend');
-const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
-const RESET_EMAIL_FROM = process.env.RESET_EMAIL_FROM || 'onboarding@resend.dev';
-async function sendPasswordResetEmail(toEmail, resetUrl) {
-  if (!resend) {
-    console.log(`[password reset] No RESEND_API_KEY set — reset link for ${toEmail}: ${resetUrl}`);
+// Email sending, via AWS SES — falls back to logging when no AWS credentials are configured,
+// so any flow that sends email stays fully testable locally without sending real mail. Sends
+// from the verified mail.nextantech.com domain identity now that its DKIM records are in place.
+const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
+const sesClient = process.env.AWS_ACCESS_KEY_ID
+  ? new SESClient({ region: process.env.AWS_REGION || 'ap-southeast-1' })
+  : null;
+const SES_EMAIL_FROM = process.env.SES_EMAIL_FROM || 'noreply@mail.nextantech.com';
+
+async function sendEmail(toEmail, subject, html) {
+  if (!sesClient) {
+    console.log(`[email] No AWS credentials configured — would have sent "${subject}" to ${toEmail}.`);
     return;
   }
-  await resend.emails.send({
-    from: RESET_EMAIL_FROM,
-    to: toEmail,
-    subject: 'Reset your Nextan HR password',
-    html: `<p>Click the link below to reset your password. This link expires in 30 minutes.</p>
-           <p><a href="${resetUrl}">${resetUrl}</a></p>
-           <p>If you didn't request this, you can ignore this email.</p>`,
-  });
+  await sesClient.send(new SendEmailCommand({
+    Source: SES_EMAIL_FROM,
+    Destination: { ToAddresses: [toEmail] },
+    Message: {
+      Subject: { Data: subject, Charset: 'UTF-8' },
+      Body: { Html: { Data: html, Charset: 'UTF-8' } },
+    },
+  }));
+}
+
+async function sendPasswordResetEmail(toEmail, resetUrl) {
+  await sendEmail(toEmail, 'Reset your Nextan HR password',
+    `<p>Click the link below to reset your password. This link expires in 30 minutes.</p>
+     <p><a href="${resetUrl}">${resetUrl}</a></p>
+     <p>If you didn't request this, you can ignore this email.</p>`);
 }
 
 // Send push notification to a user via their stored Expo push token
