@@ -39,10 +39,39 @@ async function sendEmail(toEmail, subject, html) {
 }
 
 async function sendPasswordResetEmail(toEmail, resetUrl) {
-  await sendEmail(toEmail, 'Reset your Nextan HR password',
-    `<p>Click the link below to reset your password. This link expires in 30 minutes.</p>
-     <p><a href="${resetUrl}">${resetUrl}</a></p>
-     <p>If you didn't request this, you can ignore this email.</p>`);
+  // Logo is pulled from the same portal the reset was requested on (staff/manager/HR/account
+  // manager each serve their own copy at /nextan-logo.png), so the email always matches.
+  const logoUrl = `${new URL(resetUrl).origin}/nextan-logo.png`;
+  const html = `
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 16px;font-family:Arial,Helvetica,sans-serif;">
+  <tr><td align="center">
+    <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:16px;overflow:hidden;">
+      <tr><td style="padding:32px 40px 0 40px;text-align:center;">
+        <img src="${logoUrl}" alt="Nextan" height="32" style="height:32px;width:auto;" />
+      </td></tr>
+      <tr><td style="padding:28px 40px 0 40px;">
+        <h1 style="margin:0;font-size:20px;line-height:1.3;color:#0f172a;font-weight:700;">Reset your password</h1>
+        <p style="margin:12px 0 0 0;font-size:14px;line-height:1.6;color:#475569;">
+          We received a request to reset the password for your Nextan HR account. Click the button below to choose a new one — this link expires in 30 minutes.
+        </p>
+      </td></tr>
+      <tr><td style="padding:24px 40px 0 40px;text-align:center;">
+        <a href="${resetUrl}" style="display:inline-block;background:#0c3b8f;color:#ffffff;text-decoration:none;font-size:14px;font-weight:700;padding:12px 28px;border-radius:12px;">Reset password</a>
+      </td></tr>
+      <tr><td style="padding:20px 40px 0 40px;">
+        <p style="margin:0;font-size:12px;line-height:1.6;color:#94a3b8;">Or copy and paste this link into your browser:</p>
+        <p style="margin:6px 0 0 0;font-size:12px;line-height:1.5;color:#0c3b8f;word-break:break-all;">${resetUrl}</p>
+      </td></tr>
+      <tr><td style="padding:28px 40px 32px 40px;">
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:0 0 20px 0;" />
+        <p style="margin:0;font-size:12px;line-height:1.6;color:#94a3b8;">
+          If you didn't request a password reset, you can safely ignore this email — your password won't change.
+        </p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>`;
+  await sendEmail(toEmail, 'Reset your Nextan HR password', html);
 }
 
 // Send push notification to a user via their stored Expo push token
