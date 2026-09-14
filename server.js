@@ -3128,6 +3128,7 @@ app.post('/api/v1/leave/:leaveId/mc-upload', async (req, res) => {
     );
     return res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
+    console.error('[mc-upload] failed for leaveId', leaveId, error);
     return res.status(500).json({ error: 'Failed to upload MC document.', detail: error.message });
   }
 });
