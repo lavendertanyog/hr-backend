@@ -22,8 +22,13 @@ const sesClient = process.env.AWS_ACCESS_KEY_ID
   ? new SESClient({ region: process.env.AWS_REGION || 'ap-southeast-1' })
   : null;
 const SES_EMAIL_FROM = process.env.SES_EMAIL_FROM || 'noreply@mail.nextantech.com';
+// Routes every send through the "nextan-timesheet" configuration set (CloudWatch destination
+// tracking Sends/Deliveries/Hard bounces/Complaints/Delivery delays) so bounce and complaint
+// rates are actually visible instead of silently happening. The `email-type` message tag lets
+// CloudWatch break metrics down per email kind instead of one lumped-together bucket.
+const SES_CONFIGURATION_SET = process.env.SES_CONFIGURATION_SET || 'nextan-timesheet';
 
-async function sendEmail(toEmail, subject, html) {
+async function sendEmail(toEmail, subject, html, emailType = 'general') {
   if (!sesClient) {
     console.log(`[email] No AWS credentials configured — would have sent "${subject}" to ${toEmail}.`);
     return;
@@ -35,6 +40,8 @@ async function sendEmail(toEmail, subject, html) {
       Subject: { Data: subject, Charset: 'UTF-8' },
       Body: { Html: { Data: html, Charset: 'UTF-8' } },
     },
+    ConfigurationSetName: SES_CONFIGURATION_SET,
+    Tags: [{ Name: 'email-type', Value: emailType }],
   }));
 }
 
@@ -83,7 +90,7 @@ async function sendPasswordResetEmail(toEmail, resetUrl) {
     buttonUrl: resetUrl,
     footerText: "If you didn't request a password reset, you can safely ignore this email - your password won't change.",
   });
-  await sendEmail(toEmail, 'Reset your Nextan HR password', html);
+  await sendEmail(toEmail, 'Reset your Nextan HR password', html, 'password-reset');
 }
 
 async function sendVerificationEmail(toEmail, verifyUrl) {
@@ -95,7 +102,7 @@ async function sendVerificationEmail(toEmail, verifyUrl) {
     buttonUrl: verifyUrl,
     footerText: "If you didn't create an account, you can safely ignore this email.",
   });
-  await sendEmail(toEmail, 'Verify your Nextan HR email', html);
+  await sendEmail(toEmail, 'Verify your Nextan HR email', html, 'email-verification');
 }
 
 const STAFF_PORTAL_URL = process.env.STAFF_PORTAL_URL || 'https://staff.nextantech.com';
@@ -109,7 +116,7 @@ async function sendClockInReminderEmail(toEmail, fullName) {
     buttonUrl: `${STAFF_PORTAL_URL}/attendance`,
     footerText: "You're getting this because you're clocked out past your usual start time. Already clocked in? You can ignore this.",
   });
-  await sendEmail(toEmail, "You haven't clocked in yet", html);
+  await sendEmail(toEmail, "You haven't clocked in yet", html, 'clockin-reminder');
 }
 
 // Send push notification to a user via their stored Expo push token
