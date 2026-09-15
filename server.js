@@ -98,6 +98,20 @@ async function sendVerificationEmail(toEmail, verifyUrl) {
   await sendEmail(toEmail, 'Verify your Nextan HR email', html);
 }
 
+const STAFF_PORTAL_URL = process.env.STAFF_PORTAL_URL || 'https://staff.nextantech.com';
+
+async function sendClockInReminderEmail(toEmail, fullName) {
+  const html = brandedEmailHtml({
+    linkOrigin: STAFF_PORTAL_URL,
+    heading: "You haven't clocked in yet",
+    bodyHtml: `Hi ${fullName || 'there'}, it's past 8:30am and you haven't clocked in today. Head to the Staff Portal to clock in.`,
+    buttonText: 'Clock in now',
+    buttonUrl: `${STAFF_PORTAL_URL}/attendance`,
+    footerText: "You're getting this because you're clocked out past your usual start time. Already clocked in? You can ignore this.",
+  });
+  await sendEmail(toEmail, "You haven't clocked in yet", html);
+}
+
 // Send push notification to a user via their stored Expo push token
 async function sendPushToUser(userId, title, body) {
   try {
@@ -5415,6 +5429,61 @@ async function checkAnnualHolidayReminder() {
   }
 }
 
+// CLOCK-IN EMAIL REMINDER: mirrors the in-app 8:30am-noon banner in AttendanceReminders.js, but
+// as a server-side sweep so it reaches people even if they never open the portal that day — same
+// reasoning as autoClockOutStaleSessions being a backstop for the client-side "still working?"
+// cycle. Unlike the in-app banner (which re-nags every hour a tab is open), this sends at most
+// ONE email per person per day — a repeated hourly email would read as spammy in a way an in-app
+// banner doesn't. Checked every 15 minutes; each run only sends to someone once, guarded by a
+// same-day notifications-table lookup (same dedup pattern as checkAnnualHolidayReminder).
+async function checkClockInEmailReminders() {
+  const sgt = sgtNowServer();
+  const isWeekday = sgt.getUTCDay() !== 0 && sgt.getUTCDay() !== 6; // sgt's UTC getters hold the SGT wall-clock value
+  if (!isWeekday) return;
+  const hourDecimal = sgt.getUTCHours() + sgt.getUTCMinutes() / 60;
+  if (hourDecimal < 8.5 || hourDecimal >= 12) return; // same 8:30am-noon window as the in-app reminder
+
+  const reminderTitle = "You haven't clocked in yet";
+  try {
+    const staffUsers = await db.query(
+      `SELECT user_id, full_name, email FROM users
+       WHERE account_status = 'active' AND NOT is_hidden AND email IS NOT NULL
+         AND (user_role = 'staff' OR 'staff' = ANY(user_roles))`
+    );
+
+    let sent = 0;
+    for (const row of staffUsers.rows) {
+      const clockedInToday = await db.query(
+        `SELECT 1 FROM attendance_logs
+         WHERE user_id = $1 AND (clock_in_time AT TIME ZONE 'Asia/Singapore')::date = (NOW() AT TIME ZONE 'Asia/Singapore')::date
+         LIMIT 1`,
+        [row.user_id]
+      );
+      if (clockedInToday.rows.length > 0) continue;
+
+      const alreadyReminded = await db.query(
+        `SELECT 1 FROM notifications
+         WHERE user_id = $1 AND title = $2 AND created_at::date = (NOW() AT TIME ZONE 'Asia/Singapore')::date
+         LIMIT 1`,
+        [row.user_id, reminderTitle]
+      );
+      if (alreadyReminded.rows.length > 0) continue;
+
+      const body = "It's past 8:30am and you haven't clocked in today. Head to the Staff Portal to clock in.";
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [row.user_id, reminderTitle, body]);
+      try {
+        await sendClockInReminderEmail(row.email, row.full_name);
+        sent += 1;
+      } catch (emailError) {
+        console.error('[clockin-reminder] email failed for', row.email, emailError.message);
+      }
+    }
+    if (sent > 0) console.log(`[clockin-reminder] Sent ${sent} clock-in reminder email(s).`);
+  } catch (error) {
+    console.error('[clockin-reminder] Sweep failed:', error.message);
+  }
+}
+
 // In server.js
 const PORT = process.env.PORT || 5000; // Changed from 3000
 ensureOperationalTables()
@@ -5427,6 +5496,8 @@ ensureOperationalTables()
       checkAnnualHolidayReminder();
       setInterval(finalizeOrphanedBudgetApprovals, 5 * 60 * 1000);
       finalizeOrphanedBudgetApprovals();
+      setInterval(checkClockInEmailReminders, 15 * 60 * 1000);
+      checkClockInEmailReminders();
     });
   })
   .catch((error) => {
