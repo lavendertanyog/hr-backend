@@ -22,6 +22,10 @@ const sesClient = process.env.AWS_ACCESS_KEY_ID
   ? new SESClient({ region: process.env.AWS_REGION || 'ap-southeast-1' })
   : null;
 const SES_EMAIL_FROM = process.env.SES_EMAIL_FROM || 'noreply@mail.nextantech.com';
+const SES_SENDER_NAME = process.env.SES_SENDER_NAME || 'Nextan Portal';
+// A bare address shows as just "noreply" in most mail clients — the quoted display-name form
+// (RFC 5322) makes it show as "Nextan Portal" instead, same address underneath.
+const SES_SOURCE_HEADER = `"${SES_SENDER_NAME}" <${SES_EMAIL_FROM}>`;
 // Routes every send through the "nextan-timesheet" configuration set (CloudWatch destination
 // tracking Sends/Deliveries/Hard bounces/Complaints/Delivery delays) so bounce and complaint
 // rates are actually visible instead of silently happening. The `email-type` message tag lets
@@ -34,7 +38,7 @@ async function sendEmail(toEmail, subject, html, emailType = 'general') {
     return;
   }
   await sesClient.send(new SendEmailCommand({
-    Source: SES_EMAIL_FROM,
+    Source: SES_SOURCE_HEADER,
     Destination: { ToAddresses: [toEmail] },
     Message: {
       Subject: { Data: subject, Charset: 'UTF-8' },
