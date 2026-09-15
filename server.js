@@ -85,12 +85,12 @@ async function sendPasswordResetEmail(toEmail, resetUrl) {
   const html = brandedEmailHtml({
     linkOrigin: new URL(resetUrl).origin,
     heading: 'Reset your password',
-    bodyHtml: 'We received a request to reset the password for your Nextan HR account. Click the button below to choose a new one - this link expires in 30 minutes.',
+    bodyHtml: 'We received a request to reset the password for your Nextan Portal account. Click the button below to choose a new one - this link expires in 30 minutes.',
     buttonText: 'Reset password',
     buttonUrl: resetUrl,
     footerText: "If you didn't request a password reset, you can safely ignore this email - your password won't change.",
   });
-  await sendEmail(toEmail, 'Reset your Nextan HR password', html, 'password-reset');
+  await sendEmail(toEmail, 'Reset your Nextan Portal password', html, 'password-reset');
 }
 
 async function sendVerificationEmail(toEmail, verifyUrl) {
@@ -102,7 +102,7 @@ async function sendVerificationEmail(toEmail, verifyUrl) {
     buttonUrl: verifyUrl,
     footerText: "If you didn't create an account, you can safely ignore this email.",
   });
-  await sendEmail(toEmail, 'Verify your Nextan HR email', html, 'email-verification');
+  await sendEmail(toEmail, 'Verify your Nextan Portal email', html, 'email-verification');
 }
 
 const STAFF_PORTAL_URL = process.env.STAFF_PORTAL_URL || 'https://staff.nextantech.com';
