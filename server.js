@@ -1998,7 +1998,8 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
       userId, logCheck.rows[0].project_code, clockIn.toISOString(), currentOut.toISOString(), attendanceId
     );
     const outHour = currentOut.getHours();
-    const dailyWorktimeHours = Math.round((clippedHours > 1 ? clippedHours - 1 : Math.max(clippedHours, 0)) * 100) / 100;
+    const crossesLunch = sessionOverlapsSgtLunch(clockIn, currentOut);
+    const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(clippedHours - 1, 0) : Math.max(clippedHours, 0)) * 100) / 100;
     const otHoursAccrued = clippedHours > 9.5 && outHour >= 18 ? Math.round((clippedHours - 9.5) * 100) / 100 : 0;
 
     const updateQuery = `
@@ -2131,7 +2132,8 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
     // overlap-deduplication against other sessions. It's a deliberate, precise record the staff
     // member is entering by hand, not a live timer that could double-count a forgotten clock-out.
     const outHour = end.getHours();
-    const dailyWorktimeHours = Math.round((actualDurationHours > 1 ? actualDurationHours - 1 : Math.max(actualDurationHours, 0)) * 100) / 100;
+    const crossesLunch = sessionOverlapsSgtLunch(start, end);
+    const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(actualDurationHours - 1, 0) : Math.max(actualDurationHours, 0)) * 100) / 100;
     const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
 
     const insertQuery = `
@@ -2216,7 +2218,8 @@ app.patch('/api/v1/attendance/:attendanceId/edit-times', async (req, res) => {
 
     const actualDurationHours = (end.getTime() - start.getTime()) / 3600000;
     const outHour = end.getHours();
-    const dailyWorktimeHours = Math.round((actualDurationHours > 1 ? actualDurationHours - 1 : Math.max(actualDurationHours, 0)) * 100) / 100;
+    const crossesLunch = sessionOverlapsSgtLunch(start, end);
+    const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(actualDurationHours - 1, 0) : Math.max(actualDurationHours, 0)) * 100) / 100;
     const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
 
     const result = await db.query(
@@ -5375,6 +5378,23 @@ function sgtNowServer() {
 function isSgtLunchWindow(sgt) {
   const hourDecimal = sgt.getUTCHours() + sgt.getUTCMinutes() / 60;
   return hourDecimal >= 12 && hourDecimal < 14;
+}
+
+// The automatic 1-hour lunch deduction should only apply to a session that actually ran through
+// lunch — previously it fired on ANY session over 1 hour long regardless of when it happened,
+// shorting attendance for people who simply worked a long evening or started late. This checks
+// real overlap against the 12pm-2pm SGT window on the day the session started.
+function sessionOverlapsSgtLunch(startInstant, endInstant) {
+  const start = new Date(startInstant);
+  const end = new Date(endInstant);
+  const startSgt = new Date(start.getTime() + 8 * 60 * 60 * 1000);
+  const lunchStartSgt = new Date(startSgt);
+  lunchStartSgt.setUTCHours(12, 0, 0, 0);
+  const lunchEndSgt = new Date(startSgt);
+  lunchEndSgt.setUTCHours(14, 0, 0, 0);
+  const lunchStart = new Date(lunchStartSgt.getTime() - 8 * 60 * 60 * 1000);
+  const lunchEnd = new Date(lunchEndSgt.getTime() - 8 * 60 * 60 * 1000);
+  return start < lunchEnd && end > lunchStart;
 }
 
 // A budget request reaches MANAGER_APPROVED expecting an Account Manager to give the final
