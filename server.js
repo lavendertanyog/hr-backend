@@ -49,10 +49,19 @@ async function sendEmail(toEmail, subject, html, emailType = 'general') {
   }));
 }
 
-// Shared branded shell for transactional emails — logo, heading, body copy, one primary button,
-// a footer note. `linkOrigin` picks the logo to match whichever portal triggered the email.
-function brandedEmailHtml({ linkOrigin, heading, bodyHtml, buttonText, buttonUrl, footerText }) {
+// Shared branded shell for transactional emails — logo, heading, body copy, then either a
+// clickable button OR a plain-text code block (never both), then a footer note. `linkOrigin`
+// picks the logo to match whichever portal triggered the email. The code-block variant exists
+// specifically so emails like the temporary password below contain no link at all — Microsoft
+// and other mail filters weigh links heavily when scoring a message as phishing, and a brand-new
+// sending domain is already fighting an uphill reputation battle without one.
+function brandedEmailHtml({ linkOrigin, heading, bodyHtml, buttonText, buttonUrl, codeBlock, footerText }) {
   const logoUrl = `${linkOrigin}/nextan-logo.png`;
+  const actionHtml = codeBlock
+    ? `<div style="background:#f1f5f9;border-radius:12px;padding:16px;text-align:center;">
+         <span style="font-family:'Courier New',monospace;font-size:20px;font-weight:700;letter-spacing:2px;color:#0f172a;">${codeBlock}</span>
+       </div>`
+    : `<a href="${buttonUrl}" style="display:inline-block;background:#0c3b8f;color:#ffffff;text-decoration:none;font-size:14px;font-weight:700;padding:12px 28px;border-radius:12px;">${buttonText}</a>`;
   return `<!doctype html>
 <html><head><meta charset="utf-8" /></head>
 <body style="margin:0;">
@@ -69,7 +78,7 @@ function brandedEmailHtml({ linkOrigin, heading, bodyHtml, buttonText, buttonUrl
         </p>
       </td></tr>
       <tr><td style="padding:24px 40px 0 40px;text-align:center;">
-        <a href="${buttonUrl}" style="display:inline-block;background:#0c3b8f;color:#ffffff;text-decoration:none;font-size:14px;font-weight:700;padding:12px 28px;border-radius:12px;">${buttonText}</a>
+        ${actionHtml}
       </td></tr>
       <tr><td style="padding:28px 40px 32px 40px;">
         <hr style="border:none;border-top:1px solid #e2e8f0;margin:0 0 20px 0;" />
@@ -83,18 +92,17 @@ function brandedEmailHtml({ linkOrigin, heading, bodyHtml, buttonText, buttonUrl
 </body></html>`;
 }
 
-async function sendPasswordResetEmail(toEmail, resetUrl) {
-  // Logo is pulled from the same portal the reset was requested on (staff/manager/HR/account
-  // manager each serve their own copy at /nextan-logo.png), so the email always matches.
+async function sendTemporaryPasswordEmail(toEmail, tempPassword, portalOrigin) {
+  // No link at all, by design — see brandedEmailHtml's comment. The temp password itself is the
+  // whole "action"; the user logs in with it directly and changes it from their Profile page.
   const html = brandedEmailHtml({
-    linkOrigin: new URL(resetUrl).origin,
-    heading: 'Reset your password',
-    bodyHtml: 'We received a request to reset the password for your Nextan Portal account. Click the button below to choose a new one - this link expires in 30 minutes.',
-    buttonText: 'Reset password',
-    buttonUrl: resetUrl,
-    footerText: "If you didn't request a password reset, you can safely ignore this email - your password won't change.",
+    linkOrigin: portalOrigin,
+    heading: 'Your temporary password',
+    bodyHtml: "We received a request to reset the password for your Nextan Portal account. Use the temporary password below to log in, then set a new password from your Profile page.",
+    codeBlock: tempPassword,
+    footerText: "If you didn't request a password reset, please let your HR admin know - your password has already been changed to the one above.",
   });
-  await sendEmail(toEmail, 'Reset your Nextan Portal password', html, 'password-reset');
+  await sendEmail(toEmail, 'Your temporary Nextan Portal password', html, 'password-reset');
 }
 
 async function sendVerificationEmail(toEmail, verifyUrl) {
@@ -807,13 +815,25 @@ app.post('/api/v1/auth/reset-password', async (req, res) => {
   }
 });
 
+// Random temp password, avoiding visually ambiguous characters (0/O, 1/l/I) since someone has to
+// read and retype this from an email — 12 chars from a ~54-character set is well over the
+// account's own 6-char minimum, so it's not the weak link.
+function generateTempPassword() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  let out = '';
+  for (let i = 0; i < 12; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
 // ========================================================================
-// ROUTE: FORGOT PASSWORD (self-service, via emailed link)
+// ROUTE: FORGOT PASSWORD (self-service, via a temporary password — no link)
 // ========================================================================
-// `portalUrl` is the origin of whichever portal the request came from (e.g.
-// https://hr-staff-portal.vercel.app), so the emailed link sends the user back to the same
-// portal they were trying to log into — the backend doesn't otherwise know which of the 4
-// portals a given user belongs to.
+// Deliberately no link in this flow: mail filters (Microsoft's especially) weigh links heavily
+// when scoring phishing risk, and a newly-verified sending domain is already fighting an uphill
+// reputation battle without one. Instead, the account's password is changed immediately to a
+// random temporary one, emailed as plain text; the user logs in with it directly and sets a new
+// password from their Profile page (see /auth/change-password). `portalUrl` only picks which
+// portal's logo appears in the email — there's no link to build a return URL for anymore.
 app.post('/api/v1/auth/forgot-password', async (req, res) => {
   const { email, portalUrl } = req.body;
   if (!email || !portalUrl) {
@@ -827,21 +847,46 @@ app.post('/api/v1/auth/forgot-password', async (req, res) => {
     // Always respond success even if the email isn't found, so this endpoint can't be used
     // to check which emails have accounts.
     if (user) {
-      const token = randomUUID() + randomUUID();
-      await db.query(
-        `INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, CURRENT_TIMESTAMP + INTERVAL '30 minutes')`,
-        [user.user_id, token]
-      );
-      const resetUrl = `${portalUrl.replace(/\/$/, '')}/reset-password?token=${token}`;
-      await sendPasswordResetEmail(normalized, resetUrl);
-      console.log('[forgot-password] sent reset email to', normalized);
+      const tempPassword = generateTempPassword();
+      const hash = await bcrypt.hash(tempPassword, 10);
+      await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, user.user_id]);
+      const portalOrigin = portalUrl.replace(/\/$/, '');
+      await sendTemporaryPasswordEmail(normalized, tempPassword, portalOrigin);
+      console.log('[forgot-password] sent temporary password to', normalized);
     } else {
       console.log('[forgot-password] no account found for', normalized);
     }
-    return res.status(200).json({ success: true, message: 'If an account exists for that email, a reset link has been sent.' });
+    return res.status(200).json({ success: true, message: 'If an account exists for that email, a temporary password has been sent.' });
   } catch (error) {
     console.error('[forgot-password] failed for', normalized, error);
     return res.status(500).json({ error: 'Failed to process reset request.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: CHANGE PASSWORD (logged-in self-service, from the Profile page)
+// ========================================================================
+app.post('/api/v1/auth/change-password', async (req, res) => {
+  const { userId, currentPassword, newPassword } = req.body;
+  if (!userId || !currentPassword || !newPassword) {
+    return res.status(400).json({ error: 'userId, currentPassword, and newPassword are required.' });
+  }
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'New password must be at least 6 characters.' });
+  }
+  try {
+    const userRes = await db.query('SELECT password_hash FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    const user = userRes.rows[0];
+    if (!user) return res.status(404).json({ error: 'Account not found.' });
+
+    const valid = user.password_hash ? await bcrypt.compare(currentPassword, user.password_hash) : false;
+    if (!valid) return res.status(401).json({ error: 'Current password is incorrect.' });
+
+    const hash = await bcrypt.hash(newPassword, 10);
+    await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, userId]);
+    return res.status(200).json({ success: true, message: 'Password updated.' });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to change password.', detail: error.message });
   }
 });
 
