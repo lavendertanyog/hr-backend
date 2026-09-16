@@ -890,6 +890,29 @@ app.post('/api/v1/auth/change-password', async (req, res) => {
   }
 });
 
+// TEMPORARY — one-off manual unblock for a user whose reset email isn't arriving.
+// Remove this endpoint immediately after use; it bypasses normal auth with a shared secret.
+app.post('/api/v1/admin/force-set-password', async (req, res) => {
+  const { email, newPassword, secret } = req.body;
+  if (secret !== 'nextan-temp-unblock-2026') {
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+  if (!email || !newPassword) {
+    return res.status(400).json({ error: 'email and newPassword are required.' });
+  }
+  try {
+    const normalized = email.trim().toLowerCase();
+    const userRes = await db.query('SELECT user_id FROM users WHERE LOWER(email) = $1 LIMIT 1', [normalized]);
+    const user = userRes.rows[0];
+    if (!user) return res.status(404).json({ error: 'Account not found.' });
+    const hash = await bcrypt.hash(newPassword, 10);
+    await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, user.user_id]);
+    return res.status(200).json({ success: true, message: 'Password set.' });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to set password.', detail: error.message });
+  }
+});
+
 // ========================================================================
 // ROUTE: RESET PASSWORD WITH TOKEN (applies immediately — email ownership already proven)
 // ========================================================================
