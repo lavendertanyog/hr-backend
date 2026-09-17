@@ -3014,8 +3014,9 @@ app.post('/api/v1/projects/budget-request', async (req, res) => {
 // ROUTE: EDIT / DELETE A BUDGET REQUEST (the requester's own, while still PENDING —
 // once a manager or account manager has acted on it, it's no longer editable)
 // ========================================================================
-app.patch('/api/v1/projects/budget-request/:requestId', async (req, res) => {
+app.patch('/api/v1/projects/budget-request/:requestId', async (req, res, next) => {
   const { requestId } = req.params;
+  if (requestId === 'review' || requestId === 'am-review') return next();
   const { userId, requestedHours, justification } = req.body;
   const requestedNumber = parseFloat(requestedHours);
 
@@ -3045,8 +3046,9 @@ app.patch('/api/v1/projects/budget-request/:requestId', async (req, res) => {
   }
 });
 
-app.delete('/api/v1/projects/budget-request/:requestId', async (req, res) => {
+app.delete('/api/v1/projects/budget-request/:requestId', async (req, res, next) => {
   const { requestId } = req.params;
+  if (requestId === 'review' || requestId === 'am-review') return next();
   const { userId } = req.body;
 
   try {
