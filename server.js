@@ -49,6 +49,30 @@ async function sendEmail(toEmail, subject, html, emailType = 'general') {
   }));
 }
 
+// TEMPORARY — deliverability test endpoint, removed right after use.
+app.post('/api/v1/admin/send-test-email', async (req, res) => {
+  const { to, from, secret } = req.body;
+  if (secret !== 'nextan-temp-unblock-2026') return res.status(403).json({ error: 'Forbidden.' });
+  if (!to) return res.status(400).json({ error: 'to is required.' });
+  if (!sesClient) return res.status(500).json({ error: 'No AWS credentials configured on this environment.' });
+  const source = from ? `"Nextan Portal" <${from}>` : SES_SOURCE_HEADER;
+  try {
+    const result = await sesClient.send(new SendEmailCommand({
+      Source: source,
+      Destination: { ToAddresses: [to] },
+      Message: {
+        Subject: { Data: 'Nextan Portal — deliverability test', Charset: 'UTF-8' },
+        Body: { Html: { Data: `<p>This is a test email to confirm delivery. Sent at ${new Date().toISOString()}.</p>`, Charset: 'UTF-8' } },
+      },
+      ConfigurationSetName: SES_CONFIGURATION_SET,
+      Tags: [{ Name: 'email-type', Value: 'deliverability-test' }],
+    }));
+    return res.status(200).json({ success: true, messageId: result.MessageId, source });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to send.', detail: error.message, name: error.name, source });
+  }
+});
+
 // Shared branded shell for transactional emails — logo, heading, body copy, then either a
 // clickable button OR a plain-text code block (never both), then a footer note. `linkOrigin`
 // picks the logo to match whichever portal triggered the email. The code-block variant exists
