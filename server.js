@@ -122,7 +122,7 @@ const STAFF_PORTAL_URL = process.env.STAFF_PORTAL_URL || 'https://staff.nextante
 async function sendClockInReminderEmail(toEmail, fullName) {
   const html = brandedEmailHtml({
     linkOrigin: STAFF_PORTAL_URL,
-    heading: "You haven't clocked in yet",
+    heading: 'Time to clock in',
     bodyHtml: `Hi ${fullName || 'there'}, it's past 8:30am and you haven't clocked in today. Head to the Staff Portal to clock in.`,
     buttonText: 'Clock in now',
     buttonUrl: `${STAFF_PORTAL_URL}/attendance`,
@@ -157,6 +157,20 @@ app.get('/', (_req, res) => {
 
 app.get('/health', (_req, res) => {
   res.status(200).json({ success: true, status: 'ok' });
+});
+
+// TEMPORARY — sends a real clock-in reminder email so the new "Time to clock in" headline can be
+// eyeballed in an actual inbox. Remove right after use.
+app.post('/api/v1/admin/send-test-clockin-email', async (req, res) => {
+  const { secret, toEmail, fullName } = req.body || {};
+  if (secret !== 'temp-clockin-headline-test-2026-delete-me') return res.status(403).json({ error: 'forbidden' });
+  if (!toEmail) return res.status(400).json({ error: 'toEmail is required.' });
+  try {
+    await sendClockInReminderEmail(toEmail, fullName);
+    res.status(200).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to send test email.', detail: error.message });
+  }
 });
 
 // Save / update Expo push token for a user
