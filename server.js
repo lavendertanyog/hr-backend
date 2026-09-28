@@ -122,6 +122,7 @@ const STAFF_PORTAL_URL = process.env.STAFF_PORTAL_URL || 'https://staff.nextante
 async function sendClockInReminderEmail(toEmail, fullName) {
   const html = brandedEmailHtml({
     linkOrigin: STAFF_PORTAL_URL,
+    heading: 'Time to clock in',
     bodyHtml: "Hi, it's past 8:30am and you haven't clocked in today. Head to the Staff Portal to clock in.",
     buttonText: 'Clock in now',
     buttonUrl: `${STAFF_PORTAL_URL}/attendance`,
