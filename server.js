@@ -199,6 +199,30 @@ function userIsManagerial(userRow) {
   return false;
 }
 
+// Project lifecycle: ACTIVE -> DEPLOYED -> MAINTENANCE (-> DEPLOYED again). Only HR and
+// Account Managers may move a project between these. Legacy INACTIVE rows (from the old
+// Deactivate action) are treated as DEPLOYED everywhere.
+function userCanManageProjectLifecycle(userRow) {
+  return userHasRole(userRow, 'hr') || userHasRole(userRow, 'account_manager');
+}
+
+// Returns the first of the given project codes that is DEPLOYED (or legacy INACTIVE), or null.
+// Deployed projects keep their assignments, so this — not the assignment check — is what stops
+// time, progress and budget requests being logged against them.
+async function findDeployedProjectCode(projectCodes) {
+  const codes = [...new Set(projectCodes.filter(Boolean).map((c) => String(c).toUpperCase().trim()))];
+  if (codes.length === 0) return null;
+  const result = await db.query(
+    `SELECT project_code FROM projects WHERE project_code = ANY($1) AND status IN ('DEPLOYED', 'INACTIVE') LIMIT 1`,
+    [codes]
+  );
+  return result.rows[0]?.project_code || null;
+}
+
+function deployedProjectError(projectCode) {
+  return `Project ${projectCode} has been deployed. Ask HR or an Account Manager to reactivate it for maintenance before logging work against it.`;
+}
+
 // Standard date format used across all notification/inbox text (matches the "DD Mon YYYY" TO_CHAR format used elsewhere)
 function formatDateDMY(dateLike) {
   if (!dateLike) return '';
@@ -1847,6 +1871,11 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
       return res.status(404).json({ error: 'User profile not found' });
     }
 
+    const deployedCode = await findDeployedProjectCode(requestedProjects.map((a) => a.projectCode));
+    if (deployedCode) {
+      return res.status(403).json({ error: deployedProjectError(deployedCode) });
+    }
+
     // Non-managerial staff must be assigned to every requested project to clock in (General is exempt)
     const userRow = userProfile.rows[0];
     if (!userIsManagerial(userRow)) {
@@ -2102,6 +2131,10 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
     const userProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
     if (userProfile.rows.length === 0) {
       return res.status(404).json({ error: 'User profile not found' });
+    }
+    const deployedCode = await findDeployedProjectCode(allocationsInput.map((a) => a.projectCode));
+    if (deployedCode) {
+      return res.status(403).json({ error: deployedProjectError(deployedCode) });
     }
     if (!userIsManagerial(userProfile.rows[0])) {
       for (const alloc of allocationsInput) {
@@ -2457,6 +2490,9 @@ app.post('/api/v1/attendance/allocations', async (req, res) => {
     }
 
     if (projectCode) {
+      if (await findDeployedProjectCode([projectCode])) {
+        return res.status(403).json({ error: deployedProjectError(projectCode) });
+      }
       const userProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
       if (!userIsManagerial(userProfile.rows[0])) {
         const assignCheck = await db.query(
@@ -2539,6 +2575,9 @@ app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
       const { attendance_id: attendanceId } = target.rows[0];
 
       if (projectCode) {
+        if (await findDeployedProjectCode([projectCode])) {
+          return res.status(403).json({ error: deployedProjectError(projectCode) });
+        }
         const userProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
         if (!userIsManagerial(userProfile.rows[0])) {
           const assignCheck = await db.query(
@@ -2977,6 +3016,9 @@ app.post('/api/v1/projects/budget-request', async (req, res) => {
     const projectCheck = await db.query('SELECT project_code FROM projects WHERE project_code = $1', [projectCode]);
     if (projectCheck.rows.length === 0) {
       return res.status(404).json({ error: `Project reference lookup failed for code: ${projectCode}` });
+    }
+    if (await findDeployedProjectCode([projectCode])) {
+      return res.status(403).json({ error: deployedProjectError(projectCode) });
     }
 
     // Staff must be assigned to the project to make a budget request
@@ -3454,6 +3496,9 @@ app.post('/api/v1/projects/progress-log', async (req, res) => {
     if (projectCheck.rows.length === 0) {
       return res.status(404).json({ error: `Routing Error: Project with code '${projectCode}' does not exist.` });
     }
+    if (await findDeployedProjectCode([projectCode])) {
+      return res.status(403).json({ error: deployedProjectError(projectCode) });
+    }
 
     // Non-managerial staff must be assigned to log progress
     const reporterRow = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [reporterId]);
@@ -3594,7 +3639,7 @@ app.get('/api/v1/projects/active-list', async (req, res) => {
            CASE WHEN p.account_manager_id = $1 THEN true ELSE false END AS is_assigned_manager,
            false AS is_direct_assignment
          FROM projects p
-         WHERE COALESCE(p.status, 'ACTIVE') != 'INACTIVE'
+         WHERE COALESCE(p.status, 'ACTIVE') NOT IN ('INACTIVE', 'DEPLOYED')
          ORDER BY p.project_code ASC`,
         [userId]
       );
@@ -3627,7 +3672,7 @@ app.get('/api/v1/projects/active-list', async (req, res) => {
          ON pa.project_code = p.project_code
         AND pa.user_id = $1
        WHERE pa.assignment_id IS NOT NULL
-              AND COALESCE(p.status, 'ACTIVE') != 'INACTIVE'
+              AND COALESCE(p.status, 'ACTIVE') NOT IN ('INACTIVE', 'DEPLOYED')
           ${budgetRequestsClause}
        ORDER BY p.project_code ASC`,
       [userId]
@@ -3648,7 +3693,7 @@ app.get('/api/v1/projects/active-list', async (req, res) => {
          false AS is_assigned_manager,
          false AS is_direct_assignment
        FROM projects
-       WHERE COALESCE(status, 'ACTIVE') != 'INACTIVE'
+       WHERE COALESCE(status, 'ACTIVE') NOT IN ('INACTIVE', 'DEPLOYED')
        ORDER BY project_code ASC`
     );
 
@@ -3731,7 +3776,7 @@ app.get('/api/v1/projects/suggestions', async (req, res) => {
   const query = `%${(req.query.q || '').trim()}%`;
   try {
     const result = await db.query(
-      'SELECT project_code, project_name FROM projects WHERE (project_code ILIKE $1 OR project_name ILIKE $1) AND COALESCE(status, \'ACTIVE\') != \'INACTIVE\' ORDER BY project_code ASC LIMIT 20',
+      'SELECT project_code, project_name FROM projects WHERE (project_code ILIKE $1 OR project_name ILIKE $1) AND COALESCE(status, \'ACTIVE\') NOT IN (\'INACTIVE\', \'DEPLOYED\') ORDER BY project_code ASC LIMIT 20',
       [query]
     );
     res.status(200).json({ success: true, data: result.rows });
@@ -4569,48 +4614,63 @@ app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
   }
 });
 
-// DEACTIVATE PROJECT (sets INACTIVE, removes assignments)
-app.patch('/api/v1/projects/:projectCode/deactivate', async (req, res) => {
+// MARK PROJECT DEPLOYED (ACTIVE or MAINTENANCE -> DEPLOYED). Staff assignments are kept so the
+// same team comes back when it is reactivated; time logging is blocked while it is DEPLOYED.
+// HR and Account Managers only. /deactivate is kept as an alias for portal builds that still
+// call it.
+async function markProjectDeployed(req, res) {
   const { projectCode } = req.params;
   const { editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
   try {
     const editorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [editorId]);
-    if (editorCheck.rows.length === 0 || !userIsManagerial(editorCheck.rows[0])) {
-      return res.status(403).json({ error: 'Access Denied.' });
+    if (editorCheck.rows.length === 0 || !userCanManageProjectLifecycle(editorCheck.rows[0])) {
+      return res.status(403).json({ error: 'Access Denied: Only HR or Account Manager users can mark a project as deployed.' });
     }
     const code = projectCode.toUpperCase().trim();
-    // Remove all project assignments
-    await db.query('DELETE FROM project_assignments WHERE project_code = $1', [code]);
-    // Set project status to INACTIVE
+    const existing = await db.query('SELECT status FROM projects WHERE project_code = $1', [code]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
+    const before = String(existing.rows[0].status || 'ACTIVE').toUpperCase();
+    if (before === 'DEPLOYED' || before === 'INACTIVE') {
+      return res.status(400).json({ error: `Project ${code} is already deployed.` });
+    }
     const result = await db.query(
-      `UPDATE projects SET status = 'INACTIVE' WHERE project_code = $1 RETURNING *`,
+      `UPDATE projects SET status = 'DEPLOYED' WHERE project_code = $1 RETURNING *`,
       [code]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
-    res.status(200).json({ success: true, message: `Project ${code} deactivated and assignments removed.`, data: result.rows[0] });
+    await auditInterceptor('projects', code, editorId, { status: before }, { status: 'DEPLOYED' });
+    res.status(200).json({ success: true, message: `Project ${code} marked as deployed.`, data: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to deactivate project.', detail: error.message });
+    res.status(500).json({ error: 'Failed to mark project as deployed.', detail: error.message });
   }
-});
+}
+app.patch('/api/v1/projects/:projectCode/deploy', markProjectDeployed);
+app.patch('/api/v1/projects/:projectCode/deactivate', markProjectDeployed);
 
-// REACTIVATE PROJECT (sets ACTIVE again — staff assignments must be re-added manually)
+// REACTIVATE PROJECT FOR MAINTENANCE (DEPLOYED -> MAINTENANCE). Staff can log time against a
+// MAINTENANCE project like an ACTIVE one. HR and Account Managers only.
 app.patch('/api/v1/projects/:projectCode/reactivate', async (req, res) => {
   const { projectCode } = req.params;
   const { editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
   try {
     const editorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [editorId]);
-    if (editorCheck.rows.length === 0 || !userIsManagerial(editorCheck.rows[0])) {
-      return res.status(403).json({ error: 'Access Denied.' });
+    if (editorCheck.rows.length === 0 || !userCanManageProjectLifecycle(editorCheck.rows[0])) {
+      return res.status(403).json({ error: 'Access Denied: Only HR or Account Manager users can reactivate a project.' });
     }
     const code = projectCode.toUpperCase().trim();
+    const existing = await db.query('SELECT status FROM projects WHERE project_code = $1', [code]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
+    const before = String(existing.rows[0].status || 'ACTIVE').toUpperCase();
+    if (before !== 'DEPLOYED' && before !== 'INACTIVE') {
+      return res.status(400).json({ error: `Only a deployed project can be reactivated. ${code} is ${before}.` });
+    }
     const result = await db.query(
-      `UPDATE projects SET status = 'ACTIVE' WHERE project_code = $1 RETURNING *`,
+      `UPDATE projects SET status = 'MAINTENANCE' WHERE project_code = $1 RETURNING *`,
       [code]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
-    res.status(200).json({ success: true, message: `Project ${code} reactivated.`, data: result.rows[0] });
+    await auditInterceptor('projects', code, editorId, { status: before }, { status: 'MAINTENANCE' });
+    res.status(200).json({ success: true, message: `Project ${code} reactivated for maintenance.`, data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: 'Failed to reactivate project.', detail: error.message });
   }
@@ -4936,8 +4996,8 @@ app.post('/api/v1/projects/assign-bulk', async (req, res) => {
     if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
       return res.status(403).json({ error: 'Only managers can assign projects.' });
     }
-    const projectCheck = await db.query('SELECT project_code, budget_hours, project_name FROM projects WHERE project_code = $1 AND COALESCE(status, \'ACTIVE\') != \'INACTIVE\' LIMIT 1', [projectCode]);
-    if (projectCheck.rows.length === 0) return res.status(404).json({ error: 'Project code not found or is inactive.' });
+    const projectCheck = await db.query('SELECT project_code, budget_hours, project_name FROM projects WHERE project_code = $1 AND COALESCE(status, \'ACTIVE\') NOT IN (\'INACTIVE\', \'DEPLOYED\') LIMIT 1', [projectCode]);
+    if (projectCheck.rows.length === 0) return res.status(404).json({ error: 'Project code not found or has been deployed.' });
 
     const results = [];
     for (const userId of userIds) {
