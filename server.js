@@ -4215,21 +4215,69 @@ app.get('/api/v1/hr/active-users', async (req, res) => {
 
 // HR: set a per-employee leave entitlement override
 app.patch('/api/v1/hr/update-leave-entitlement', async (req, res) => {
-  const { requesterId, userId, leaveEntitlementDays } = req.body;
+  const { requesterId, userId, leaveEntitlementDays, reason } = req.body;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   const days = Number(leaveEntitlementDays);
   if (!userId || !Number.isInteger(days) || days < 0) {
     return res.status(400).json({ error: 'userId and a non-negative integer leaveEntitlementDays are required.' });
   }
   try {
+    const before = await db.query('SELECT leave_entitlement_days FROM users WHERE user_id = $1', [userId]);
     const updated = await db.query(
       'UPDATE users SET leave_entitlement_days = $1 WHERE user_id = $2 RETURNING user_id, full_name, leave_entitlement_days',
       [days, userId]
     );
     if (!updated.rows[0]) return res.status(404).json({ error: 'User not found.' });
+    await auditInterceptor('users', userId, requesterId,
+      { leave_entitlement_days: before.rows[0]?.leave_entitlement_days ?? 12 },
+      { leave_entitlement_days: days, reason: String(reason || '').trim() || null });
     return res.status(200).json({ success: true, data: updated.rows[0] });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update leave entitlement.', detail: err.message });
+  }
+});
+
+// HR: set the same leave entitlement for several employees at once (e.g. a new grade or year).
+app.patch('/api/v1/hr/update-leave-entitlement-bulk', async (req, res) => {
+  const { requesterId, userIds, leaveEntitlementDays, reason } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  const days = Number(leaveEntitlementDays);
+  if (!Array.isArray(userIds) || userIds.length === 0 || !Number.isInteger(days) || days < 0) {
+    return res.status(400).json({ error: 'userIds (non-empty array) and a non-negative integer leaveEntitlementDays are required.' });
+  }
+  try {
+    const before = await db.query('SELECT user_id, leave_entitlement_days FROM users WHERE user_id = ANY($1::uuid[])', [userIds]);
+    const updated = await db.query(
+      'UPDATE users SET leave_entitlement_days = $1 WHERE user_id = ANY($2::uuid[]) RETURNING user_id, leave_entitlement_days',
+      [days, userIds]
+    );
+    const cleanReason = String(reason || '').trim() || null;
+    for (const row of before.rows) {
+      await auditInterceptor('users', row.user_id, requesterId,
+        { leave_entitlement_days: row.leave_entitlement_days ?? 12 },
+        { leave_entitlement_days: days, reason: cleanReason });
+    }
+    return res.status(200).json({ success: true, updated: updated.rows.length, data: updated.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update leave entitlements.', detail: err.message });
+  }
+});
+
+// HR: approved Annual + Emergency days used per employee (same rule as /leave/balance/:userId),
+// so the People page can show used/remaining beside each entitlement in one request.
+app.get('/api/v1/hr/leave-balances', async (req, res) => {
+  const { requesterId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  try {
+    const result = await db.query(
+      `SELECT user_id, COALESCE(SUM(end_date::date - start_date::date + 1), 0)::int AS used_days
+       FROM leave_applications
+       WHERE category::TEXT IN ('ANNUAL', 'EMERGENCY') AND workflow_status::TEXT = 'APPROVED'
+       GROUP BY user_id`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch leave balances.', detail: err.message });
   }
 });
 
