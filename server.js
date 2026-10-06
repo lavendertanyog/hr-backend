@@ -4295,6 +4295,37 @@ app.get('/api/v1/public-holidays', async (req, res) => {
   }
 });
 
+// Company-wide leave calendar — who is on approved leave between ?from and ?to (YYYY-MM-DD,
+// inclusive). Open to any active user in every portal, so it deliberately returns only the
+// person's name and dates: no leave type (sick leave is medical), reason or MC.
+app.get('/api/v1/calendar/leave', async (req, res) => {
+  const { requesterId, from, to } = req.query;
+  const isoDate = /^\d{4}-\d{2}-\d{2}$/;
+  if (!requesterId) return res.status(400).json({ error: 'requesterId is required.' });
+  if (!isoDate.test(String(from || '')) || !isoDate.test(String(to || '')) || from > to) {
+    return res.status(400).json({ error: 'from and to must be YYYY-MM-DD dates, with from on or before to.' });
+  }
+  try {
+    const requester = await db.query('SELECT account_status FROM users WHERE user_id = $1', [requesterId]);
+    if (requester.rows.length === 0 || String(requester.rows[0].account_status || 'active').toLowerCase() !== 'active') {
+      return res.status(403).json({ error: 'Access Denied.' });
+    }
+    const result = await db.query(
+      `SELECT la.leave_id, la.user_id, u.full_name, la.start_date, la.end_date
+       FROM leave_applications la
+       JOIN users u ON u.user_id = la.user_id
+       WHERE la.workflow_status = 'APPROVED'
+         AND la.start_date <= $2 AND la.end_date >= $1
+         AND COALESCE(u.account_status, 'active') = 'active' AND NOT COALESCE(u.is_hidden, false)
+       ORDER BY la.start_date ASC, u.full_name ASC`,
+      [from, to]
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch leave calendar.', detail: error.message });
+  }
+});
+
 app.post('/api/v1/hr/public-holidays', async (req, res) => {
   const { requesterId, holidayDate, name } = req.body;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
