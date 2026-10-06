@@ -669,7 +669,7 @@ app.post('/api/v1/auth/signup', async (req, res) => {
   // Temporary allowance for testing the SES email flow end-to-end — remove once done.
   const SIGNUP_DOMAIN_EXCEPTIONS = ['unicorntanyongnie@gmail.com', 'unicorntanyongnie+verifytest@gmail.com'];
   if (!normalized.endsWith('@nextan.com.sg') && !SIGNUP_DOMAIN_EXCEPTIONS.includes(normalized)) {
-    return res.status(403).json({ error: 'Only @nextan.com.sg emails are allowed.' });
+    return res.status(403).json({ error: 'Please enter a valid email address.' });
   }
   try {
     const columns = await getUsersTableColumns();
@@ -724,7 +724,13 @@ app.post('/api/v1/auth/signup', async (req, res) => {
       `INSERT INTO email_verification_tokens (user_id, token, expires_at) VALUES ($1, $2, CURRENT_TIMESTAMP + INTERVAL '24 hours')`,
       [userId, verifyToken]
     );
-    const origin = (portalUrl || 'https://hr.nextantech.com').replace(/\/$/, '');
+    const PORTAL_URL_BY_ROLE = {
+      staff: STAFF_PORTAL_URL,
+      hr: 'https://hr.nextantech.com',
+      manager: 'https://manager.nextantech.com',
+      account_manager: 'https://accountmanager.nextantech.com',
+    };
+    const origin = (portalUrl || PORTAL_URL_BY_ROLE[signupRole] || STAFF_PORTAL_URL).replace(/\/$/, '');
     const verifyUrl = `${origin}/verify-email?token=${verifyToken}`;
     try {
       await sendVerificationEmail(normalized, verifyUrl);
@@ -1460,7 +1466,7 @@ app.post('/api/v1/auth/outlook-login', async (req, res) => {
   const { email, displayName } = req.body;
 
   if (!email || !email.toLowerCase().endsWith('@nextan.com.sg')) {
-    return res.status(403).json({ error: 'Only @nextan.com.sg emails are allowed.' });
+    return res.status(403).json({ error: 'Please enter a valid email address.' });
   }
 
   try {
@@ -2255,20 +2261,86 @@ app.patch('/api/v1/attendance/:attendanceId/edit-times', async (req, res) => {
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(actualDurationHours - 1, 0) : Math.max(actualDurationHours, 0)) * 100) / 100;
     const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
 
-    const result = await db.query(
-      `UPDATE attendance_logs
-       SET original_clock_in_time = COALESCE(original_clock_in_time, clock_in_time),
-           original_clock_out_time = COALESCE(original_clock_out_time, clock_out_time),
-           clock_in_time = $2::timestamptz,
-           clock_out_time = $3::timestamptz,
-           daily_worktime_hours = $4,
-           ot_hours_accrued = $5
-       WHERE attendance_id = $1
-       RETURNING attendance_id, clock_in_time, clock_out_time, daily_worktime_hours, ot_hours_accrued`,
-      [attendanceId, start.toISOString(), end.toISOString(), dailyWorktimeHours, otHoursAccrued]
-    );
+    // Optional: replace the entry's project list in the same save. Each block is re-created
+    // COMPLETED with the hours entered, carrying over any description a kept project already had.
+    let newAllocations = null;
+    if (Array.isArray(req.body.allocations) && req.body.allocations.length > 0) {
+      newAllocations = req.body.allocations.map((a) => ({
+        projectCode: normalizeProjectCode(a.projectCode),
+        hours: Math.round(Number(a.hours ?? a.allocatedHours) * 100) / 100,
+      }));
+      if (newAllocations.some((a) => !(a.hours > 0))) {
+        return res.status(400).json({ error: 'Every project needs a positive number of hours.' });
+      }
+      const codes = newAllocations.map((a) => a.projectCode || '');
+      if (new Set(codes).size !== codes.length) {
+        return res.status(400).json({ error: 'The same project is listed twice. Combine its hours into one row.' });
+      }
+      const totalAllocated = newAllocations.reduce((sum, a) => sum + a.hours, 0);
+      if (totalAllocated > actualDurationHours + 0.02) {
+        return res.status(400).json({
+          error: `Project hours (${totalAllocated.toFixed(2)}h) can't be more than the time between start and end (${actualDurationHours.toFixed(2)}h).`,
+        });
+      }
+      const profile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
+      if (profile.rows.length > 0 && !userIsManagerial(profile.rows[0])) {
+        for (const alloc of newAllocations) {
+          if (!alloc.projectCode) continue;
+          const assignCheck = await db.query(
+            'SELECT assignment_id FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1',
+            [userId, alloc.projectCode]
+          );
+          if (assignCheck.rows.length === 0) {
+            return res.status(403).json({ error: `You are not assigned to project ${alloc.projectCode}. Please ask your manager to assign you first.` });
+          }
+        }
+      }
+    }
 
-    await auditInterceptor('attendance_logs', attendanceId, userId, existing.rows[0], result.rows[0]);
+    const client = await db.pool.connect();
+    let result;
+    try {
+      await client.query('BEGIN');
+      result = await client.query(
+        `UPDATE attendance_logs
+         SET original_clock_in_time = COALESCE(original_clock_in_time, clock_in_time),
+             original_clock_out_time = COALESCE(original_clock_out_time, clock_out_time),
+             clock_in_time = $2::timestamptz,
+             clock_out_time = $3::timestamptz,
+             daily_worktime_hours = $4,
+             ot_hours_accrued = $5
+         WHERE attendance_id = $1
+         RETURNING attendance_id, clock_in_time, clock_out_time, daily_worktime_hours, ot_hours_accrued`,
+        [attendanceId, start.toISOString(), end.toISOString(), dailyWorktimeHours, otHoursAccrued]
+      );
+      if (newAllocations) {
+        const old = await client.query('SELECT project_code, description FROM attendance_allocations WHERE attendance_id = $1', [attendanceId]);
+        const oldDescriptions = new Map(old.rows.map((r) => [r.project_code || '', r.description]));
+        await client.query('DELETE FROM attendance_allocations WHERE attendance_id = $1', [attendanceId]);
+        for (let i = 0; i < newAllocations.length; i++) {
+          const alloc = newAllocations[i];
+          await client.query(
+            `INSERT INTO attendance_allocations
+               (attendance_id, project_code, allocated_hours, accumulated_hours, status, seq, started_at, completed_at, description, last_edited_at, edited_after_completion)
+             VALUES ($1, $2, $3, $3, 'COMPLETED', $4, $5::timestamptz, $6::timestamptz, $7, CURRENT_TIMESTAMP, TRUE)`,
+            [attendanceId, alloc.projectCode || null, alloc.hours, i, start.toISOString(), end.toISOString(), oldDescriptions.get(alloc.projectCode || '') || null]
+          );
+        }
+        const primaryProjectCode = newAllocations[0].projectCode || null;
+        await client.query(
+          'UPDATE attendance_logs SET project_code = $2, entry_type = $3 WHERE attendance_id = $1',
+          [attendanceId, primaryProjectCode, primaryProjectCode ? 'PROJECT' : 'GENERAL']
+        );
+      }
+      await client.query('COMMIT');
+    } catch (txError) {
+      await client.query('ROLLBACK');
+      throw txError;
+    } finally {
+      client.release();
+    }
+
+    await auditInterceptor('attendance_logs', attendanceId, userId, existing.rows[0], { ...result.rows[0], ...(newAllocations ? { allocations: newAllocations } : {}) });
 
     res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
