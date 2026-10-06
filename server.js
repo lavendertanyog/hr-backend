@@ -4194,27 +4194,62 @@ app.patch('/api/v1/hr/update-leave-entitlement', async (req, res) => {
 
 // HR: set the same leave entitlement for several employees at once (e.g. a new grade or year).
 app.patch('/api/v1/hr/update-leave-entitlement-bulk', async (req, res) => {
-  const { requesterId, userIds, leaveEntitlementDays, reason } = req.body;
+  const { requesterId, userIds, leaveEntitlementDays, delta, reason } = req.body;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  // Either set everyone to one number (leaveEntitlementDays) or add/remove days from each
+  // person's current number (delta, e.g. +1 for the yearly top-up). Never below zero.
+  const hasDelta = delta !== undefined && delta !== null && delta !== '';
   const days = Number(leaveEntitlementDays);
-  if (!Array.isArray(userIds) || userIds.length === 0 || !Number.isInteger(days) || days < 0) {
-    return res.status(400).json({ error: 'userIds (non-empty array) and a non-negative integer leaveEntitlementDays are required.' });
+  const change = Number(delta);
+  const validValue = hasDelta ? Number.isInteger(change) && change !== 0 : Number.isInteger(days) && days >= 0;
+  if (!Array.isArray(userIds) || userIds.length === 0 || !validValue) {
+    return res.status(400).json({ error: 'userIds (non-empty array) and either a non-negative integer leaveEntitlementDays or a non-zero integer delta are required.' });
   }
   try {
     const before = await db.query('SELECT user_id, leave_entitlement_days FROM users WHERE user_id = ANY($1::uuid[])', [userIds]);
-    const updated = await db.query(
-      'UPDATE users SET leave_entitlement_days = $1 WHERE user_id = ANY($2::uuid[]) RETURNING user_id, leave_entitlement_days',
-      [days, userIds]
-    );
+    const updated = hasDelta
+      ? await db.query(
+          'UPDATE users SET leave_entitlement_days = GREATEST(0, COALESCE(leave_entitlement_days, 12) + $1) WHERE user_id = ANY($2::uuid[]) RETURNING user_id, leave_entitlement_days',
+          [change, userIds]
+        )
+      : await db.query(
+          'UPDATE users SET leave_entitlement_days = $1 WHERE user_id = ANY($2::uuid[]) RETURNING user_id, leave_entitlement_days',
+          [days, userIds]
+        );
+    const newByUser = new Map(updated.rows.map((r) => [r.user_id, r.leave_entitlement_days]));
     const cleanReason = String(reason || '').trim() || null;
     for (const row of before.rows) {
       await auditInterceptor('users', row.user_id, requesterId,
         { leave_entitlement_days: row.leave_entitlement_days ?? 12 },
-        { leave_entitlement_days: days, reason: cleanReason });
+        { leave_entitlement_days: newByUser.get(row.user_id), reason: cleanReason });
     }
     return res.status(200).json({ success: true, updated: updated.rows.length, data: updated.rows });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update leave entitlements.', detail: err.message });
+  }
+});
+
+// HR: who changed whose leave entitlement, when, from what to what, and why (latest first).
+app.get('/api/v1/hr/leave-entitlement-history', async (req, res) => {
+  const { requesterId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  try {
+    const result = await db.query(
+      `SELECT al.audit_id, al.created_at,
+              e.full_name AS employee_name, c.full_name AS changed_by_name,
+              al.pre_value->>'leave_entitlement_days' AS old_days,
+              al.post_value->>'leave_entitlement_days' AS new_days,
+              al.post_value->>'reason' AS reason
+       FROM audit_logs al
+       LEFT JOIN users e ON e.user_id::text = al.record_id::text
+       LEFT JOIN users c ON c.user_id::text = al.altered_by::text
+       WHERE al.table_name = 'users' AND jsonb_exists(al.post_value, 'leave_entitlement_days')
+       ORDER BY al.created_at DESC
+       LIMIT 100`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch leave history.', detail: err.message });
   }
 });
 
