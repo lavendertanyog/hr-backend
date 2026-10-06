@@ -645,7 +645,7 @@ app.post('/api/v1/auth/signup', async (req, res) => {
   // Temporary allowance for testing the SES email flow end-to-end — remove once done.
   const SIGNUP_DOMAIN_EXCEPTIONS = ['unicorntanyongnie@gmail.com', 'unicorntanyongnie+verifytest@gmail.com'];
   if (!normalized.endsWith('@nextan.com.sg') && !SIGNUP_DOMAIN_EXCEPTIONS.includes(normalized)) {
-    return res.status(403).json({ error: 'Only @nextan.com.sg emails are allowed.' });
+    return res.status(403).json({ error: 'Please enter a valid email address.' });
   }
   try {
     const columns = await getUsersTableColumns();
@@ -1442,7 +1442,7 @@ app.post('/api/v1/auth/outlook-login', async (req, res) => {
   const { email, displayName } = req.body;
 
   if (!email || !email.toLowerCase().endsWith('@nextan.com.sg')) {
-    return res.status(403).json({ error: 'Only @nextan.com.sg emails are allowed.' });
+    return res.status(403).json({ error: 'Please enter a valid email address.' });
   }
 
   try {
