@@ -2032,7 +2032,7 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
     const { clippedHours, ratio } = await clipOverlappingHours(
       userId, logCheck.rows[0].project_code, clockIn.toISOString(), currentOut.toISOString(), attendanceId
     );
-    const outHour = currentOut.getHours();
+    const outHour = sgtHourOf(currentOut);
     const crossesLunch = sessionOverlapsSgtLunch(clockIn, currentOut);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(clippedHours - 1, 0) : Math.max(clippedHours, 0)) * 100) / 100;
     const otHoursAccrued = clippedHours > 9.5 && outHour >= 18 ? Math.round((clippedHours - 9.5) * 100) / 100 : 0;
@@ -2170,7 +2170,7 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
     // Unlike live clock-out, a Manual Entry always credits exactly what was entered — no
     // overlap-deduplication against other sessions. It's a deliberate, precise record the staff
     // member is entering by hand, not a live timer that could double-count a forgotten clock-out.
-    const outHour = end.getHours();
+    const outHour = sgtHourOf(end);
     const crossesLunch = sessionOverlapsSgtLunch(start, end);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(actualDurationHours - 1, 0) : Math.max(actualDurationHours, 0)) * 100) / 100;
     const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
@@ -2256,7 +2256,7 @@ app.patch('/api/v1/attendance/:attendanceId/edit-times', async (req, res) => {
     }
 
     const actualDurationHours = (end.getTime() - start.getTime()) / 3600000;
-    const outHour = end.getHours();
+    const outHour = sgtHourOf(end);
     const crossesLunch = sessionOverlapsSgtLunch(start, end);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(actualDurationHours - 1, 0) : Math.max(actualDurationHours, 0)) * 100) / 100;
     const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
@@ -2359,7 +2359,7 @@ app.delete('/api/v1/attendance/:attendanceId', async (req, res) => {
   }
   try {
     const existing = await db.query(
-      'SELECT attendance_id, clock_out_time FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2',
+      'SELECT * FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2',
       [attendanceId, userId]
     );
     if (existing.rows.length === 0) {
@@ -2368,7 +2368,10 @@ app.delete('/api/v1/attendance/:attendanceId', async (req, res) => {
     if (!existing.rows[0].clock_out_time) {
       return res.status(400).json({ error: 'This session is still active — clock it out before deleting it.' });
     }
+    // The delete cascades to the entry's project blocks, so keep them in the audit snapshot too.
+    const blocks = await db.query('SELECT * FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC', [attendanceId]);
     await db.query('DELETE FROM attendance_logs WHERE attendance_id = $1', [attendanceId]);
+    await auditInterceptor('attendance_logs', attendanceId, userId, { ...existing.rows[0], allocations: blocks.rows }, null);
     res.status(200).json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete attendance entry.', detail: error.message });
@@ -2782,7 +2785,9 @@ app.delete('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
       return res.status(400).json({ error: 'Can\'t delete the only project on this entry.' });
     }
 
+    const deletedBlock = await db.query('SELECT * FROM attendance_allocations WHERE allocation_id = $1', [allocationId]);
     await db.query('DELETE FROM attendance_allocations WHERE allocation_id = $1', [allocationId]);
+    await auditInterceptor('attendance_allocations', allocationId, userId, deletedBlock.rows[0], null);
 
     const remaining = await db.query(
       `SELECT allocation_id, allocated_hours, status FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
@@ -3504,13 +3509,14 @@ app.delete('/api/v1/leave/:leaveId', async (req, res) => {
     const result = await db.query(
       `DELETE FROM leave_applications
        WHERE leave_id = $1 AND user_id = $2 AND workflow_status = 'PENDING'
-       RETURNING leave_id, user_id, category, start_date, end_date`,
+       RETURNING *`,
       [leaveId, userId]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Leave request not found or it is not eligible for cancellation.' });
     }
+    await auditInterceptor('leave_applications', leaveId, userId, result.rows[0], null);
 
     try {
       const cancelled = result.rows[0];
@@ -3518,7 +3524,8 @@ app.delete('/api/v1/leave/:leaveId', async (req, res) => {
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, 'Leave Request Deleted', message]);
     } catch (_) {}
 
-    return res.status(200).json({ success: true, data: result.rows[0] });
+    const { leave_id, user_id, category, start_date, end_date } = result.rows[0];
+    return res.status(200).json({ success: true, data: { leave_id, user_id, category, start_date, end_date } });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to delete leave application.', detail: error.message });
   }
@@ -3662,7 +3669,7 @@ app.delete('/api/v1/projects/progress-log/:logId', async (req, res) => {
   const { userId } = req.body;
 
   try {
-    const existing = await db.query('SELECT reporter_id, progress_summary FROM project_progress_logs WHERE log_id = $1', [logId]);
+    const existing = await db.query('SELECT * FROM project_progress_logs WHERE log_id = $1', [logId]);
     if (existing.rows.length === 0) {
       return res.status(404).json({ error: 'Progress log entry not found.' });
     }
@@ -3674,6 +3681,7 @@ app.delete('/api/v1/projects/progress-log/:logId', async (req, res) => {
     }
 
     await db.query('DELETE FROM project_progress_logs WHERE log_id = $1', [logId]);
+    await auditInterceptor('project_progress_logs', logId, userId, existing.rows[0], null);
     res.status(200).json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete progress entry.', detail: error.message });
@@ -5569,6 +5577,71 @@ app.get('/api/v1/admin/audit-logs', async (req, res) => {
   }
 });
 
+// HR Portal > Audit Log: read-only, filterable, paginated view of audit_logs. Each row is
+// resolved to the person who made the change ("changed by") and, where the record belongs to
+// someone, the person it belongs to ("affected"). Allocation snapshots carry no user_id, so
+// those are traced through their attendance entry; project changes have no affected person.
+const AUDIT_TABLES = ['attendance_logs', 'attendance_allocations', 'leave_applications', 'project_progress_logs', 'budget_requests', 'projects', 'users'];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+app.get('/api/v1/hr/audit-logs', async (req, res) => {
+  const { requesterId, from, to, tableName, alteredBy, subjectUserId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  const isoDate = /^\d{4}-\d{2}-\d{2}$/;
+  if ((from && !isoDate.test(from)) || (to && !isoDate.test(to)) || (from && to && from > to)) {
+    return res.status(400).json({ error: 'from and to must be YYYY-MM-DD dates, with from on or before to.' });
+  }
+  if (tableName && !AUDIT_TABLES.includes(tableName)) {
+    return res.status(400).json({ error: 'Unknown record type.' });
+  }
+  if ((alteredBy && !UUID_RE.test(alteredBy)) || (subjectUserId && !UUID_RE.test(subjectUserId))) {
+    return res.status(400).json({ error: 'Invalid user filter.' });
+  }
+  const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 20, 1), 100);
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  try {
+    const result = await db.query(
+      `WITH a AS (
+         SELECT l.*,
+           CASE l.table_name
+             WHEN 'users' THEN l.record_id
+             WHEN 'projects' THEN NULL
+             WHEN 'project_progress_logs' THEN COALESCE(l.post_value->>'reporter_id', l.pre_value->>'reporter_id')
+             -- Only the entry's owner can edit its blocks, so fall back to the editor once the
+             -- entry itself has been deleted.
+             WHEN 'attendance_allocations' THEN COALESCE((
+               SELECT al.user_id::text FROM attendance_logs al
+               WHERE al.attendance_id::text = COALESCE(l.post_value->>'attendance_id', l.pre_value->>'attendance_id')),
+               l.altered_by::text)
+             ELSE COALESCE(l.post_value->>'user_id', l.pre_value->>'user_id')
+           END AS subject_user_id
+         FROM audit_logs l
+       )
+       SELECT a.audit_id, a.table_name, a.record_id, a.altered_by, a.pre_value, a.post_value, a.created_at,
+              a.subject_user_id, ab.full_name AS altered_by_name, su.full_name AS subject_name,
+              COUNT(*) OVER() AS total_count
+       FROM a
+       LEFT JOIN users ab ON ab.user_id::text = a.altered_by::text
+       LEFT JOIN users su ON su.user_id::text = a.subject_user_id
+       WHERE ($1::date IS NULL OR (a.created_at AT TIME ZONE 'Asia/Singapore')::date >= $1::date)
+         AND ($2::date IS NULL OR (a.created_at AT TIME ZONE 'Asia/Singapore')::date <= $2::date)
+         AND ($3::text IS NULL OR a.table_name = $3)
+         AND ($4::text IS NULL OR a.altered_by::text = $4)
+         AND ($5::text IS NULL OR a.subject_user_id = $5)
+       ORDER BY a.created_at DESC, a.audit_id DESC
+       LIMIT $6 OFFSET $7`,
+      [from || null, to || null, tableName || null, alteredBy ? alteredBy.toLowerCase() : null, subjectUserId ? subjectUserId.toLowerCase() : null, pageSize, (page - 1) * pageSize]
+    );
+    const total = result.rows.length ? Number(result.rows[0].total_count) : 0;
+    return res.status(200).json({
+      success: true,
+      data: result.rows.map(({ total_count, ...row }) => row),
+      pagination: { page, pageSize, total },
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch audit logs.', detail: error.message });
+  }
+});
+
 // ========================================================================
 // SERVER-SIDE BACKSTOP: force clock-out any session that's gone 4+ hours since its last
 // confirmation (Continue press, or clock-in if never confirmed) — independent of whether
@@ -5587,6 +5660,11 @@ function sgtNowServer() {
   // comment in AttendanceReminders.js for why only the UTC getters on the result are valid.
   const now = new Date();
   return new Date(now.getTime() + 8 * 60 * 60 * 1000);
+}
+// Hour of day (0-23) in SGT for any instant. Overtime used to read Date#getHours(), which is the
+// server's own time zone — UTC on Render — so "clock-out at 18:00 or later" was really 2am SGT.
+function sgtHourOf(instant) {
+  return new Date(new Date(instant).getTime() + 8 * 60 * 60 * 1000).getUTCHours();
 }
 function isSgtLunchWindow(sgt) {
   const hourDecimal = sgt.getUTCHours() + sgt.getUTCMinutes() / 60;
