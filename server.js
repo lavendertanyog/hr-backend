@@ -4414,31 +4414,45 @@ app.delete('/api/v1/hr/users/:userId', async (req, res) => {
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   if (requesterId === userId) return res.status(400).json({ error: "You can't delete your own account." });
 
+  const client = await db.pool.connect();
   try {
-    const target = await db.query('SELECT user_id, full_name FROM users WHERE user_id = $1', [userId]);
+    const target = await client.query('SELECT user_id, full_name FROM users WHERE user_id = $1', [userId]);
     if (target.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
 
-    // Clear references that aren't ON DELETE CASCADE so the final delete doesn't hit an FK violation.
-    await db.query('UPDATE users SET supervisor_id = NULL WHERE supervisor_id = $1', [userId]);
-    await db.query('UPDATE project_assignments SET assigned_by = NULL WHERE assigned_by = $1', [userId]);
-    await db.query('UPDATE hour_allocations SET allocated_by = NULL WHERE allocated_by = $1', [userId]);
-    await db.query('UPDATE hour_allocations SET account_manager_reviewer_id = NULL WHERE account_manager_reviewer_id = $1', [userId]);
-    await db.query('UPDATE leave_applications SET reviewed_by = NULL WHERE reviewed_by = $1', [userId]);
-    await db.query('UPDATE budget_requests SET reviewed_by = NULL WHERE reviewed_by = $1', [userId]);
-    await db.query('UPDATE password_reset_requests SET reviewed_by = NULL WHERE reviewed_by = $1', [userId]);
+    await client.query('BEGIN');
 
-    // Explicitly clear attendance data too, since attendance_logs/attendance_allocations predate
-    // ensureOperationalTables and their FK cascade behavior isn't guaranteed here.
-    await db.query(
+    // Attendance allocations hang off attendance logs, so clear them first.
+    await client.query(
       'DELETE FROM attendance_allocations WHERE attendance_id IN (SELECT attendance_id FROM attendance_logs WHERE user_id = $1)',
       [userId]
     );
-    await db.query('DELETE FROM attendance_logs WHERE user_id = $1', [userId]);
 
-    await db.query('DELETE FROM users WHERE user_id = $1', [userId]);
+    // Every foreign key that points at users(user_id), found from the live schema so a newly
+    // added table can't silently block deletes. A table's own user_id (or any required column)
+    // means the row belongs to this user, so it is deleted; other nullable references
+    // (reviewer, assigned_by, supervisor...) are just cleared.
+    const refs = await client.query(`
+      SELECT c.conrelid::regclass::text AS tbl, a.attname AS col, a.attnotnull AS required, c.confdeltype AS on_delete
+      FROM pg_constraint c
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+      WHERE c.contype = 'f' AND c.confrelid = 'users'::regclass AND array_length(c.conkey, 1) = 1
+    `);
+    for (const ref of refs.rows) {
+      if (ref.on_delete === 'c') continue; // ON DELETE CASCADE handles it
+      if (ref.required || ref.col === 'user_id') await client.query(`DELETE FROM ${ref.tbl} WHERE "${ref.col}" = $1`, [userId]);
+      else await client.query(`UPDATE ${ref.tbl} SET "${ref.col}" = NULL WHERE "${ref.col}" = $1`, [userId]);
+    }
+    // projects.account_manager_ids is a plain array rather than a foreign key.
+    await client.query(`UPDATE projects SET account_manager_ids = array_remove(account_manager_ids, $1::text) WHERE $1::text = ANY (account_manager_ids)`, [userId]);
+
+    await client.query('DELETE FROM users WHERE user_id = $1', [userId]);
+    await client.query('COMMIT');
     return res.status(200).json({ success: true, data: { user_id: userId, full_name: target.rows[0].full_name } });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     return res.status(500).json({ error: 'Failed to delete user.', detail: err.message });
+  } finally {
+    client.release();
   }
 });
 
