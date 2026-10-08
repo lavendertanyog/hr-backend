@@ -1,7 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { randomUUID } = require('crypto');
+const { randomUUID, randomBytes, createHash } = require('crypto');
 const bcrypt = require('bcryptjs');
 const dotenv = require('dotenv');
 const db = require('./db');
@@ -197,6 +197,30 @@ function userIsManagerial(userRow) {
     return userRow.user_roles.some((r) => isManagerialRole(r));
   }
   return false;
+}
+
+// Project lifecycle: ACTIVE -> DEPLOYED -> MAINTENANCE (-> DEPLOYED again). Only HR and
+// Account Managers may move a project between these. Legacy INACTIVE rows (from the old
+// Deactivate action) are treated as DEPLOYED everywhere.
+function userCanManageProjectLifecycle(userRow) {
+  return userHasRole(userRow, 'hr') || userHasRole(userRow, 'account_manager');
+}
+
+// Returns the first of the given project codes that is DEPLOYED (or legacy INACTIVE), or null.
+// Deployed projects keep their assignments, so this — not the assignment check — is what stops
+// time, progress and budget requests being logged against them.
+async function findDeployedProjectCode(projectCodes) {
+  const codes = [...new Set(projectCodes.filter(Boolean).map((c) => String(c).toUpperCase().trim()))];
+  if (codes.length === 0) return null;
+  const result = await db.query(
+    `SELECT project_code FROM projects WHERE project_code = ANY($1) AND status IN ('DEPLOYED', 'INACTIVE') LIMIT 1`,
+    [codes]
+  );
+  return result.rows[0]?.project_code || null;
+}
+
+function deployedProjectError(projectCode) {
+  return `Project ${projectCode} has been deployed. Ask HR or an Account Manager to reactivate it for maintenance before logging work against it.`;
 }
 
 // Standard date format used across all notification/inbox text (matches the "DD Mon YYYY" TO_CHAR format used elsewhere)
@@ -559,6 +583,25 @@ async function ensureOperationalTables() {
   // name to explain it), optional for a named project. Lives per-allocation rather than per
   // session, since one session can hold several project blocks each with their own note.
   await db.query(`ALTER TABLE attendance_allocations ADD COLUMN IF NOT EXISTS description TEXT;`);
+
+  // Login sessions. Every login gets one; "Remember me" makes it a trusted-device session that
+  // the login page can resume without a password until it expires. Only a SHA-256 hash of the
+  // token is stored, so a copy of this table can't be used to sign in.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      session_id UUID PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      portal TEXT,
+      device_label TEXT,
+      trusted BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      expires_at TIMESTAMPTZ NOT NULL,
+      revoked_at TIMESTAMPTZ
+    );
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions (user_id);`);
 }
 
 const STANDARD_WORKDAY_HOURS = 8;
@@ -856,6 +899,7 @@ app.post('/api/v1/auth/forgot-password', async (req, res) => {
       const tempPassword = generateTempPassword();
       const hash = await bcrypt.hash(tempPassword, 10);
       await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, user.user_id]);
+      await revokeUserSessions(user.user_id);
       const portalOrigin = portalUrl.replace(/\/$/, '');
       await sendTemporaryPasswordEmail(normalized, tempPassword, portalOrigin);
       console.log('[forgot-password] sent temporary password to', normalized);
@@ -890,6 +934,7 @@ app.post('/api/v1/auth/change-password', async (req, res) => {
 
     const hash = await bcrypt.hash(newPassword, 10);
     await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, userId]);
+    await revokeUserSessions(userId, bearerToken(req));
     return res.status(200).json({ success: true, message: 'Password updated.' });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to change password.', detail: error.message });
@@ -921,6 +966,7 @@ app.post('/api/v1/auth/reset-password-token', async (req, res) => {
 
     const hash = await bcrypt.hash(newPassword, 10);
     await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, row.user_id]);
+    await revokeUserSessions(row.user_id);
     await db.query('UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP WHERE token_id = $1', [row.token_id]);
     return res.status(200).json({ success: true, message: 'Password updated. You can now log in.' });
   } catch (error) {
@@ -937,7 +983,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
   const normalized = email.trim().toLowerCase();
   try {
     const result = await db.query(
-      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status FROM users WHERE LOWER(email) = $1 LIMIT 1',
+      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status, is_admin FROM users WHERE LOWER(email) = $1 LIMIT 1',
       [normalized]
     );
     const user = result.rows[0];
@@ -966,15 +1012,192 @@ app.post('/api/v1/auth/login', async (req, res) => {
       const valid = await bcrypt.compare(password, user.password_hash);
       if (!valid) return res.status(401).json({ error: 'Incorrect password.' });
     }
-    const { password_hash, account_status, ...safeUser } = user;
-    safeUser.full_name = deriveNameFromEmail(normalized);
-    // Ensure user_roles is always an array in the response
-    safeUser.user_roles = Array.isArray(safeUser.user_roles) && safeUser.user_roles.length > 0
-      ? safeUser.user_roles
-      : [safeUser.user_role].filter(Boolean);
-    return res.status(200).json({ success: true, data: safeUser });
+    const session = await createAuthSession(user, {
+      trusted: req.body.trustDevice === true,
+      portal: req.body.portal,
+      deviceLabel: deviceLabelFrom(req),
+    });
+    return res.status(200).json({ success: true, data: sessionUserPayload(user), session });
   } catch (error) {
     return res.status(500).json({ error: 'Login failed.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// LOGIN SESSIONS ("Remember me on this device")
+// ========================================================================
+// A login returns a session token. With "Remember me" ticked the portal keeps it in
+// localStorage and the login page trades it for a fresh one via /auth/resume, so the user skips
+// the password until the session expires: 30 days, or 1 day for HR and admin accounts because of
+// what they can change. Sessions keep the expiry set at password login (resuming doesn't extend
+// it), and each resume replaces the token so a copied one stops working once the device is used.
+// Tokens are sent as `Authorization: Bearer <token>`, ready for the rest of the API to use.
+const SESSION_DAY_MS = 24 * 60 * 60 * 1000;
+const TRUSTED_SESSION_DAYS = 30;
+const PRIVILEGED_TRUSTED_SESSION_DAYS = 1;
+const UNTRUSTED_SESSION_DAYS = 1;
+const SESSION_PORTALS = ['staff', 'manager', 'account_manager', 'hr'];
+
+function hashSessionToken(token) {
+  return createHash('sha256').update(String(token)).digest('hex');
+}
+
+function isPrivilegedAccount(user) {
+  return Boolean(user.is_admin) || userHasRole(user, 'hr');
+}
+
+function sessionDaysFor(user, trusted) {
+  if (!trusted) return UNTRUSTED_SESSION_DAYS;
+  return isPrivilegedAccount(user) ? PRIVILEGED_TRUSTED_SESSION_DAYS : TRUSTED_SESSION_DAYS;
+}
+
+// "Chrome on Windows" etc., so people can recognise their devices on the Profile page.
+function deviceLabelFrom(req) {
+  const ua = String(req.headers['user-agent'] || '');
+  const browser = /Edg\//.test(ua) ? 'Edge'
+    : /OPR\//.test(ua) ? 'Opera'
+    : /Chrome\//.test(ua) ? 'Chrome'
+    : /Firefox\//.test(ua) ? 'Firefox'
+    : /Safari\//.test(ua) ? 'Safari'
+    : 'Browser';
+  const os = /Windows/.test(ua) ? 'Windows'
+    : /iPhone|iPad/.test(ua) ? 'iOS'
+    : /Android/.test(ua) ? 'Android'
+    : /Mac OS X/.test(ua) ? 'macOS'
+    : /Linux/.test(ua) ? 'Linux'
+    : 'unknown device';
+  return `${browser} on ${os}`;
+}
+
+function bearerToken(req) {
+  const match = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ''));
+  return match ? match[1].trim() : null;
+}
+
+// The user object the portals keep in sessionStorage — same shape /auth/login has always returned.
+function sessionUserPayload(user) {
+  const { password_hash, account_status, is_admin, ...safeUser } = user;
+  safeUser.full_name = deriveNameFromEmail(user.email);
+  safeUser.user_roles = Array.isArray(safeUser.user_roles) && safeUser.user_roles.length > 0
+    ? safeUser.user_roles
+    : [safeUser.user_role].filter(Boolean);
+  return safeUser;
+}
+
+async function createAuthSession(user, { trusted, portal, deviceLabel, expiresAt }) {
+  const token = randomBytes(32).toString('base64url');
+  let expires = new Date(Date.now() + sessionDaysFor(user, trusted) * SESSION_DAY_MS);
+  // A resumed session keeps its original expiry, unless the account has since become HR/admin.
+  if (expiresAt && new Date(expiresAt) < expires) expires = new Date(expiresAt);
+  await db.query(
+    `INSERT INTO auth_sessions (session_id, user_id, token_hash, portal, device_label, trusted, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [randomUUID(), user.user_id, hashSessionToken(token),
+      SESSION_PORTALS.includes(portal) ? portal : null, deviceLabel || null, Boolean(trusted), expires]
+  );
+  return { token, trusted: Boolean(trusted), expiresAt: expires.toISOString() };
+}
+
+// The live session for a token, joined with its user, or null if it's unknown, revoked or expired.
+async function findAuthSession(token) {
+  if (!token) return null;
+  const result = await db.query(
+    `SELECT s.session_id, s.portal, s.device_label, s.trusted, s.expires_at,
+            u.user_id, u.full_name, u.user_role, u.user_roles, u.email, u.account_status, u.is_admin
+     FROM auth_sessions s JOIN users u ON u.user_id = s.user_id
+     WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > CURRENT_TIMESTAMP
+     LIMIT 1`,
+    [hashSessionToken(token)]
+  );
+  return result.rows[0] || null;
+}
+
+// Signs a user out everywhere: after a password change or reset, or a change to their roles.
+// `exceptToken` keeps the session that made the change (changing your own password).
+async function revokeUserSessions(userId, exceptToken = null) {
+  await db.query(
+    `UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP
+     WHERE user_id = $1 AND revoked_at IS NULL AND token_hash IS DISTINCT FROM $2`,
+    [userId, exceptToken ? hashSessionToken(exceptToken) : null]
+  );
+}
+
+app.post('/api/v1/auth/resume', async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'token is required.' });
+  try {
+    const session = await findAuthSession(token);
+    if (!session || !session.trusted || String(session.account_status || 'active').toLowerCase() !== 'active') {
+      return res.status(401).json({ error: 'Your saved sign-in has expired. Please log in again.' });
+    }
+    await db.query('UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE session_id = $1', [session.session_id]);
+    const next = await createAuthSession(session, {
+      trusted: true,
+      portal: session.portal,
+      deviceLabel: deviceLabelFrom(req),
+      expiresAt: session.expires_at,
+    });
+    return res.status(200).json({ success: true, data: sessionUserPayload(session), session: next });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to resume sign-in.', detail: error.message });
+  }
+});
+
+// Log out: ends this device's session. Always succeeds, so logging out never gets stuck.
+app.post('/api/v1/auth/logout', async (req, res) => {
+  const token = bearerToken(req);
+  try {
+    if (token) {
+      await db.query(
+        'UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE token_hash = $1 AND revoked_at IS NULL',
+        [hashSessionToken(token)]
+      );
+    }
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to log out.', detail: error.message });
+  }
+});
+
+// The signed-in user's own remembered devices, for the Profile page.
+app.get('/api/v1/auth/sessions', async (req, res) => {
+  try {
+    const current = await findAuthSession(bearerToken(req));
+    if (!current) return res.status(401).json({ error: 'Please log in again to see your devices.' });
+    const result = await db.query(
+      `SELECT session_id, portal, device_label, created_at, last_used_at, expires_at
+       FROM auth_sessions
+       WHERE user_id = $1 AND trusted AND revoked_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+       ORDER BY created_at DESC`,
+      [current.user_id]
+    );
+    const data = result.rows.map((row) => ({ ...row, is_current: row.session_id === current.session_id }));
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load your devices.', detail: error.message });
+  }
+});
+
+// Forget one remembered device (`sessionId`), or every one except this device (`allOthers: true`).
+app.post('/api/v1/auth/sessions/revoke', async (req, res) => {
+  const { sessionId, allOthers } = req.body;
+  if (!sessionId && allOthers !== true) return res.status(400).json({ error: 'sessionId or allOthers is required.' });
+  if (sessionId && !UUID_RE.test(sessionId)) return res.status(400).json({ error: 'sessionId is not valid.' });
+  try {
+    const current = await findAuthSession(bearerToken(req));
+    if (!current) return res.status(401).json({ error: 'Please log in again to manage your devices.' });
+    const result = allOthers === true
+      ? await db.query(
+        `UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1 AND session_id <> $2 AND revoked_at IS NULL`,
+        [current.user_id, current.session_id])
+      : await db.query(
+        `UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1 AND session_id = $2 AND revoked_at IS NULL`,
+        [current.user_id, sessionId]);
+    return res.status(200).json({ success: true, data: { revoked: result.rowCount } });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to sign out the device.', detail: error.message });
   }
 });
 
@@ -1065,6 +1288,7 @@ app.patch('/api/v1/admin/approve-reset', async (req, res) => {
 
     if (action === 'approve') {
       await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [row.new_password_hash, row.user_id]);
+      await revokeUserSessions(row.user_id);
     }
     await db.query(
       `UPDATE password_reset_requests SET status = $1, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = $2 WHERE request_id = $3`,
@@ -1539,6 +1763,16 @@ app.get('/api/v1/auth/verify-session', async (req, res) => {
       [userId]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'User not found.' });
+    // A tab that sends its session token is signed out once that session is revoked (log out
+    // elsewhere, password change, Sign out on the Profile device list) or has expired. Tabs from
+    // before login sessions existed send no token and keep the old behaviour.
+    const token = bearerToken(req);
+    if (token) {
+      const session = await findAuthSession(token);
+      if (!session || session.user_id !== userId) {
+        return res.status(401).json({ error: 'Your sign-in has ended. Please log in again.', signedOut: true });
+      }
+    }
     const row = result.rows[0];
     const roles = Array.isArray(row.user_roles) && row.user_roles.length > 0
       ? row.user_roles : [row.user_role].filter(Boolean);
@@ -1853,6 +2087,11 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
       return res.status(404).json({ error: 'User profile not found' });
     }
 
+    const deployedCode = await findDeployedProjectCode(requestedProjects.map((a) => a.projectCode));
+    if (deployedCode) {
+      return res.status(403).json({ error: deployedProjectError(deployedCode) });
+    }
+
     // Non-managerial staff must be assigned to every requested project to clock in (General is exempt)
     const userRow = userProfile.rows[0];
     if (!userIsManagerial(userRow)) {
@@ -2003,7 +2242,7 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
     const { clippedHours, ratio } = await clipOverlappingHours(
       userId, logCheck.rows[0].project_code, clockIn.toISOString(), currentOut.toISOString(), attendanceId
     );
-    const outHour = currentOut.getHours();
+    const outHour = sgtHourOf(currentOut);
     const crossesLunch = sessionOverlapsSgtLunch(clockIn, currentOut);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(clippedHours - 1, 0) : Math.max(clippedHours, 0)) * 100) / 100;
     const otHoursAccrued = clippedHours > 9.5 && outHour >= 18 ? Math.round((clippedHours - 9.5) * 100) / 100 : 0;
@@ -2109,6 +2348,10 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
     if (userProfile.rows.length === 0) {
       return res.status(404).json({ error: 'User profile not found' });
     }
+    const deployedCode = await findDeployedProjectCode(allocationsInput.map((a) => a.projectCode));
+    if (deployedCode) {
+      return res.status(403).json({ error: deployedProjectError(deployedCode) });
+    }
     if (!userIsManagerial(userProfile.rows[0])) {
       for (const alloc of allocationsInput) {
         if (!alloc.projectCode) continue;
@@ -2137,7 +2380,7 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
     // Unlike live clock-out, a Manual Entry always credits exactly what was entered — no
     // overlap-deduplication against other sessions. It's a deliberate, precise record the staff
     // member is entering by hand, not a live timer that could double-count a forgotten clock-out.
-    const outHour = end.getHours();
+    const outHour = sgtHourOf(end);
     const crossesLunch = sessionOverlapsSgtLunch(start, end);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(actualDurationHours - 1, 0) : Math.max(actualDurationHours, 0)) * 100) / 100;
     const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
@@ -2223,7 +2466,7 @@ app.patch('/api/v1/attendance/:attendanceId/edit-times', async (req, res) => {
     }
 
     const actualDurationHours = (end.getTime() - start.getTime()) / 3600000;
-    const outHour = end.getHours();
+    const outHour = sgtHourOf(end);
     const crossesLunch = sessionOverlapsSgtLunch(start, end);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(actualDurationHours - 1, 0) : Math.max(actualDurationHours, 0)) * 100) / 100;
     const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
@@ -2326,7 +2569,7 @@ app.delete('/api/v1/attendance/:attendanceId', async (req, res) => {
   }
   try {
     const existing = await db.query(
-      'SELECT attendance_id, clock_out_time FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2',
+      'SELECT * FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2',
       [attendanceId, userId]
     );
     if (existing.rows.length === 0) {
@@ -2335,7 +2578,10 @@ app.delete('/api/v1/attendance/:attendanceId', async (req, res) => {
     if (!existing.rows[0].clock_out_time) {
       return res.status(400).json({ error: 'This session is still active — clock it out before deleting it.' });
     }
+    // The delete cascades to the entry's project blocks, so keep them in the audit snapshot too.
+    const blocks = await db.query('SELECT * FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC', [attendanceId]);
     await db.query('DELETE FROM attendance_logs WHERE attendance_id = $1', [attendanceId]);
+    await auditInterceptor('attendance_logs', attendanceId, userId, { ...existing.rows[0], allocations: blocks.rows }, null);
     res.status(200).json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete attendance entry.', detail: error.message });
@@ -2529,6 +2775,9 @@ app.post('/api/v1/attendance/allocations', async (req, res) => {
     }
 
     if (projectCode) {
+      if (await findDeployedProjectCode([projectCode])) {
+        return res.status(403).json({ error: deployedProjectError(projectCode) });
+      }
       const userProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
       if (!userIsManagerial(userProfile.rows[0])) {
         const assignCheck = await db.query(
@@ -2611,6 +2860,9 @@ app.patch('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
       const { attendance_id: attendanceId } = target.rows[0];
 
       if (projectCode) {
+        if (await findDeployedProjectCode([projectCode])) {
+          return res.status(403).json({ error: deployedProjectError(projectCode) });
+        }
         const userProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
         if (!userIsManagerial(userProfile.rows[0])) {
           const assignCheck = await db.query(
@@ -2743,7 +2995,9 @@ app.delete('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
       return res.status(400).json({ error: 'Can\'t delete the only project on this entry.' });
     }
 
+    const deletedBlock = await db.query('SELECT * FROM attendance_allocations WHERE allocation_id = $1', [allocationId]);
     await db.query('DELETE FROM attendance_allocations WHERE allocation_id = $1', [allocationId]);
+    await auditInterceptor('attendance_allocations', allocationId, userId, deletedBlock.rows[0], null);
 
     const remaining = await db.query(
       `SELECT allocation_id, allocated_hours, status FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
@@ -3049,6 +3303,9 @@ app.post('/api/v1/projects/budget-request', async (req, res) => {
     const projectCheck = await db.query('SELECT project_code FROM projects WHERE project_code = $1', [projectCode]);
     if (projectCheck.rows.length === 0) {
       return res.status(404).json({ error: `Project reference lookup failed for code: ${projectCode}` });
+    }
+    if (await findDeployedProjectCode([projectCode])) {
+      return res.status(403).json({ error: deployedProjectError(projectCode) });
     }
 
     // Staff must be assigned to the project to make a budget request
@@ -3462,13 +3719,14 @@ app.delete('/api/v1/leave/:leaveId', async (req, res) => {
     const result = await db.query(
       `DELETE FROM leave_applications
        WHERE leave_id = $1 AND user_id = $2 AND workflow_status = 'PENDING'
-       RETURNING leave_id, user_id, category, start_date, end_date`,
+       RETURNING *`,
       [leaveId, userId]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Leave request not found or it is not eligible for cancellation.' });
     }
+    await auditInterceptor('leave_applications', leaveId, userId, result.rows[0], null);
 
     try {
       const cancelled = result.rows[0];
@@ -3476,7 +3734,8 @@ app.delete('/api/v1/leave/:leaveId', async (req, res) => {
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, 'Leave Request Deleted', message]);
     } catch (_) {}
 
-    return res.status(200).json({ success: true, data: result.rows[0] });
+    const { leave_id, user_id, category, start_date, end_date } = result.rows[0];
+    return res.status(200).json({ success: true, data: { leave_id, user_id, category, start_date, end_date } });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to delete leave application.', detail: error.message });
   }
@@ -3525,6 +3784,9 @@ app.post('/api/v1/projects/progress-log', async (req, res) => {
     const projectCheck = await db.query('SELECT project_code FROM projects WHERE project_code = $1', [projectCode]);
     if (projectCheck.rows.length === 0) {
       return res.status(404).json({ error: `Routing Error: Project with code '${projectCode}' does not exist.` });
+    }
+    if (await findDeployedProjectCode([projectCode])) {
+      return res.status(403).json({ error: deployedProjectError(projectCode) });
     }
 
     // Non-managerial staff must be assigned to log progress
@@ -3617,7 +3879,7 @@ app.delete('/api/v1/projects/progress-log/:logId', async (req, res) => {
   const { userId } = req.body;
 
   try {
-    const existing = await db.query('SELECT reporter_id, progress_summary FROM project_progress_logs WHERE log_id = $1', [logId]);
+    const existing = await db.query('SELECT * FROM project_progress_logs WHERE log_id = $1', [logId]);
     if (existing.rows.length === 0) {
       return res.status(404).json({ error: 'Progress log entry not found.' });
     }
@@ -3629,6 +3891,7 @@ app.delete('/api/v1/projects/progress-log/:logId', async (req, res) => {
     }
 
     await db.query('DELETE FROM project_progress_logs WHERE log_id = $1', [logId]);
+    await auditInterceptor('project_progress_logs', logId, userId, existing.rows[0], null);
     res.status(200).json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete progress entry.', detail: error.message });
@@ -3666,7 +3929,7 @@ app.get('/api/v1/projects/active-list', async (req, res) => {
            CASE WHEN p.account_manager_id = $1 THEN true ELSE false END AS is_assigned_manager,
            false AS is_direct_assignment
          FROM projects p
-         WHERE COALESCE(p.status, 'ACTIVE') != 'INACTIVE'
+         WHERE COALESCE(p.status, 'ACTIVE') NOT IN ('INACTIVE', 'DEPLOYED')
          ORDER BY p.project_code ASC`,
         [userId]
       );
@@ -3699,7 +3962,7 @@ app.get('/api/v1/projects/active-list', async (req, res) => {
          ON pa.project_code = p.project_code
         AND pa.user_id = $1
        WHERE pa.assignment_id IS NOT NULL
-              AND COALESCE(p.status, 'ACTIVE') != 'INACTIVE'
+              AND COALESCE(p.status, 'ACTIVE') NOT IN ('INACTIVE', 'DEPLOYED')
           ${budgetRequestsClause}
        ORDER BY p.project_code ASC`,
       [userId]
@@ -3720,7 +3983,7 @@ app.get('/api/v1/projects/active-list', async (req, res) => {
          false AS is_assigned_manager,
          false AS is_direct_assignment
        FROM projects
-       WHERE COALESCE(status, 'ACTIVE') != 'INACTIVE'
+       WHERE COALESCE(status, 'ACTIVE') NOT IN ('INACTIVE', 'DEPLOYED')
        ORDER BY project_code ASC`
     );
 
@@ -3803,7 +4066,7 @@ app.get('/api/v1/projects/suggestions', async (req, res) => {
   const query = `%${(req.query.q || '').trim()}%`;
   try {
     const result = await db.query(
-      'SELECT project_code, project_name FROM projects WHERE (project_code ILIKE $1 OR project_name ILIKE $1) AND COALESCE(status, \'ACTIVE\') != \'INACTIVE\' ORDER BY project_code ASC LIMIT 20',
+      'SELECT project_code, project_name FROM projects WHERE (project_code ILIKE $1 OR project_name ILIKE $1) AND COALESCE(status, \'ACTIVE\') NOT IN (\'INACTIVE\', \'DEPLOYED\') ORDER BY project_code ASC LIMIT 20',
       [query]
     );
     res.status(200).json({ success: true, data: result.rows });
@@ -4141,6 +4404,7 @@ app.patch('/api/v1/hr/update-user-roles', async (req, res) => {
       'UPDATE users SET user_role = $1, user_roles = $2 WHERE user_id = $3',
       [resolvedPrimary, cleaned, userId]
     );
+    await revokeUserSessions(userId);
     const updated = await db.query(
       'SELECT user_id, full_name, email, user_role, user_roles, account_status FROM users WHERE user_id = $1 LIMIT 1',
       [userId]
@@ -4170,21 +4434,69 @@ app.get('/api/v1/hr/active-users', async (req, res) => {
 
 // HR: set a per-employee leave entitlement override
 app.patch('/api/v1/hr/update-leave-entitlement', async (req, res) => {
-  const { requesterId, userId, leaveEntitlementDays } = req.body;
+  const { requesterId, userId, leaveEntitlementDays, reason } = req.body;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   const days = Number(leaveEntitlementDays);
   if (!userId || !Number.isInteger(days) || days < 0) {
     return res.status(400).json({ error: 'userId and a non-negative integer leaveEntitlementDays are required.' });
   }
   try {
+    const before = await db.query('SELECT leave_entitlement_days FROM users WHERE user_id = $1', [userId]);
     const updated = await db.query(
       'UPDATE users SET leave_entitlement_days = $1 WHERE user_id = $2 RETURNING user_id, full_name, leave_entitlement_days',
       [days, userId]
     );
     if (!updated.rows[0]) return res.status(404).json({ error: 'User not found.' });
+    await auditInterceptor('users', userId, requesterId,
+      { leave_entitlement_days: before.rows[0]?.leave_entitlement_days ?? 12 },
+      { leave_entitlement_days: days, reason: String(reason || '').trim() || null });
     return res.status(200).json({ success: true, data: updated.rows[0] });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update leave entitlement.', detail: err.message });
+  }
+});
+
+// HR: set the same leave entitlement for several employees at once (e.g. a new grade or year).
+app.patch('/api/v1/hr/update-leave-entitlement-bulk', async (req, res) => {
+  const { requesterId, userIds, leaveEntitlementDays, reason } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  const days = Number(leaveEntitlementDays);
+  if (!Array.isArray(userIds) || userIds.length === 0 || !Number.isInteger(days) || days < 0) {
+    return res.status(400).json({ error: 'userIds (non-empty array) and a non-negative integer leaveEntitlementDays are required.' });
+  }
+  try {
+    const before = await db.query('SELECT user_id, leave_entitlement_days FROM users WHERE user_id = ANY($1::uuid[])', [userIds]);
+    const updated = await db.query(
+      'UPDATE users SET leave_entitlement_days = $1 WHERE user_id = ANY($2::uuid[]) RETURNING user_id, leave_entitlement_days',
+      [days, userIds]
+    );
+    const cleanReason = String(reason || '').trim() || null;
+    for (const row of before.rows) {
+      await auditInterceptor('users', row.user_id, requesterId,
+        { leave_entitlement_days: row.leave_entitlement_days ?? 12 },
+        { leave_entitlement_days: days, reason: cleanReason });
+    }
+    return res.status(200).json({ success: true, updated: updated.rows.length, data: updated.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update leave entitlements.', detail: err.message });
+  }
+});
+
+// HR: approved Annual + Emergency days used per employee (same rule as /leave/balance/:userId),
+// so the People page can show used/remaining beside each entitlement in one request.
+app.get('/api/v1/hr/leave-balances', async (req, res) => {
+  const { requesterId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  try {
+    const result = await db.query(
+      `SELECT user_id, COALESCE(SUM(end_date::date - start_date::date + 1), 0)::int AS used_days
+       FROM leave_applications
+       WHERE category::TEXT IN ('ANNUAL', 'EMERGENCY') AND workflow_status::TEXT = 'APPROVED'
+       GROUP BY user_id`
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to fetch leave balances.', detail: err.message });
   }
 });
 
@@ -4199,6 +4511,37 @@ app.get('/api/v1/public-holidays', async (req, res) => {
     return res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch public holidays.', detail: error.message });
+  }
+});
+
+// Company-wide leave calendar — who is on approved leave between ?from and ?to (YYYY-MM-DD,
+// inclusive). Open to any active user in every portal, so it deliberately returns only the
+// person's name and dates: no leave type (sick leave is medical), reason or MC.
+app.get('/api/v1/calendar/leave', async (req, res) => {
+  const { requesterId, from, to } = req.query;
+  const isoDate = /^\d{4}-\d{2}-\d{2}$/;
+  if (!requesterId) return res.status(400).json({ error: 'requesterId is required.' });
+  if (!isoDate.test(String(from || '')) || !isoDate.test(String(to || '')) || from > to) {
+    return res.status(400).json({ error: 'from and to must be YYYY-MM-DD dates, with from on or before to.' });
+  }
+  try {
+    const requester = await db.query('SELECT account_status FROM users WHERE user_id = $1', [requesterId]);
+    if (requester.rows.length === 0 || String(requester.rows[0].account_status || 'active').toLowerCase() !== 'active') {
+      return res.status(403).json({ error: 'Access Denied.' });
+    }
+    const result = await db.query(
+      `SELECT la.leave_id, la.user_id, u.full_name, la.start_date, la.end_date
+       FROM leave_applications la
+       JOIN users u ON u.user_id = la.user_id
+       WHERE la.workflow_status = 'APPROVED'
+         AND la.start_date <= $2 AND la.end_date >= $1
+         AND COALESCE(u.account_status, 'active') = 'active' AND NOT COALESCE(u.is_hidden, false)
+       ORDER BY la.start_date ASC, u.full_name ASC`,
+      [from, to]
+    );
+    return res.status(200).json({ success: true, data: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch leave calendar.', detail: error.message });
   }
 });
 
@@ -4655,48 +4998,63 @@ app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
   }
 });
 
-// DEACTIVATE PROJECT (sets INACTIVE, removes assignments)
-app.patch('/api/v1/projects/:projectCode/deactivate', async (req, res) => {
+// MARK PROJECT DEPLOYED (ACTIVE or MAINTENANCE -> DEPLOYED). Staff assignments are kept so the
+// same team comes back when it is reactivated; time logging is blocked while it is DEPLOYED.
+// HR and Account Managers only. /deactivate is kept as an alias for portal builds that still
+// call it.
+async function markProjectDeployed(req, res) {
   const { projectCode } = req.params;
   const { editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
   try {
     const editorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [editorId]);
-    if (editorCheck.rows.length === 0 || !userIsManagerial(editorCheck.rows[0])) {
-      return res.status(403).json({ error: 'Access Denied.' });
+    if (editorCheck.rows.length === 0 || !userCanManageProjectLifecycle(editorCheck.rows[0])) {
+      return res.status(403).json({ error: 'Access Denied: Only HR or Account Manager users can mark a project as deployed.' });
     }
     const code = projectCode.toUpperCase().trim();
-    // Remove all project assignments
-    await db.query('DELETE FROM project_assignments WHERE project_code = $1', [code]);
-    // Set project status to INACTIVE
+    const existing = await db.query('SELECT status FROM projects WHERE project_code = $1', [code]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
+    const before = String(existing.rows[0].status || 'ACTIVE').toUpperCase();
+    if (before === 'DEPLOYED' || before === 'INACTIVE') {
+      return res.status(400).json({ error: `Project ${code} is already deployed.` });
+    }
     const result = await db.query(
-      `UPDATE projects SET status = 'INACTIVE' WHERE project_code = $1 RETURNING *`,
+      `UPDATE projects SET status = 'DEPLOYED' WHERE project_code = $1 RETURNING *`,
       [code]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
-    res.status(200).json({ success: true, message: `Project ${code} deactivated and assignments removed.`, data: result.rows[0] });
+    await auditInterceptor('projects', code, editorId, { status: before }, { status: 'DEPLOYED' });
+    res.status(200).json({ success: true, message: `Project ${code} marked as deployed.`, data: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to deactivate project.', detail: error.message });
+    res.status(500).json({ error: 'Failed to mark project as deployed.', detail: error.message });
   }
-});
+}
+app.patch('/api/v1/projects/:projectCode/deploy', markProjectDeployed);
+app.patch('/api/v1/projects/:projectCode/deactivate', markProjectDeployed);
 
-// REACTIVATE PROJECT (sets ACTIVE again — staff assignments must be re-added manually)
+// REACTIVATE PROJECT FOR MAINTENANCE (DEPLOYED -> MAINTENANCE). Staff can log time against a
+// MAINTENANCE project like an ACTIVE one. HR and Account Managers only.
 app.patch('/api/v1/projects/:projectCode/reactivate', async (req, res) => {
   const { projectCode } = req.params;
   const { editorId } = req.body;
   if (!editorId) return res.status(400).json({ error: 'editorId is required.' });
   try {
     const editorCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [editorId]);
-    if (editorCheck.rows.length === 0 || !userIsManagerial(editorCheck.rows[0])) {
-      return res.status(403).json({ error: 'Access Denied.' });
+    if (editorCheck.rows.length === 0 || !userCanManageProjectLifecycle(editorCheck.rows[0])) {
+      return res.status(403).json({ error: 'Access Denied: Only HR or Account Manager users can reactivate a project.' });
     }
     const code = projectCode.toUpperCase().trim();
+    const existing = await db.query('SELECT status FROM projects WHERE project_code = $1', [code]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
+    const before = String(existing.rows[0].status || 'ACTIVE').toUpperCase();
+    if (before !== 'DEPLOYED' && before !== 'INACTIVE') {
+      return res.status(400).json({ error: `Only a deployed project can be reactivated. ${code} is ${before}.` });
+    }
     const result = await db.query(
-      `UPDATE projects SET status = 'ACTIVE' WHERE project_code = $1 RETURNING *`,
+      `UPDATE projects SET status = 'MAINTENANCE' WHERE project_code = $1 RETURNING *`,
       [code]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
-    res.status(200).json({ success: true, message: `Project ${code} reactivated.`, data: result.rows[0] });
+    await auditInterceptor('projects', code, editorId, { status: before }, { status: 'MAINTENANCE' });
+    res.status(200).json({ success: true, message: `Project ${code} reactivated for maintenance.`, data: result.rows[0] });
   } catch (error) {
     res.status(500).json({ error: 'Failed to reactivate project.', detail: error.message });
   }
@@ -5022,8 +5380,8 @@ app.post('/api/v1/projects/assign-bulk', async (req, res) => {
     if (managerCheck.rows.length === 0 || !userIsManagerial(managerCheck.rows[0])) {
       return res.status(403).json({ error: 'Only managers can assign projects.' });
     }
-    const projectCheck = await db.query('SELECT project_code, budget_hours, project_name FROM projects WHERE project_code = $1 AND COALESCE(status, \'ACTIVE\') != \'INACTIVE\' LIMIT 1', [projectCode]);
-    if (projectCheck.rows.length === 0) return res.status(404).json({ error: 'Project code not found or is inactive.' });
+    const projectCheck = await db.query('SELECT project_code, budget_hours, project_name FROM projects WHERE project_code = $1 AND COALESCE(status, \'ACTIVE\') NOT IN (\'INACTIVE\', \'DEPLOYED\') LIMIT 1', [projectCode]);
+    if (projectCheck.rows.length === 0) return res.status(404).json({ error: 'Project code not found or has been deployed.' });
 
     const results = [];
     for (const userId of userIds) {
@@ -5444,6 +5802,71 @@ app.get('/api/v1/admin/audit-logs', async (req, res) => {
   }
 });
 
+// HR Portal > Audit Log: read-only, filterable, paginated view of audit_logs. Each row is
+// resolved to the person who made the change ("changed by") and, where the record belongs to
+// someone, the person it belongs to ("affected"). Allocation snapshots carry no user_id, so
+// those are traced through their attendance entry; project changes have no affected person.
+const AUDIT_TABLES = ['attendance_logs', 'attendance_allocations', 'leave_applications', 'project_progress_logs', 'budget_requests', 'projects', 'users'];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+app.get('/api/v1/hr/audit-logs', async (req, res) => {
+  const { requesterId, from, to, tableName, alteredBy, subjectUserId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  const isoDate = /^\d{4}-\d{2}-\d{2}$/;
+  if ((from && !isoDate.test(from)) || (to && !isoDate.test(to)) || (from && to && from > to)) {
+    return res.status(400).json({ error: 'from and to must be YYYY-MM-DD dates, with from on or before to.' });
+  }
+  if (tableName && !AUDIT_TABLES.includes(tableName)) {
+    return res.status(400).json({ error: 'Unknown record type.' });
+  }
+  if ((alteredBy && !UUID_RE.test(alteredBy)) || (subjectUserId && !UUID_RE.test(subjectUserId))) {
+    return res.status(400).json({ error: 'Invalid user filter.' });
+  }
+  const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 20, 1), 100);
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  try {
+    const result = await db.query(
+      `WITH a AS (
+         SELECT l.*,
+           CASE l.table_name
+             WHEN 'users' THEN l.record_id
+             WHEN 'projects' THEN NULL
+             WHEN 'project_progress_logs' THEN COALESCE(l.post_value->>'reporter_id', l.pre_value->>'reporter_id')
+             -- Only the entry's owner can edit its blocks, so fall back to the editor once the
+             -- entry itself has been deleted.
+             WHEN 'attendance_allocations' THEN COALESCE((
+               SELECT al.user_id::text FROM attendance_logs al
+               WHERE al.attendance_id::text = COALESCE(l.post_value->>'attendance_id', l.pre_value->>'attendance_id')),
+               l.altered_by::text)
+             ELSE COALESCE(l.post_value->>'user_id', l.pre_value->>'user_id')
+           END AS subject_user_id
+         FROM audit_logs l
+       )
+       SELECT a.audit_id, a.table_name, a.record_id, a.altered_by, a.pre_value, a.post_value, a.created_at,
+              a.subject_user_id, ab.full_name AS altered_by_name, su.full_name AS subject_name,
+              COUNT(*) OVER() AS total_count
+       FROM a
+       LEFT JOIN users ab ON ab.user_id::text = a.altered_by::text
+       LEFT JOIN users su ON su.user_id::text = a.subject_user_id
+       WHERE ($1::date IS NULL OR (a.created_at AT TIME ZONE 'Asia/Singapore')::date >= $1::date)
+         AND ($2::date IS NULL OR (a.created_at AT TIME ZONE 'Asia/Singapore')::date <= $2::date)
+         AND ($3::text IS NULL OR a.table_name = $3)
+         AND ($4::text IS NULL OR a.altered_by::text = $4)
+         AND ($5::text IS NULL OR a.subject_user_id = $5)
+       ORDER BY a.created_at DESC, a.audit_id DESC
+       LIMIT $6 OFFSET $7`,
+      [from || null, to || null, tableName || null, alteredBy ? alteredBy.toLowerCase() : null, subjectUserId ? subjectUserId.toLowerCase() : null, pageSize, (page - 1) * pageSize]
+    );
+    const total = result.rows.length ? Number(result.rows[0].total_count) : 0;
+    return res.status(200).json({
+      success: true,
+      data: result.rows.map(({ total_count, ...row }) => row),
+      pagination: { page, pageSize, total },
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch audit logs.', detail: error.message });
+  }
+});
+
 // ========================================================================
 // SERVER-SIDE BACKSTOP: force clock-out any session that's gone 4+ hours since its last
 // confirmation (Continue press, or clock-in if never confirmed) — independent of whether
@@ -5462,6 +5885,11 @@ function sgtNowServer() {
   // comment in AttendanceReminders.js for why only the UTC getters on the result are valid.
   const now = new Date();
   return new Date(now.getTime() + 8 * 60 * 60 * 1000);
+}
+// Hour of day (0-23) in SGT for any instant. Overtime used to read Date#getHours(), which is the
+// server's own time zone — UTC on Render — so "clock-out at 18:00 or later" was really 2am SGT.
+function sgtHourOf(instant) {
+  return new Date(new Date(instant).getTime() + 8 * 60 * 60 * 1000).getUTCHours();
 }
 function isSgtLunchWindow(sgt) {
   const hourDecimal = sgt.getUTCHours() + sgt.getUTCMinutes() / 60;
