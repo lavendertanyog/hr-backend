@@ -3463,8 +3463,24 @@ app.post('/api/v1/leave/apply', async (req, res) => {
   if (!validCategories.includes(category?.toUpperCase())) {
     return res.status(400).json({ error: "Invalid category. Must be 'ANNUAL', 'EMERGENCY', or 'SICK'." });
   }
+  // Required fields: without these the request used to save a leave with no owner, or crash
+  // with a 500 on an empty date.
+  if (!userId || !UUID_RE.test(String(userId))) {
+    return res.status(400).json({ error: 'userId is required.' });
+  }
+  const isRealDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || '')) && !Number.isNaN(new Date(`${d}T00:00:00Z`).getTime())
+    && new Date(`${d}T00:00:00Z`).toISOString().slice(0, 10) === d;
+  if (!isRealDate(startDate) || !isRealDate(endDate)) {
+    return res.status(400).json({ error: 'Please select a start and end date.' });
+  }
+  if (endDate < startDate) {
+    return res.status(400).json({ error: 'The end date cannot be before the start date.' });
+  }
 
   try {
+    const applicant = await db.query('SELECT 1 FROM users WHERE user_id = $1', [userId]);
+    if (applicant.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+
     const leaveStartTimestamp = new Date(startDate);
     const currentTimestamp = new Date();
     const hoursPastStart = (currentTimestamp.getTime() - leaveStartTimestamp.getTime()) / (1000 * 60 * 60);
@@ -3604,7 +3620,9 @@ app.patch('/api/v1/leave/undo-review', async (req, res) => {
 app.patch('/api/v1/leave/review', async (req, res) => {
   const { leaveId, reviewerId, action, reviewerRemarks } = req.body;
 
-  const approvedActions = ['APPROVED', 'REJECTED', 'FORWARD_TO_ACCOUNT_MANAGER'];
+  // FORWARD_TO_ACCOUNT_MANAGER used to be accepted here, but the leave status type in the database
+  // has no such value, so it crashed with a 500. No portal sends it; leave goes manager-only.
+  const approvedActions = ['APPROVED', 'REJECTED'];
   if (!approvedActions.includes(action?.toUpperCase())) {
     return res.status(400).json({ error: "Invalid review action." });
   }
