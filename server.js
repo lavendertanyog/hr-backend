@@ -1897,7 +1897,7 @@ app.get('/api/v1/leave/my-requests/:userId', async (req, res) => {
 
   try {
     const result = await db.query(
-      `SELECT leave_id, category, start_date, end_date, workflow_status, reviewer_remarks, mc_file_url, created_at
+      `SELECT leave_id, category, start_date, end_date, workflow_status, reviewer_remarks, reason, mc_file_url, created_at
        FROM leave_applications
        WHERE user_id = $1
        ORDER BY created_at DESC`,
@@ -3417,7 +3417,7 @@ app.get('/api/v1/manager/:supervisorId/leave-all', async (req, res) => {
        FROM leave_applications la
        JOIN users u ON la.user_id = u.user_id
        LEFT JOIN users r ON r.user_id = la.reviewed_by
-       WHERE (u.supervisor_id = $1 OR la.workflow_status != 'PENDING')
+       WHERE u.supervisor_id = $1
          AND la.workflow_status != 'PENDING'
        ORDER BY la.created_at DESC`,
       [supervisorId]
@@ -3526,10 +3526,23 @@ app.patch('/api/v1/leave/re-review', async (req, res) => {
     return res.status(400).json({ error: 'Invalid action. Must be APPROVED or REJECTED.' });
   }
   try {
-    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
+    const reviewerProfile = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1', [reviewerId]);
     if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
     const role = normalizeRole(reviewerProfile.rows[0].user_role);
     if (role === 'staff') return res.status(403).json({ error: 'Staff users cannot review leave.' });
+    // Only the applicant's own manager (or HR/admin) may change a past decision — previously any
+    // non-staff user could override any team's leave from their History tab.
+    const isHrReviewer = Boolean(reviewerProfile.rows[0].is_admin) || userHasRole(reviewerProfile.rows[0], 'hr');
+    if (!isHrReviewer) {
+      const ownership = await db.query(
+        `SELECT 1 FROM leave_applications la JOIN users u ON u.user_id = la.user_id
+         WHERE la.leave_id = $1 AND u.supervisor_id = $2`,
+        [leaveId, reviewerId]
+      );
+      if (ownership.rows.length === 0) {
+        return res.status(403).json({ error: 'This leave request does not belong to a member of your team.' });
+      }
+    }
     const beforeLeave = await db.query('SELECT * FROM leave_applications WHERE leave_id = $1', [leaveId]);
     const result = await db.query(
       `UPDATE leave_applications SET workflow_status = $1, reviewer_remarks = $2, reviewed_by = $3, updated_at = CURRENT_TIMESTAMP WHERE leave_id = $4 RETURNING *`,
@@ -3546,6 +3559,45 @@ app.patch('/api/v1/leave/re-review', async (req, res) => {
     res.status(200).json({ success: true, data: updated });
   } catch (error) {
     res.status(500).json({ error: 'Re-review failed.', detail: error.message });
+  }
+});
+
+// PATCH /api/v1/leave/undo-review - the Undo on the manager's toast. Puts a decision the same
+// manager made in the last 10 minutes back to PENDING, so it can be decided again. (Undo used to
+// call /leave/review with the opposite action, which only works on PENDING requests, so it failed.)
+const UNDO_REVIEW_WINDOW_MINUTES = 10;
+app.patch('/api/v1/leave/undo-review', async (req, res) => {
+  const { leaveId, reviewerId } = req.body;
+  if (!leaveId || !reviewerId) return res.status(400).json({ error: 'leaveId and reviewerId are required.' });
+  try {
+    const before = await db.query(
+      `SELECT la.* FROM leave_applications la JOIN users u ON u.user_id = la.user_id
+       WHERE la.leave_id = $1 AND u.supervisor_id = $2`,
+      [leaveId, reviewerId]
+    );
+    if (!before.rows[0]) return res.status(403).json({ error: 'This leave request does not belong to a member of your team.' });
+    const result = await db.query(
+      `UPDATE leave_applications
+       SET workflow_status = 'PENDING', reviewer_remarks = NULL, reviewed_by = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE leave_id = $1 AND reviewed_by = $2 AND workflow_status IN ('APPROVED', 'REJECTED')
+         AND updated_at > CURRENT_TIMESTAMP - make_interval(mins => $3)
+       RETURNING *`,
+      [leaveId, reviewerId, UNDO_REVIEW_WINDOW_MINUTES]
+    );
+    const updated = result.rows[0];
+    if (!updated) {
+      return res.status(409).json({ error: 'This decision can no longer be undone. Use History to change it instead.' });
+    }
+    await auditInterceptor('leave_applications', leaveId, reviewerId, before.rows[0], updated);
+    try {
+      const notifTitle = 'Leave Decision Withdrawn';
+      const notifBody = `${updated.category} • ${formatDateDMY(updated.start_date)} → ${formatDateDMY(updated.end_date)} • Back to pending manager review.`;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updated.user_id, notifTitle, notifBody]);
+      await sendPushToUser(updated.user_id, notifTitle, notifBody);
+    } catch (_) {}
+    return res.status(200).json({ success: true, data: updated });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to undo the decision.', detail: error.message });
   }
 });
 
