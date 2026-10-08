@@ -1763,6 +1763,16 @@ app.get('/api/v1/auth/verify-session', async (req, res) => {
       [userId]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'User not found.' });
+    // A tab that sends its session token is signed out once that session is revoked (log out
+    // elsewhere, password change, Sign out on the Profile device list) or has expired. Tabs from
+    // before login sessions existed send no token and keep the old behaviour.
+    const token = bearerToken(req);
+    if (token) {
+      const session = await findAuthSession(token);
+      if (!session || session.user_id !== userId) {
+        return res.status(401).json({ error: 'Your sign-in has ended. Please log in again.', signedOut: true });
+      }
+    }
     const row = result.rows[0];
     const roles = Array.isArray(row.user_roles) && row.user_roles.length > 0
       ? row.user_roles : [row.user_role].filter(Boolean);
