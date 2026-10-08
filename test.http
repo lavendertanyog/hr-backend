@@ -30,3 +30,39 @@ Content-Type: application/json
   "completionPercentage": 45.50,
   "progressSummary": "Database persistence tables initialized and backend routing layers verified via integration tests."
 }
+
+### Log In and Remember This Device (returns session.token)
+POST http://localhost:5000/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "test.staff@nextan.com.sg",
+  "password": "<password>",
+  "trustDevice": true,
+  "portal": "staff"
+}
+
+### Resume a Remembered Sign-in (returns a new token; the old one stops working)
+POST http://localhost:5000/api/v1/auth/resume
+Content-Type: application/json
+
+{
+  "token": "<session.token>"
+}
+
+### List My Remembered Devices
+GET http://localhost:5000/api/v1/auth/sessions
+Authorization: Bearer <session.token>
+
+### Sign Out All My Other Devices
+POST http://localhost:5000/api/v1/auth/sessions/revoke
+Authorization: Bearer <session.token>
+Content-Type: application/json
+
+{
+  "allOthers": true
+}
+
+### Log Out (ends this device's session)
+POST http://localhost:5000/api/v1/auth/logout
+Authorization: Bearer <session.token>

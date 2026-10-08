@@ -1,7 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { randomUUID } = require('crypto');
+const { randomUUID, randomBytes, createHash } = require('crypto');
 const bcrypt = require('bcryptjs');
 const dotenv = require('dotenv');
 const db = require('./db');
@@ -583,6 +583,25 @@ async function ensureOperationalTables() {
   // name to explain it), optional for a named project. Lives per-allocation rather than per
   // session, since one session can hold several project blocks each with their own note.
   await db.query(`ALTER TABLE attendance_allocations ADD COLUMN IF NOT EXISTS description TEXT;`);
+
+  // Login sessions. Every login gets one; "Remember me" makes it a trusted-device session that
+  // the login page can resume without a password until it expires. Only a SHA-256 hash of the
+  // token is stored, so a copy of this table can't be used to sign in.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      session_id UUID PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      portal TEXT,
+      device_label TEXT,
+      trusted BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      expires_at TIMESTAMPTZ NOT NULL,
+      revoked_at TIMESTAMPTZ
+    );
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions (user_id);`);
 }
 
 const STANDARD_WORKDAY_HOURS = 8;
@@ -880,6 +899,7 @@ app.post('/api/v1/auth/forgot-password', async (req, res) => {
       const tempPassword = generateTempPassword();
       const hash = await bcrypt.hash(tempPassword, 10);
       await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, user.user_id]);
+      await revokeUserSessions(user.user_id);
       const portalOrigin = portalUrl.replace(/\/$/, '');
       await sendTemporaryPasswordEmail(normalized, tempPassword, portalOrigin);
       console.log('[forgot-password] sent temporary password to', normalized);
@@ -914,6 +934,7 @@ app.post('/api/v1/auth/change-password', async (req, res) => {
 
     const hash = await bcrypt.hash(newPassword, 10);
     await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, userId]);
+    await revokeUserSessions(userId, bearerToken(req));
     return res.status(200).json({ success: true, message: 'Password updated.' });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to change password.', detail: error.message });
@@ -945,6 +966,7 @@ app.post('/api/v1/auth/reset-password-token', async (req, res) => {
 
     const hash = await bcrypt.hash(newPassword, 10);
     await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, row.user_id]);
+    await revokeUserSessions(row.user_id);
     await db.query('UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP WHERE token_id = $1', [row.token_id]);
     return res.status(200).json({ success: true, message: 'Password updated. You can now log in.' });
   } catch (error) {
@@ -961,7 +983,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
   const normalized = email.trim().toLowerCase();
   try {
     const result = await db.query(
-      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status FROM users WHERE LOWER(email) = $1 LIMIT 1',
+      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status, is_admin FROM users WHERE LOWER(email) = $1 LIMIT 1',
       [normalized]
     );
     const user = result.rows[0];
@@ -990,15 +1012,192 @@ app.post('/api/v1/auth/login', async (req, res) => {
       const valid = await bcrypt.compare(password, user.password_hash);
       if (!valid) return res.status(401).json({ error: 'Incorrect password.' });
     }
-    const { password_hash, account_status, ...safeUser } = user;
-    safeUser.full_name = deriveNameFromEmail(normalized);
-    // Ensure user_roles is always an array in the response
-    safeUser.user_roles = Array.isArray(safeUser.user_roles) && safeUser.user_roles.length > 0
-      ? safeUser.user_roles
-      : [safeUser.user_role].filter(Boolean);
-    return res.status(200).json({ success: true, data: safeUser });
+    const session = await createAuthSession(user, {
+      trusted: req.body.trustDevice === true,
+      portal: req.body.portal,
+      deviceLabel: deviceLabelFrom(req),
+    });
+    return res.status(200).json({ success: true, data: sessionUserPayload(user), session });
   } catch (error) {
     return res.status(500).json({ error: 'Login failed.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// LOGIN SESSIONS ("Remember me on this device")
+// ========================================================================
+// A login returns a session token. With "Remember me" ticked the portal keeps it in
+// localStorage and the login page trades it for a fresh one via /auth/resume, so the user skips
+// the password until the session expires: 30 days, or 1 day for HR and admin accounts because of
+// what they can change. Sessions keep the expiry set at password login (resuming doesn't extend
+// it), and each resume replaces the token so a copied one stops working once the device is used.
+// Tokens are sent as `Authorization: Bearer <token>`, ready for the rest of the API to use.
+const SESSION_DAY_MS = 24 * 60 * 60 * 1000;
+const TRUSTED_SESSION_DAYS = 30;
+const PRIVILEGED_TRUSTED_SESSION_DAYS = 1;
+const UNTRUSTED_SESSION_DAYS = 1;
+const SESSION_PORTALS = ['staff', 'manager', 'account_manager', 'hr'];
+
+function hashSessionToken(token) {
+  return createHash('sha256').update(String(token)).digest('hex');
+}
+
+function isPrivilegedAccount(user) {
+  return Boolean(user.is_admin) || userHasRole(user, 'hr');
+}
+
+function sessionDaysFor(user, trusted) {
+  if (!trusted) return UNTRUSTED_SESSION_DAYS;
+  return isPrivilegedAccount(user) ? PRIVILEGED_TRUSTED_SESSION_DAYS : TRUSTED_SESSION_DAYS;
+}
+
+// "Chrome on Windows" etc., so people can recognise their devices on the Profile page.
+function deviceLabelFrom(req) {
+  const ua = String(req.headers['user-agent'] || '');
+  const browser = /Edg\//.test(ua) ? 'Edge'
+    : /OPR\//.test(ua) ? 'Opera'
+    : /Chrome\//.test(ua) ? 'Chrome'
+    : /Firefox\//.test(ua) ? 'Firefox'
+    : /Safari\//.test(ua) ? 'Safari'
+    : 'Browser';
+  const os = /Windows/.test(ua) ? 'Windows'
+    : /iPhone|iPad/.test(ua) ? 'iOS'
+    : /Android/.test(ua) ? 'Android'
+    : /Mac OS X/.test(ua) ? 'macOS'
+    : /Linux/.test(ua) ? 'Linux'
+    : 'unknown device';
+  return `${browser} on ${os}`;
+}
+
+function bearerToken(req) {
+  const match = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ''));
+  return match ? match[1].trim() : null;
+}
+
+// The user object the portals keep in sessionStorage — same shape /auth/login has always returned.
+function sessionUserPayload(user) {
+  const { password_hash, account_status, is_admin, ...safeUser } = user;
+  safeUser.full_name = deriveNameFromEmail(user.email);
+  safeUser.user_roles = Array.isArray(safeUser.user_roles) && safeUser.user_roles.length > 0
+    ? safeUser.user_roles
+    : [safeUser.user_role].filter(Boolean);
+  return safeUser;
+}
+
+async function createAuthSession(user, { trusted, portal, deviceLabel, expiresAt }) {
+  const token = randomBytes(32).toString('base64url');
+  let expires = new Date(Date.now() + sessionDaysFor(user, trusted) * SESSION_DAY_MS);
+  // A resumed session keeps its original expiry, unless the account has since become HR/admin.
+  if (expiresAt && new Date(expiresAt) < expires) expires = new Date(expiresAt);
+  await db.query(
+    `INSERT INTO auth_sessions (session_id, user_id, token_hash, portal, device_label, trusted, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [randomUUID(), user.user_id, hashSessionToken(token),
+      SESSION_PORTALS.includes(portal) ? portal : null, deviceLabel || null, Boolean(trusted), expires]
+  );
+  return { token, trusted: Boolean(trusted), expiresAt: expires.toISOString() };
+}
+
+// The live session for a token, joined with its user, or null if it's unknown, revoked or expired.
+async function findAuthSession(token) {
+  if (!token) return null;
+  const result = await db.query(
+    `SELECT s.session_id, s.portal, s.device_label, s.trusted, s.expires_at,
+            u.user_id, u.full_name, u.user_role, u.user_roles, u.email, u.account_status, u.is_admin
+     FROM auth_sessions s JOIN users u ON u.user_id = s.user_id
+     WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > CURRENT_TIMESTAMP
+     LIMIT 1`,
+    [hashSessionToken(token)]
+  );
+  return result.rows[0] || null;
+}
+
+// Signs a user out everywhere: after a password change or reset, or a change to their roles.
+// `exceptToken` keeps the session that made the change (changing your own password).
+async function revokeUserSessions(userId, exceptToken = null) {
+  await db.query(
+    `UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP
+     WHERE user_id = $1 AND revoked_at IS NULL AND token_hash IS DISTINCT FROM $2`,
+    [userId, exceptToken ? hashSessionToken(exceptToken) : null]
+  );
+}
+
+app.post('/api/v1/auth/resume', async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'token is required.' });
+  try {
+    const session = await findAuthSession(token);
+    if (!session || !session.trusted || String(session.account_status || 'active').toLowerCase() !== 'active') {
+      return res.status(401).json({ error: 'Your saved sign-in has expired. Please log in again.' });
+    }
+    await db.query('UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE session_id = $1', [session.session_id]);
+    const next = await createAuthSession(session, {
+      trusted: true,
+      portal: session.portal,
+      deviceLabel: deviceLabelFrom(req),
+      expiresAt: session.expires_at,
+    });
+    return res.status(200).json({ success: true, data: sessionUserPayload(session), session: next });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to resume sign-in.', detail: error.message });
+  }
+});
+
+// Log out: ends this device's session. Always succeeds, so logging out never gets stuck.
+app.post('/api/v1/auth/logout', async (req, res) => {
+  const token = bearerToken(req);
+  try {
+    if (token) {
+      await db.query(
+        'UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE token_hash = $1 AND revoked_at IS NULL',
+        [hashSessionToken(token)]
+      );
+    }
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to log out.', detail: error.message });
+  }
+});
+
+// The signed-in user's own remembered devices, for the Profile page.
+app.get('/api/v1/auth/sessions', async (req, res) => {
+  try {
+    const current = await findAuthSession(bearerToken(req));
+    if (!current) return res.status(401).json({ error: 'Please log in again to see your devices.' });
+    const result = await db.query(
+      `SELECT session_id, portal, device_label, created_at, last_used_at, expires_at
+       FROM auth_sessions
+       WHERE user_id = $1 AND trusted AND revoked_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+       ORDER BY created_at DESC`,
+      [current.user_id]
+    );
+    const data = result.rows.map((row) => ({ ...row, is_current: row.session_id === current.session_id }));
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load your devices.', detail: error.message });
+  }
+});
+
+// Forget one remembered device (`sessionId`), or every one except this device (`allOthers: true`).
+app.post('/api/v1/auth/sessions/revoke', async (req, res) => {
+  const { sessionId, allOthers } = req.body;
+  if (!sessionId && allOthers !== true) return res.status(400).json({ error: 'sessionId or allOthers is required.' });
+  if (sessionId && !UUID_RE.test(sessionId)) return res.status(400).json({ error: 'sessionId is not valid.' });
+  try {
+    const current = await findAuthSession(bearerToken(req));
+    if (!current) return res.status(401).json({ error: 'Please log in again to manage your devices.' });
+    const result = allOthers === true
+      ? await db.query(
+        `UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1 AND session_id <> $2 AND revoked_at IS NULL`,
+        [current.user_id, current.session_id])
+      : await db.query(
+        `UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1 AND session_id = $2 AND revoked_at IS NULL`,
+        [current.user_id, sessionId]);
+    return res.status(200).json({ success: true, data: { revoked: result.rowCount } });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to sign out the device.', detail: error.message });
   }
 });
 
@@ -1089,6 +1288,7 @@ app.patch('/api/v1/admin/approve-reset', async (req, res) => {
 
     if (action === 'approve') {
       await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [row.new_password_hash, row.user_id]);
+      await revokeUserSessions(row.user_id);
     }
     await db.query(
       `UPDATE password_reset_requests SET status = $1, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = $2 WHERE request_id = $3`,
@@ -4194,6 +4394,7 @@ app.patch('/api/v1/hr/update-user-roles', async (req, res) => {
       'UPDATE users SET user_role = $1, user_roles = $2 WHERE user_id = $3',
       [resolvedPrimary, cleaned, userId]
     );
+    await revokeUserSessions(userId);
     const updated = await db.query(
       'SELECT user_id, full_name, email, user_role, user_roles, account_status FROM users WHERE user_id = $1 LIMIT 1',
       [userId]
