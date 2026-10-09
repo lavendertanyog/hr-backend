@@ -89,3 +89,12 @@ Authorization: Bearer <session.token>
 ### Mark a Notification Read (owner only)
 PATCH http://localhost:5000/api/v1/notifications/<notification_id>/read
 Authorization: Bearer <session.token>
+
+### Undo a Budget Decision (manager, within 10 minutes; back to PENDING)
+PATCH http://localhost:5000/api/v1/projects/budget-request/undo-review
+Content-Type: application/json
+
+{
+  "requestId": "<request_id>",
+  "reviewerId": "<manager user_id>"
+}

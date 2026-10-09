@@ -368,6 +368,7 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_status TEXT NOT NULL DEFAULT 'PENDING';`);
   await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_reviewer_id UUID REFERENCES users(user_id);`);
   await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_reviewed_at TIMESTAMPTZ;`);
+  await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_remarks TEXT;`);
 
   // Projects: support multiple managers
   await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS manager_ids TEXT[] DEFAULT '{}';`);
@@ -1385,6 +1386,20 @@ app.get('/api/v1/hr/pending-registrations', async (req, res) => {
 });
 
 // HR Admin only: approve or reject any pending registration (Manager, Account Manager, or Staff)
+// Tells someone their account is now active: a new sign-up approved, or a rejected or revoked
+// account reactivated. Sent by both the HR and the Account Manager registration routes.
+async function sendAccountActiveEmail(toEmail) {
+  const html = brandedEmailHtml({
+    linkOrigin: STAFF_PORTAL_URL,
+    heading: 'Your Nextan Portal account is active',
+    bodyHtml: 'Your account has been approved. You can now log in with the email and password you signed up with.',
+    buttonText: 'Log in',
+    buttonUrl: STAFF_PORTAL_URL,
+    footerText: "You're receiving this because an account was requested with this email address.",
+  });
+  await sendEmail(toEmail, 'Your Nextan Portal account is active', html, 'account-active');
+}
+
 app.patch('/api/v1/hr/approve-registration', async (req, res) => {
   const { requesterId, userId, action } = req.body;
   if (!await requireAdmin(requesterId, res)) return;
@@ -1392,10 +1407,14 @@ app.patch('/api/v1/hr/approve-registration', async (req, res) => {
     return res.status(400).json({ error: 'userId and action (approve|reject) are required.' });
   }
   try {
-    const target = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    const target = await db.query('SELECT user_role, user_roles, email, account_status FROM users WHERE user_id = $1 LIMIT 1', [userId]);
     if (!target.rows[0]) return res.status(404).json({ error: 'User not found.' });
     const newStatus = action === 'approve' ? 'active' : 'rejected';
     await db.query('UPDATE users SET account_status = $1 WHERE user_id = $2', [newStatus, userId]);
+    if (target.rows[0].account_status !== 'active' && newStatus === 'active' && target.rows[0].email) {
+      sendAccountActiveEmail(target.rows[0].email)
+        .catch((e) => console.error('[email] Account active email failed:', e.message));
+    }
     return res.status(200).json({ success: true, message: `Account ${newStatus}.` });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update registration status.', detail: err.message });
@@ -1429,7 +1448,7 @@ app.patch('/api/v1/account-manager/approve-staff-registration', async (req, res)
     return res.status(400).json({ error: 'userId and action (approve|reject) are required.' });
   }
   try {
-    const target = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    const target = await db.query('SELECT user_role, user_roles, email, account_status FROM users WHERE user_id = $1 LIMIT 1', [userId]);
     if (!target.rows[0]) return res.status(404).json({ error: 'User not found.' });
     const targetRow = target.rows[0];
     if (!userHasRole(targetRow, 'staff')) {
@@ -1437,6 +1456,10 @@ app.patch('/api/v1/account-manager/approve-staff-registration', async (req, res)
     }
     const newStatus = action === 'approve' ? 'active' : 'rejected';
     await db.query('UPDATE users SET account_status = $1 WHERE user_id = $2', [newStatus, userId]);
+    if (targetRow.account_status !== 'active' && newStatus === 'active' && targetRow.email) {
+      sendAccountActiveEmail(targetRow.email)
+        .catch((e) => console.error('[email] Account active email failed:', e.message));
+    }
     return res.status(200).json({ success: true, message: `Staff account ${newStatus}.` });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update staff registration status.', detail: err.message });
@@ -1630,8 +1653,9 @@ app.get('/api/v1/allocations/history-account-manager', async (req, res) => {
 
 app.patch('/api/v1/allocations/:allocationId/account-manager-review', async (req, res) => {
   const { allocationId } = req.params;
-  const { reviewerId, action } = req.body;
+  const { reviewerId, action, reviewerRemarks } = req.body;
   const normalizedAction = String(action || '').toUpperCase();
+  const remarks = String(reviewerRemarks || '').trim() || null;
 
   if (!reviewerId || !['APPROVED', 'REJECTED'].includes(normalizedAction)) {
     return res.status(400).json({ error: 'reviewerId and valid action (APPROVED/REJECTED) are required.' });
@@ -1647,17 +1671,24 @@ app.patch('/api/v1/allocations/:allocationId/account-manager-review', async (req
       return res.status(403).json({ error: 'Only account managers can review allocation submissions.' });
     }
 
+    // Only a PENDING allocation can be reviewed; an approved or rejected one used to be
+    // flippable here with no record of the change.
     const updated = await db.query(
       `UPDATE hour_allocations
        SET account_manager_status = $1,
            account_manager_reviewer_id = $2,
-           account_manager_reviewed_at = CURRENT_TIMESTAMP
-       WHERE allocation_id = $3
+           account_manager_reviewed_at = CURRENT_TIMESTAMP,
+           account_manager_remarks = $4
+       WHERE allocation_id = $3 AND account_manager_status = 'PENDING'
        RETURNING *`,
-      [normalizedAction, reviewerId, allocationId]
+      [normalizedAction, reviewerId, allocationId, remarks]
     );
 
     if (!updated.rows[0]) {
+      const exists = await db.query('SELECT 1 FROM hour_allocations WHERE allocation_id = $1', [allocationId]);
+      if (exists.rows.length > 0) {
+        return res.status(409).json({ error: 'This allocation has already been reviewed.' });
+      }
       return res.status(404).json({ error: 'Allocation request not found.' });
     }
 
@@ -1667,7 +1698,7 @@ app.patch('/api/v1/allocations/:allocationId/account-manager-review', async (req
 
     await db.query(
       'INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
-      [row.user_id, `Allocation ${normalizedAction}`, `${reviewerName} ${statusWord} your allocation for ${row.project_code} (${row.hours_per_week} hrs/week).`]
+      [row.user_id, `Allocation ${normalizedAction}`, `${reviewerName} ${statusWord} your allocation for ${row.project_code} (${row.hours_per_week} hrs/week).${remarks ? ` Remark: ${remarks}` : ''}`]
     );
 
     if (row.allocated_by) {
@@ -3406,7 +3437,7 @@ app.post('/api/v1/projects/budget-request', async (req, res) => {
 // ========================================================================
 app.patch('/api/v1/projects/budget-request/:requestId', async (req, res, next) => {
   const { requestId } = req.params;
-  if (requestId === 'review' || requestId === 'am-review') return next();
+  if (requestId === 'review' || requestId === 'am-review' || requestId === 'undo-review') return next();
   const { userId, requestedHours, justification } = req.body;
   const requestedNumber = parseFloat(requestedHours);
 
@@ -3438,7 +3469,7 @@ app.patch('/api/v1/projects/budget-request/:requestId', async (req, res, next) =
 
 app.delete('/api/v1/projects/budget-request/:requestId', async (req, res, next) => {
   const { requestId } = req.params;
-  if (requestId === 'review' || requestId === 'am-review') return next();
+  if (requestId === 'review' || requestId === 'am-review' || requestId === 'undo-review') return next();
   const { userId } = req.body;
 
   try {
@@ -4263,6 +4294,11 @@ app.post('/api/v1/projects/create', async (req, res) => {
     const amIds = Array.isArray(accountManagerIds) ? accountManagerIds : [];
     const mgrIds = Array.isArray(managerIds) ? managerIds : [];
 
+    const existing = await db.query('SELECT 1 FROM projects WHERE project_code = $1', [code]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: `Project code ${code} already exists.` });
+    }
+
     const insertResult = await db.query(
       `INSERT INTO projects (project_code, project_name, budget_hours, total_tracked_hours, start_date, end_date, created_at)
        VALUES ($1, $2, $3, 0.00, $4, $5, CURRENT_TIMESTAMP)
@@ -4332,8 +4368,12 @@ app.delete('/api/v1/projects/:projectCode', async (req, res) => {
     if (editorCheck.rows.length === 0 || !userIsManagerial(editorCheck.rows[0])) {
       return res.status(403).json({ error: 'Access Denied.' });
     }
-    await db.query('DELETE FROM projects WHERE project_code = $1', [projectCode.toUpperCase().trim()]);
-    res.status(200).json({ success: true, message: `Project ${projectCode} deleted.` });
+    const code = projectCode.toUpperCase().trim();
+    const before = await db.query('SELECT * FROM projects WHERE project_code = $1', [code]);
+    if (before.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
+    await db.query('DELETE FROM projects WHERE project_code = $1', [code]);
+    await auditInterceptor('projects', code, editorId, before.rows[0], null);
+    res.status(200).json({ success: true, message: `Project ${code} deleted.` });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete project.', detail: error.message });
   }
@@ -4512,6 +4552,61 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
   }
 });
 
+// PATCH /api/v1/projects/budget-request/undo-review - the Undo on the manager's toast. Puts a
+// decision the same manager made in the last 10 minutes back to PENDING. (Undo used to call
+// /review with the opposite action, which only works on PENDING requests, so it failed.) A
+// MANAGER_APPROVED request can't be undone once the Account Manager has decided it, because its
+// status has moved on. A manager approval that was final (project with no Account Manager) also
+// takes the added hours back off the project budget and the requester's allocation.
+app.patch('/api/v1/projects/budget-request/undo-review', async (req, res) => {
+  const { requestId, reviewerId } = req.body;
+  if (!requestId || !reviewerId) return res.status(400).json({ error: 'requestId and reviewerId are required.' });
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    const before = await client.query(
+      `SELECT * FROM budget_requests
+       WHERE request_id = $1 AND reviewed_by = $2 AND status IN ('MANAGER_APPROVED', 'APPROVED', 'REJECTED')
+         AND reviewed_at > CURRENT_TIMESTAMP - make_interval(mins => $3)
+       FOR UPDATE`,
+      [requestId, reviewerId, UNDO_REVIEW_WINDOW_MINUTES]
+    );
+    const row = before.rows[0];
+    if (!row) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'This decision can no longer be undone.' });
+    }
+    if (row.status === 'APPROVED') {
+      await client.query('UPDATE projects SET budget_hours = budget_hours - $1 WHERE project_code = $2', [row.requested_hours, row.project_code]);
+      await client.query(
+        `UPDATE hour_allocations SET hours_per_week = hours_per_week - $1
+         WHERE user_id = $2 AND project_code = $3 AND account_manager_status = 'APPROVED'`,
+        [row.requested_hours, row.user_id, row.project_code]
+      );
+    }
+    const result = await client.query(
+      `UPDATE budget_requests SET status = 'PENDING', reviewed_by = NULL, reviewed_at = NULL, reviewer_remarks = NULL
+       WHERE request_id = $1 RETURNING *`,
+      [requestId]
+    );
+    await client.query('COMMIT');
+    const updated = result.rows[0];
+    await auditInterceptor('budget_requests', requestId, reviewerId, row, updated);
+    try {
+      const notifTitle = 'Budget Decision Withdrawn';
+      const notifBody = `Your request for additional hours of ${updated.requested_hours}hrs for project ${updated.project_code} is back to pending manager review.`;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updated.user_id, notifTitle, notifBody]);
+      await sendPushToUser(updated.user_id, notifTitle, notifBody);
+    } catch (_) {}
+    return res.status(200).json({ success: true, data: updated });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    return res.status(500).json({ error: 'Failed to undo the decision.', detail: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // GET budget requests pending Account Manager final approval — normally status = MANAGER_APPROVED
 // (the manager already reviewed it), but also includes a still-PENDING request on a project that
 // has no manager to review it, mirroring the "only one approver exists" logic in am-review.
@@ -4567,10 +4662,11 @@ app.patch('/api/v1/hr/update-user-roles', async (req, res) => {
   const primaryRole = PRIORITY.find((r) => cleaned.includes(r)) || cleaned[0];
   try {
     const resolvedPrimary = await getDefaultUserRole(primaryRole);
-    await db.query(
+    const changed = await db.query(
       'UPDATE users SET user_role = $1, user_roles = $2 WHERE user_id = $3',
       [resolvedPrimary, cleaned, userId]
     );
+    if (changed.rowCount === 0) return res.status(404).json({ error: 'User not found.' });
     await revokeUserSessions(userId);
     const updated = await db.query(
       'SELECT user_id, full_name, email, user_role, user_roles, account_status FROM users WHERE user_id = $1 LIMIT 1',
@@ -4787,9 +4883,11 @@ app.post('/api/v1/hr/public-holidays/bulk', async (req, res) => {
     return res.status(400).json({ error: 'holidays must be a non-empty array.' });
   }
   try {
+    // Rows without a date or a name are skipped and counted, so the portal can say how many.
     const saved = [];
+    let skipped = 0;
     for (const h of holidays) {
-      if (!h.holiday_date || !h.name || !String(h.name).trim()) continue;
+      if (!h.holiday_date || !h.name || !String(h.name).trim()) { skipped++; continue; }
       const result = await db.query(
         `INSERT INTO public_holidays (holiday_date, name, updated_by, updated_at)
          VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
@@ -4799,7 +4897,7 @@ app.post('/api/v1/hr/public-holidays/bulk', async (req, res) => {
       );
       saved.push(result.rows[0]);
     }
-    return res.status(200).json({ success: true, data: saved });
+    return res.status(200).json({ success: true, data: saved, skipped });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to save public holidays.', detail: error.message });
   }
