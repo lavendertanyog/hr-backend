@@ -75,3 +75,9 @@ Content-Type: application/json
   "leaveId": "<leave_id>",
   "reviewerId": "<manager user_id>"
 }
+
+### Pending Budget Requests for one manager (only projects they manage; HR sees all)
+GET http://localhost:5000/api/v1/projects/budget-requests?reviewerId=<manager user_id>
+
+### Budget Requests awaiting one Account Manager (only their projects; HR sees all)
+GET http://localhost:5000/api/v1/projects/budget-requests/pending-am?reviewerId=<account manager user_id>

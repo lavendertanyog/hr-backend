@@ -206,6 +206,30 @@ function userCanManageProjectLifecycle(userRow) {
   return userHasRole(userRow, 'hr') || userHasRole(userRow, 'account_manager');
 }
 
+// Budget request reviewers: a manager may only review requests on projects they manage
+// (projects.manager_ids), and an Account Manager only on projects they are the Account
+// Manager of. HR / is_admin users skip the project check.
+function userIsHrOrAdmin(userRow) {
+  return Boolean(userRow?.is_admin) || userHasRole(userRow, 'hr');
+}
+
+async function isProjectManagerOf(userId, projectCode) {
+  const r = await db.query(
+    'SELECT 1 FROM projects WHERE project_code = $1 AND $2::uuid = ANY(manager_ids::uuid[])',
+    [projectCode, userId]
+  );
+  return r.rows.length > 0;
+}
+
+async function isProjectAccountManagerOf(userId, projectCode) {
+  const r = await db.query(
+    `SELECT 1 FROM projects
+     WHERE project_code = $1 AND (account_manager_id = $2::uuid OR $2::uuid = ANY(account_manager_ids::uuid[]))`,
+    [projectCode, userId]
+  );
+  return r.rows.length > 0;
+}
+
 // Returns the first of the given project codes that is DEPLOYED (or legacy INACTIVE), or null.
 // Deployed projects keep their assignments, so this — not the assignment check — is what stops
 // time, progress and budget requests being logged against them.
@@ -1502,6 +1526,8 @@ app.post('/api/v1/allocations', async (req, res) => {
     }
     const userRow = await db.query('SELECT user_id, full_name FROM users WHERE user_id = $1', [userId]);
     if (!userRow.rows[0]) return res.status(404).json({ error: 'Target user not found.' });
+    const projectRow = await db.query('SELECT 1 FROM projects WHERE project_code = $1', [projectCode]);
+    if (projectRow.rows.length === 0) return res.status(404).json({ error: 'Project code not found.' });
 
     const result = await db.query(
       `INSERT INTO hour_allocations (
@@ -4278,12 +4304,21 @@ app.delete('/api/v1/projects/:projectCode', async (req, res) => {
   }
 });
 
-// FETCH ALL PENDING BUDGET REQUESTS
+// FETCH ALL PENDING BUDGET REQUESTS. With ?reviewerId=, only the projects that manager manages
+// (HR / admin still see all), so the Manager portal lists only requests it is allowed to review.
 app.get('/api/v1/projects/budget-requests', async (req, res) => {
+  const { reviewerId } = req.query;
   try {
     const hasBudgetRequestsTable = await tableExists('public.budget_requests');
     if (!hasBudgetRequestsTable) {
       return res.status(200).json({ success: true, data: [] });
+    }
+
+    let scopeToManager = false;
+    if (reviewerId) {
+      const reviewer = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1', [reviewerId]);
+      if (reviewer.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
+      scopeToManager = !userIsHrOrAdmin(reviewer.rows[0]);
     }
 
     const result = await db.query(
@@ -4292,7 +4327,9 @@ app.get('/api/v1/projects/budget-requests', async (req, res) => {
        JOIN projects p ON br.project_code = p.project_code
        LEFT JOIN users u ON u.user_id = br.user_id
        WHERE br.status = 'PENDING'
-       ORDER BY br.created_at ASC`
+         ${scopeToManager ? 'AND $1::uuid = ANY(p.manager_ids::uuid[])' : ''}
+       ORDER BY br.created_at ASC`,
+      scopeToManager ? [reviewerId] : []
     );
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
@@ -4351,15 +4388,29 @@ app.get('/api/v1/projects/budget-requests/history', async (req, res) => {
 app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
   const { requestId, reviewerId, action } = req.body;
 
-  const validActions = ['MANAGER_APPROVED', 'REJECTED', 'REFER_TO_AM'];
+  // REFER_TO_AM used to be accepted here, but nothing listed or acted on a referred request,
+  // so it went nowhere. A manager who approves already hands the request to the Account Manager.
+  const validActions = ['MANAGER_APPROVED', 'REJECTED'];
   if (!validActions.includes(action?.toUpperCase())) {
     return res.status(400).json({ error: "Invalid action. Must be MANAGER_APPROVED or REJECTED." });
+  }
+  if (!requestId || !reviewerId) {
+    return res.status(400).json({ error: 'requestId and reviewerId are required.' });
   }
 
   try {
     const hasBudgetRequestsTable = await tableExists('public.budget_requests');
     if (!hasBudgetRequestsTable) {
       return res.status(503).json({ error: 'budget_requests table is not initialized in this environment.' });
+    }
+
+    const reviewer = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1', [reviewerId]);
+    if (reviewer.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
+    const requestRow = await db.query('SELECT project_code FROM budget_requests WHERE request_id = $1', [requestId]);
+    if (requestRow.rows.length === 0) return res.status(404).json({ error: "Request not found or already processed." });
+    const requestProject = requestRow.rows[0].project_code;
+    if (!userIsHrOrAdmin(reviewer.rows[0]) && !(await isProjectManagerOf(reviewerId, requestProject))) {
+      return res.status(403).json({ error: `Only a manager of project ${requestProject} can review this budget request.` });
     }
 
     // A project without an Account Manager has no one to hand the second approval step to —
@@ -4369,16 +4420,13 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
     let finalAction = action.toUpperCase();
     let projectHasAM = true;
     if (finalAction === 'MANAGER_APPROVED') {
-      const pending = await db.query('SELECT project_code FROM budget_requests WHERE request_id = $1', [requestId]);
-      if (pending.rows.length > 0) {
-        const proj = await db.query(
-          'SELECT account_manager_id, account_manager_ids FROM projects WHERE project_code = $1',
-          [pending.rows[0].project_code]
-        );
-        const amIds = proj.rows[0]?.account_manager_ids || [];
-        projectHasAM = Boolean(proj.rows[0]?.account_manager_id) || amIds.length > 0;
-        if (!projectHasAM) finalAction = 'APPROVED';
-      }
+      const proj = await db.query(
+        'SELECT account_manager_id, account_manager_ids FROM projects WHERE project_code = $1',
+        [requestProject]
+      );
+      const amIds = proj.rows[0]?.account_manager_ids || [];
+      projectHasAM = Boolean(proj.rows[0]?.account_manager_id) || amIds.length > 0;
+      if (!projectHasAM) finalAction = 'APPROVED';
     }
 
     const beforeBudgetRequest = await db.query('SELECT * FROM budget_requests WHERE request_id = $1', [requestId]);
@@ -4432,20 +4480,34 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
 // GET budget requests pending Account Manager final approval — normally status = MANAGER_APPROVED
 // (the manager already reviewed it), but also includes a still-PENDING request on a project that
 // has no manager to review it, mirroring the "only one approver exists" logic in am-review.
+// REFER_TO_AM rows (an action the manager review no longer accepts) are listed with
+// MANAGER_APPROVED so any left from before can still be finished. With ?reviewerId=, only that
+// Account Manager's projects (HR / admin still see all).
 app.get('/api/v1/projects/budget-requests/pending-am', async (req, res) => {
+  const { reviewerId } = req.query;
   try {
     const hasBudgetRequestsTable = await tableExists('public.budget_requests');
     if (!hasBudgetRequestsTable) {
       return res.status(200).json({ success: true, data: [] });
     }
+
+    let scopeToAm = false;
+    if (reviewerId) {
+      const reviewer = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1', [reviewerId]);
+      if (reviewer.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
+      scopeToAm = !userIsHrOrAdmin(reviewer.rows[0]);
+    }
+
     const result = await db.query(
       `SELECT br.*, p.project_name, u.full_name AS requester_name, u.email AS requester_email
        FROM budget_requests br
        JOIN projects p ON br.project_code = p.project_code
        LEFT JOIN users u ON u.user_id = br.user_id
-       WHERE br.status = 'MANAGER_APPROVED'
-          OR (br.status = 'PENDING' AND (p.manager_ids IS NULL OR array_length(p.manager_ids, 1) IS NULL))
-       ORDER BY br.created_at ASC`
+       WHERE (br.status IN ('MANAGER_APPROVED', 'REFER_TO_AM')
+          OR (br.status = 'PENDING' AND (p.manager_ids IS NULL OR array_length(p.manager_ids, 1) IS NULL)))
+         ${scopeToAm ? 'AND (p.account_manager_id = $1::uuid OR $1::uuid = ANY(p.account_manager_ids::uuid[]))' : ''}
+       ORDER BY br.created_at ASC`,
+      scopeToAm ? [reviewerId] : []
     );
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
@@ -5001,21 +5063,26 @@ app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
     return res.status(400).json({ error: "Invalid action. Must be APPROVED or REJECTED." });
   }
   try {
-    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
+    const reviewerProfile = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1', [reviewerId]);
     if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
     if (!userHasRole(reviewerProfile.rows[0], 'account_manager')) return res.status(403).json({ error: 'Only Account Managers can perform final budget approval.' });
 
     const beforeBudgetRequest = await db.query('SELECT * FROM budget_requests WHERE request_id = $1', [requestId]);
     if (beforeBudgetRequest.rows.length === 0) return res.status(404).json({ error: 'Budget request not found.' });
+    const requestProject = beforeBudgetRequest.rows[0].project_code;
 
-    const proj = await db.query('SELECT manager_ids FROM projects WHERE project_code = $1', [beforeBudgetRequest.rows[0].project_code]);
+    if (!userIsHrOrAdmin(reviewerProfile.rows[0]) && !(await isProjectAccountManagerOf(reviewerId, requestProject))) {
+      return res.status(403).json({ error: `Only the Account Manager of project ${requestProject} can give final approval.` });
+    }
+
+    const proj = await db.query('SELECT manager_ids FROM projects WHERE project_code = $1', [requestProject]);
     const projectHasManager = (proj.rows[0]?.manager_ids || []).length > 0;
-    const acceptedSourceStatus = projectHasManager ? 'MANAGER_APPROVED' : 'PENDING';
+    const acceptedSourceStatuses = projectHasManager ? ['MANAGER_APPROVED', 'REFER_TO_AM'] : ['PENDING'];
 
     const result = await db.query(
       `UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP
-       WHERE request_id = $3 AND status = $4 RETURNING *`,
-      [action.toUpperCase(), reviewerId, requestId, acceptedSourceStatus]
+       WHERE request_id = $3 AND status = ANY($4) RETURNING *`,
+      [action.toUpperCase(), reviewerId, requestId, acceptedSourceStatuses]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Budget request not found or not awaiting AM approval.' });
 
