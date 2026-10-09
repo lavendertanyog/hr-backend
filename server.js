@@ -1136,6 +1136,17 @@ async function findAuthSession(token) {
   return result.rows[0] || null;
 }
 
+// For routes that need to know who is calling: the live session from the Bearer token, or null
+// after responding 401. Use this rather than trusting a userId sent in the request.
+async function requireSession(req, res) {
+  const session = await findAuthSession(bearerToken(req));
+  if (!session || String(session.account_status || 'active').toLowerCase() !== 'active') {
+    res.status(401).json({ error: 'Your sign-in has ended. Please log in again.', signedOut: true });
+    return null;
+  }
+  return session;
+}
+
 // Signs a user out everywhere: after a password change or reset, or a change to their roles.
 // `exceptToken` keeps the session that made the change (changing your own password).
 async function revokeUserSessions(userId, exceptToken = null) {
@@ -1472,8 +1483,15 @@ app.get('/api/v1/admin/reset-history', async (req, res) => {
 // ========================================================================
 // ROUTE: NOTIFICATIONS
 // ========================================================================
+// Notifications are private: reading or marking them read needs the owner's session token.
+// Creating one by API is HR/admin only (the server inserts its own notifications directly).
 app.get('/api/v1/notifications/:userId', async (req, res) => {
   try {
+    const session = await requireSession(req, res);
+    if (!session) return;
+    if (session.user_id !== req.params.userId) {
+      return res.status(403).json({ error: 'You can only see your own notifications.' });
+    }
     const result = await db.query(
       'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
       [req.params.userId]
@@ -1488,6 +1506,11 @@ app.post('/api/v1/notifications', async (req, res) => {
   const { userId, title, body } = req.body;
   if (!userId || !title || !body) return res.status(400).json({ error: 'userId, title and body are required.' });
   try {
+    const session = await requireSession(req, res);
+    if (!session) return;
+    if (!isPrivilegedAccount(session)) {
+      return res.status(403).json({ error: 'Only HR can send notifications.' });
+    }
     const result = await db.query(
       'INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3) RETURNING *',
       [userId, title, body]
@@ -1499,8 +1522,15 @@ app.post('/api/v1/notifications', async (req, res) => {
 });
 
 app.patch('/api/v1/notifications/:notifId/read', async (req, res) => {
+  if (!UUID_RE.test(req.params.notifId)) return res.status(400).json({ error: 'Notification id is not valid.' });
   try {
-    await db.query('UPDATE notifications SET is_read = TRUE WHERE notification_id = $1', [req.params.notifId]);
+    const session = await requireSession(req, res);
+    if (!session) return;
+    const result = await db.query(
+      'UPDATE notifications SET is_read = TRUE WHERE notification_id = $1 AND user_id = $2',
+      [req.params.notifId, session.user_id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Notification not found.' });
     return res.status(200).json({ success: true });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to mark notification read.', detail: error.message });
@@ -1853,6 +1883,11 @@ app.get('/api/v1/users/:userId/inbox', async (req, res) => {
   const { userId } = req.params;
 
   try {
+    const session = await requireSession(req, res);
+    if (!session) return;
+    if (session.user_id !== userId) {
+      return res.status(403).json({ error: 'You can only see your own inbox.' });
+    }
     const hasBudgetRequestsTable = await tableExists('public.budget_requests');
     const budgetUnion = hasBudgetRequestsTable
       ? `

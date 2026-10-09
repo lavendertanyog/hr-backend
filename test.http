@@ -81,3 +81,11 @@ GET http://localhost:5000/api/v1/projects/budget-requests?reviewerId=<manager us
 
 ### Budget Requests awaiting one Account Manager (only their projects; HR sees all)
 GET http://localhost:5000/api/v1/projects/budget-requests/pending-am?reviewerId=<account manager user_id>
+
+### My Inbox Feed (owner only: needs this user's session token)
+GET http://localhost:5000/api/v1/users/<user_id>/inbox
+Authorization: Bearer <session.token>
+
+### Mark a Notification Read (owner only)
+PATCH http://localhost:5000/api/v1/notifications/<notification_id>/read
+Authorization: Bearer <session.token>
