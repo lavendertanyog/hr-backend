@@ -18,6 +18,7 @@ const expo = new Expo();
 // so any flow that sends email stays fully testable locally without sending real mail. Sends
 // from the verified mail.nextantech.com domain identity now that its DKIM records are in place.
 const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
+const { GoogleGenAI, MediaResolution, ThinkingLevel } = require('@google/genai');
 const sesClient = process.env.AWS_ACCESS_KEY_ID
   ? new SESClient({ region: process.env.AWS_REGION || 'ap-southeast-1' })
   : null;
@@ -482,6 +483,63 @@ async function ensureOperationalTables() {
   // Justification is optional in the UI ("Justification (optional)") but was created NOT NULL —
   // submitting without one previously crashed with a 500. DROP NOT NULL is a no-op if already dropped.
   await db.query(`ALTER TABLE budget_requests ALTER COLUMN justification DROP NOT NULL;`);
+
+  // Expense claims from a receipt photo. Status: PENDING (submitted) -> MANAGER_APPROVED
+  // (claimant's supervisor) -> APPROVED (HR) -> PAID; REJECTED at either review. The receipt is
+  // kept as a base64 data URL, like leave MCs. claim_scans logs every Gemini receipt scan and its
+  // cost, which is what the monthly spend cap and the per-person daily limit are counted from.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS claims (
+      claim_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      purchase_date DATE NOT NULL,
+      merchant TEXT NOT NULL,
+      category TEXT NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'SGD',
+      total_amount NUMERIC(10,2) NOT NULL,
+      project_code TEXT REFERENCES projects(project_code) ON DELETE SET NULL,
+      notes TEXT,
+      receipt_image TEXT NOT NULL,
+      ai_extraction JSONB,
+      manager_reviewed_by UUID REFERENCES users(user_id),
+      manager_reviewed_at TIMESTAMPTZ,
+      manager_remarks TEXT,
+      hr_reviewed_by UUID REFERENCES users(user_id),
+      hr_reviewed_at TIMESTAMPTZ,
+      hr_remarks TEXT,
+      paid_at DATE,
+      paid_reference TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ
+    );
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS claim_items (
+      item_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      claim_id UUID NOT NULL REFERENCES claims(claim_id) ON DELETE CASCADE,
+      description TEXT NOT NULL,
+      quantity NUMERIC(10,2),
+      amount NUMERIC(10,2),
+      sort_order INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS claim_scans (
+      scan_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
+      outcome TEXT NOT NULL,
+      extraction JSONB
+    );
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS claims_user_idx ON claims (user_id, created_at DESC);`);
+  await db.query(`CREATE INDEX IF NOT EXISTS claims_status_idx ON claims (status);`);
+  await db.query(`CREATE INDEX IF NOT EXISTS claim_items_claim_idx ON claim_items (claim_id);`);
+  await db.query(`CREATE INDEX IF NOT EXISTS claim_scans_created_idx ON claim_scans (created_at);`);
 
   // Generic audit trail — every edit to user-facing data (attendance times, allocation
   // project/hours, progress %, leave requests, budget/project approvals, ...) is recorded here
@@ -4642,6 +4700,684 @@ app.get('/api/v1/projects/budget-requests/pending-am', async (req, res) => {
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch pending AM budget requests.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// ROUTE: EXPENSE CLAIMS (receipt scan with Gemini; manager -> HR approval -> paid)
+// ========================================================================
+// Every claim route works from the signed-in session (requireSession), never a userId in the
+// request. Receipt scanning is capped twice: Google AI Studio's project spend cap ($20/month, set
+// in AI Studio) and our own CLAIM_SCAN_MONTHLY_CAP_USD below it, counted from claim_scans. When a
+// scan can't run (not set up, a cap reached, or Gemini failing) the portal falls back to manual
+// entry, so claims never depend on the scan.
+const CLAIM_CATEGORIES = [
+  { code: 'MEALS', label: 'Meals & entertainment' },
+  { code: 'LOCAL_TRANSPORT', label: 'Local transport' },
+  { code: 'TRAVEL', label: 'Travel (flights, hotel)' },
+  { code: 'PARKING_TOLLS', label: 'Parking & tolls' },
+  { code: 'OFFICE_SUPPLIES', label: 'Office supplies' },
+  { code: 'PHONE_INTERNET', label: 'Phone & internet' },
+  { code: 'MEDICAL', label: 'Medical' },
+  { code: 'TRAINING', label: 'Training' },
+  { code: 'OTHERS', label: 'Others' },
+];
+const CLAIM_CATEGORY_CODES = CLAIM_CATEGORIES.map((c) => c.code);
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite';
+const GEMINI_PRICE_IN_PER_M = Number(process.env.GEMINI_PRICE_IN_PER_M || 0.25);
+const GEMINI_PRICE_OUT_PER_M = Number(process.env.GEMINI_PRICE_OUT_PER_M || 1.5);
+const CLAIM_SCAN_MONTHLY_CAP_USD = Number(process.env.CLAIM_SCAN_MONTHLY_CAP_USD || 19);
+const CLAIM_SCAN_DAILY_LIMIT = Number(process.env.CLAIM_SCAN_DAILY_LIMIT_PER_USER || 20);
+const CLAIM_SCAN_TIMEOUT_MS = 45_000;
+const RECEIPT_MAX_CHARS = 4_000_000; // a base64 image of about 3 MB; the portal sends ~300 KB
+const RECEIPT_DATA_URL_RE = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/;
+const SGT_MONTH_START_SQL = `(date_trunc('month', now() AT TIME ZONE 'Asia/Singapore') AT TIME ZONE 'Asia/Singapore')`;
+const SGT_DAY_START_SQL = `(date_trunc('day', now() AT TIME ZONE 'Asia/Singapore') AT TIME ZONE 'Asia/Singapore')`;
+
+let geminiClient = null;
+function getGeminiClient() {
+  if (!process.env.GEMINI_API_KEY) return null;
+  if (!geminiClient) geminiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+  return geminiClient;
+}
+
+function parseReceiptImage(value) {
+  const match = RECEIPT_DATA_URL_RE.exec(String(value || ''));
+  if (!match) return { error: 'Please attach a photo of the receipt (JPEG, PNG or WebP).' };
+  if (value.length > RECEIPT_MAX_CHARS) return { error: 'The receipt photo is too large. Please use a smaller photo.' };
+  return { mimeType: match[1], data: match[2] };
+}
+
+function sgtTodayYmd() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Singapore' });
+}
+
+function isRealYmd(d) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''))
+    && new Date(`${d}T00:00:00Z`).toISOString().slice(0, 10) === d;
+}
+
+function roundMoney(n) {
+  return Math.round(Number(n) * 100) / 100;
+}
+
+// Cleans what the staff member submits (or edits). Returns { error } or { value }.
+function validateClaimInput(body) {
+  const purchaseDate = String(body.purchaseDate || '');
+  if (!isRealYmd(purchaseDate)) return { error: 'Please enter the date of purchase.' };
+  if (purchaseDate > sgtTodayYmd()) return { error: 'The date of purchase cannot be in the future.' };
+  const merchant = String(body.merchant || '').trim();
+  if (!merchant) return { error: 'Please enter the shop, restaurant or company name.' };
+  if (merchant.length > 200) return { error: 'The merchant name is too long (200 characters at most).' };
+  const category = String(body.category || '').toUpperCase();
+  if (!CLAIM_CATEGORY_CODES.includes(category)) return { error: 'Please choose a category.' };
+  const currency = String(body.currency || 'SGD').trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) return { error: 'Currency must be a 3-letter code, for example SGD.' };
+  const total = Number(body.totalAmount);
+  if (!Number.isFinite(total) || total <= 0) return { error: 'Please enter the amount paid (more than 0).' };
+  if (total > 100000) return { error: 'The amount is too large. Please check it.' };
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  if (rawItems.length > 50) return { error: 'A claim can list at most 50 items.' };
+  const items = [];
+  for (const it of rawItems) {
+    const description = String(it?.description || '').trim();
+    if (!description) continue;
+    const quantity = it.quantity === null || it.quantity === undefined || it.quantity === '' ? null : Number(it.quantity);
+    const amount = it.amount === null || it.amount === undefined || it.amount === '' ? null : Number(it.amount);
+    if (quantity !== null && (!Number.isFinite(quantity) || quantity <= 0)) return { error: `Check the quantity for "${description}".` };
+    if (amount !== null && !Number.isFinite(amount)) return { error: `Check the amount for "${description}".` };
+    items.push({ description: description.slice(0, 200), quantity, amount: amount === null ? null : roundMoney(amount) });
+  }
+  const notes = String(body.notes || '').trim();
+  if (notes.length > 1000) return { error: 'Notes are too long (1,000 characters at most).' };
+  const projectCode = body.projectCode ? String(body.projectCode).toUpperCase().trim() : null;
+  return { value: { purchaseDate, merchant, category, currency, total: roundMoney(total), items, notes: notes || null, projectCode } };
+}
+
+// A project on a claim must exist, not be deployed, and (for staff) be one they are assigned to.
+async function checkClaimProject(session, projectCode) {
+  if (!projectCode) return null;
+  const project = await db.query('SELECT project_code FROM projects WHERE project_code = $1', [projectCode]);
+  if (project.rows.length === 0) return `Project ${projectCode} was not found.`;
+  if (await findDeployedProjectCode([projectCode])) return deployedProjectError(projectCode);
+  if (!userIsManagerial(session)) {
+    const assigned = await db.query('SELECT 1 FROM project_assignments WHERE user_id = $1 AND project_code = $2 LIMIT 1', [session.user_id, projectCode]);
+    if (assigned.rows.length === 0) return `You are not assigned to project ${projectCode}.`;
+  }
+  return null;
+}
+
+async function notifyClaimUser(userId, title, body) {
+  if (!userId) return;
+  try {
+    await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, title, body]);
+    await sendPushToUser(userId, title, body);
+  } catch (_) {}
+}
+
+function claimSummary(c) {
+  return `${c.merchant}, ${c.currency} ${Number(c.total_amount).toFixed(2)} on ${formatDateDMY(c.purchase_date)}`;
+}
+
+// Lists never include the receipt photo (it can be hundreds of KB); it is fetched on its own.
+// Dates are cast to text so a DATE isn't shifted a day by the JSON timestamp conversion.
+const CLAIM_LIST_SELECT = `
+  SELECT c.claim_id, c.user_id, c.status, c.purchase_date::text AS purchase_date, c.merchant, c.category,
+         c.currency, c.total_amount, c.project_code, p.project_name, c.notes,
+         c.manager_reviewed_by, c.manager_reviewed_at, c.manager_remarks,
+         c.hr_reviewed_by, c.hr_reviewed_at, c.hr_remarks, c.paid_at::text AS paid_at, c.paid_reference,
+         c.created_at, c.updated_at,
+         u.full_name AS claimant_name, u.email AS claimant_email,
+         mr.full_name AS manager_reviewer_name, hrr.full_name AS hr_reviewer_name,
+         COALESCE((SELECT json_agg(json_build_object('description', i.description, 'quantity', i.quantity, 'amount', i.amount) ORDER BY i.sort_order)
+                   FROM claim_items i WHERE i.claim_id = c.claim_id), '[]'::json) AS items
+  FROM claims c
+  JOIN users u ON u.user_id = c.user_id
+  LEFT JOIN projects p ON p.project_code = c.project_code
+  LEFT JOIN users mr ON mr.user_id = c.manager_reviewed_by
+  LEFT JOIN users hrr ON hrr.user_id = c.hr_reviewed_by`;
+
+async function fetchClaimForUpdate(claimId) {
+  const r = await db.query(
+    `SELECT c.*, c.purchase_date::text AS purchase_date, u.supervisor_id
+     FROM claims c JOIN users u ON u.user_id = c.user_id WHERE c.claim_id = $1`,
+    [claimId]
+  );
+  return r.rows[0] || null;
+}
+
+// Audit rows leave out the receipt photo itself; it never changes after submission except by an
+// edit, which the audit records as a flag.
+function claimAuditSnapshot(row, items) {
+  if (!row) return null;
+  const { receipt_image, ai_extraction, ...rest } = row;
+  return { ...rest, has_receipt: Boolean(receipt_image), items: items || undefined };
+}
+
+async function saveClaimItems(client, claimId, items) {
+  await client.query('DELETE FROM claim_items WHERE claim_id = $1', [claimId]);
+  for (let i = 0; i < items.length; i += 1) {
+    const it = items[i];
+    await client.query(
+      'INSERT INTO claim_items (claim_id, description, quantity, amount, sort_order) VALUES ($1, $2, $3, $4, $5)',
+      [claimId, it.description, it.quantity, it.amount, i]
+    );
+  }
+}
+
+const RECEIPT_SCAN_PROMPT = [
+  'You read a photo of a receipt for a staff expense claim in Singapore.',
+  'Extract only what is printed on the receipt. Never guess an amount; use null for anything you cannot read.',
+  '- purchase_date: the date on the receipt as YYYY-MM-DD.',
+  '- merchant: the shop, restaurant or company name.',
+  '- currency: ISO 4217 code; use SGD when the receipt shows only "$" with no other currency.',
+  '- items: each line purchased, with its quantity and line amount. Leave out subtotal, GST, service charge, rounding, change and payment lines.',
+  '- tax: the GST amount if printed.',
+  '- total: the final amount paid.',
+  `- category: the best fit from ${CLAIM_CATEGORY_CODES.join(', ')}.`,
+  '- readable: false if the photo is not a receipt or the total cannot be read.',
+].join('\n');
+
+const nullable = (type) => ({ anyOf: [{ type }, { type: 'null' }] });
+const RECEIPT_SCAN_SCHEMA = {
+  type: 'object',
+  properties: {
+    readable: { type: 'boolean' },
+    purchase_date: { ...nullable('string'), description: 'YYYY-MM-DD' },
+    merchant: nullable('string'),
+    currency: nullable('string'),
+    category: { type: 'string', enum: CLAIM_CATEGORY_CODES },
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { description: { type: 'string' }, quantity: nullable('number'), amount: nullable('number') },
+        required: ['description', 'quantity', 'amount'],
+      },
+    },
+    tax: nullable('number'),
+    total: nullable('number'),
+  },
+  required: ['readable', 'purchase_date', 'merchant', 'currency', 'category', 'items', 'tax', 'total'],
+};
+
+// Turns Gemini's JSON into the form fields the portal fills in, dropping anything malformed.
+function normalizeReceiptScan(raw) {
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? roundMoney(v) : null);
+  const date = isRealYmd(raw?.purchase_date) && raw.purchase_date <= sgtTodayYmd() ? raw.purchase_date : null;
+  const currency = /^[A-Z]{3}$/.test(String(raw?.currency || '').toUpperCase()) ? String(raw.currency).toUpperCase() : 'SGD';
+  const items = (Array.isArray(raw?.items) ? raw.items : []).slice(0, 50)
+    .map((it) => ({ description: String(it?.description || '').trim().slice(0, 200), quantity: num(it?.quantity), amount: num(it?.amount) }))
+    .filter((it) => it.description);
+  return {
+    readable: raw?.readable !== false,
+    purchaseDate: date,
+    merchant: String(raw?.merchant || '').trim().slice(0, 200) || null,
+    currency,
+    category: CLAIM_CATEGORY_CODES.includes(raw?.category) ? raw.category : 'OTHERS',
+    items,
+    tax: num(raw?.tax),
+    totalAmount: num(raw?.total) !== null && num(raw?.total) > 0 ? num(raw.total) : null,
+  };
+}
+
+async function logClaimScan(userId, outcome, { inputTokens = 0, outputTokens = 0, cost = 0, extraction = null } = {}) {
+  const r = await db.query(
+    `INSERT INTO claim_scans (user_id, input_tokens, output_tokens, cost_usd, outcome, extraction)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING scan_id`,
+    [userId, inputTokens, outputTokens, cost, outcome, extraction ? JSON.stringify(extraction) : null]
+  );
+  return r.rows[0].scan_id;
+}
+
+app.get('/api/v1/claims/categories', (req, res) => {
+  res.status(200).json({ success: true, data: CLAIM_CATEGORIES });
+});
+
+// Reads a receipt photo with Gemini and returns the fields for the staff member to check.
+// Nothing is saved except the scan log. Expected "can't scan" cases answer 200 with
+// available:false and a message, so the portal simply switches to manual entry.
+app.post('/api/v1/claims/scan', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session) return;
+  const image = parseReceiptImage(req.body.receiptImage);
+  if (image.error) return res.status(400).json({ error: image.error });
+  const manual = (message) => res.status(200).json({ success: true, available: false, message });
+  try {
+    const client = getGeminiClient();
+    if (!client) return manual('Receipt scanning is not set up yet. Please fill in the details yourself.');
+
+    const month = await db.query(`SELECT COALESCE(SUM(cost_usd), 0) AS cost FROM claim_scans WHERE created_at >= ${SGT_MONTH_START_SQL}`);
+    if (Number(month.rows[0].cost) >= CLAIM_SCAN_MONTHLY_CAP_USD) {
+      await logClaimScan(session.user_id, 'blocked');
+      return manual("Receipt scanning has reached this month's limit. Please fill in the details yourself.");
+    }
+    const today = await db.query(
+      `SELECT COUNT(*)::int AS n FROM claim_scans WHERE user_id = $1 AND outcome <> 'blocked' AND created_at >= ${SGT_DAY_START_SQL}`,
+      [session.user_id]
+    );
+    if (today.rows[0].n >= CLAIM_SCAN_DAILY_LIMIT) {
+      await logClaimScan(session.user_id, 'blocked');
+      return manual(`You've used today's ${CLAIM_SCAN_DAILY_LIMIT} receipt scans. Please fill in the details yourself.`);
+    }
+
+    let response;
+    try {
+      response = await Promise.race([
+        client.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: [{ role: 'user', parts: [{ inlineData: { mimeType: image.mimeType, data: image.data } }, { text: RECEIPT_SCAN_PROMPT }] }],
+          config: {
+            responseMimeType: 'application/json',
+            responseJsonSchema: RECEIPT_SCAN_SCHEMA,
+            mediaResolution: MediaResolution.MEDIA_RESOLUTION_HIGH,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          },
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Receipt scan timed out.')), CLAIM_SCAN_TIMEOUT_MS)),
+      ]);
+    } catch (err) {
+      console.error('[claims] Receipt scan failed:', err.message);
+      await logClaimScan(session.user_id, 'error');
+      return manual("We couldn't read the receipt right now. Please fill in the details yourself.");
+    }
+
+    const usage = response.usageMetadata || {};
+    const inputTokens = usage.promptTokenCount || 0;
+    const outputTokens = (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0);
+    const cost = (inputTokens * GEMINI_PRICE_IN_PER_M + outputTokens * GEMINI_PRICE_OUT_PER_M) / 1e6;
+    let raw = null;
+    try { raw = JSON.parse(response.text || ''); } catch (_) {}
+    const scanId = await logClaimScan(session.user_id, raw ? 'ok' : 'error', { inputTokens, outputTokens, cost, extraction: raw });
+    if (!raw) return manual("We couldn't read the receipt. Please fill in the details yourself.");
+    const fields = normalizeReceiptScan(raw);
+    if (!fields.readable) {
+      return res.status(200).json({ success: true, available: true, scanId, data: fields, message: "This photo doesn't look like a readable receipt. Check the details or retake the photo." });
+    }
+    return res.status(200).json({ success: true, available: true, scanId, data: fields });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to scan the receipt.', detail: error.message });
+  }
+});
+
+// Submit a claim. A claimant with no supervisor goes straight to HR.
+app.post('/api/v1/claims', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session) return;
+  const input = validateClaimInput(req.body);
+  if (input.error) return res.status(400).json({ error: input.error });
+  const image = parseReceiptImage(req.body.receiptImage);
+  if (image.error) return res.status(400).json({ error: image.error });
+  const v = input.value;
+  const client = await db.pool.connect();
+  try {
+    const projectError = await checkClaimProject(session, v.projectCode);
+    if (projectError) return res.status(400).json({ error: projectError });
+
+    if (req.body.confirmDuplicate !== true) {
+      const dup = await db.query(
+        `SELECT 1 FROM claims WHERE user_id = $1 AND LOWER(merchant) = LOWER($2) AND purchase_date = $3
+           AND total_amount = $4 AND status <> 'REJECTED' LIMIT 1`,
+        [session.user_id, v.merchant, v.purchaseDate, v.total]
+      );
+      if (dup.rows.length > 0) {
+        return res.status(409).json({ error: `You already have a claim for ${v.merchant}, ${v.currency} ${v.total.toFixed(2)} on ${formatDateDMY(v.purchaseDate)}. Submit it again only if this is a different receipt.`, duplicate: true });
+      }
+    }
+
+    let aiExtraction = null;
+    if (req.body.scanId && UUID_RE.test(String(req.body.scanId))) {
+      const scan = await db.query('SELECT extraction FROM claim_scans WHERE scan_id = $1 AND user_id = $2', [req.body.scanId, session.user_id]);
+      aiExtraction = scan.rows[0]?.extraction || null;
+    }
+
+    const me = await db.query('SELECT supervisor_id FROM users WHERE user_id = $1', [session.user_id]);
+    const supervisorId = me.rows[0]?.supervisor_id && me.rows[0].supervisor_id !== session.user_id ? me.rows[0].supervisor_id : null;
+    const status = supervisorId ? 'PENDING' : 'MANAGER_APPROVED';
+
+    await client.query('BEGIN');
+    const inserted = await client.query(
+      `INSERT INTO claims (user_id, status, purchase_date, merchant, category, currency, total_amount, project_code,
+                           notes, receipt_image, ai_extraction, manager_remarks)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING claim_id, status, purchase_date::text AS purchase_date, merchant, currency, total_amount`,
+      [session.user_id, status, v.purchaseDate, v.merchant, v.category, v.currency, v.total, v.projectCode,
+        v.notes, req.body.receiptImage, aiExtraction ? JSON.stringify(aiExtraction) : null,
+        supervisorId ? null : 'No manager assigned; sent straight to HR.']
+    );
+    const claim = inserted.rows[0];
+    await saveClaimItems(client, claim.claim_id, v.items);
+    await client.query('COMMIT');
+
+    await notifyClaimUser(session.user_id, 'Claim Submitted',
+      `Your claim for ${claimSummary(claim)} is ${supervisorId ? 'waiting for your manager' : 'waiting for HR'}.`);
+    if (supervisorId) {
+      await notifyClaimUser(supervisorId, 'Claim to Review', `${session.full_name} submitted a claim: ${claimSummary(claim)}.`);
+    }
+    return res.status(201).json({ success: true, data: claim });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    return res.status(500).json({ error: 'Failed to submit the claim.', detail: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/v1/claims/mine', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session) return;
+  try {
+    const r = await db.query(`${CLAIM_LIST_SELECT} WHERE c.user_id = $1 ORDER BY c.created_at DESC LIMIT 200`, [session.user_id]);
+    return res.status(200).json({ success: true, data: r.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load your claims.', detail: error.message });
+  }
+});
+
+app.get('/api/v1/claims/manager-pending', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session) return;
+  try {
+    const r = await db.query(
+      `${CLAIM_LIST_SELECT} WHERE c.status = 'PENDING' AND u.supervisor_id = $1 AND c.user_id <> $1 ORDER BY c.created_at ASC`,
+      [session.user_id]
+    );
+    return res.status(200).json({ success: true, data: r.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load claims to review.', detail: error.message });
+  }
+});
+
+app.get('/api/v1/claims/manager-history', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session) return;
+  try {
+    const r = await db.query(
+      `${CLAIM_LIST_SELECT} WHERE c.manager_reviewed_by = $1 ORDER BY c.manager_reviewed_at DESC LIMIT 200`,
+      [session.user_id]
+    );
+    return res.status(200).json({ success: true, data: r.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load your claim decisions.', detail: error.message });
+  }
+});
+
+function requireClaimsHr(session, res) {
+  if (!isPrivilegedAccount(session)) {
+    res.status(403).json({ error: 'Only HR can do this.' });
+    return false;
+  }
+  return true;
+}
+
+app.get('/api/v1/claims/hr-pending', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session || !requireClaimsHr(session, res)) return;
+  try {
+    const r = await db.query(`${CLAIM_LIST_SELECT} WHERE c.status = 'MANAGER_APPROVED' ORDER BY c.created_at ASC`);
+    return res.status(200).json({ success: true, data: r.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load claims to approve.', detail: error.message });
+  }
+});
+
+// HR list with optional ?status= and ?month=YYYY-MM (month the claim was submitted, SGT).
+app.get('/api/v1/claims/hr-list', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session || !requireClaimsHr(session, res)) return;
+  const { status, month } = req.query;
+  const where = [];
+  const params = [];
+  if (status) {
+    params.push(String(status).toUpperCase());
+    where.push(`c.status = $${params.length}`);
+  }
+  if (month) {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(month))) return res.status(400).json({ error: 'month must be YYYY-MM.' });
+    params.push(`${month}-01`);
+    where.push(`(c.created_at AT TIME ZONE 'Asia/Singapore')::date >= $${params.length}::date
+                AND (c.created_at AT TIME ZONE 'Asia/Singapore')::date < ($${params.length}::date + INTERVAL '1 month')`);
+  }
+  try {
+    const r = await db.query(
+      `${CLAIM_LIST_SELECT} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY c.created_at DESC LIMIT 500`,
+      params
+    );
+    return res.status(200).json({ success: true, data: r.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load claims.', detail: error.message });
+  }
+});
+
+// Claims HR approved in a month (SGT), for payroll. The portal turns this into the CSV.
+app.get('/api/v1/claims/export', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session || !requireClaimsHr(session, res)) return;
+  const { month } = req.query;
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(month || ''))) return res.status(400).json({ error: 'month must be YYYY-MM.' });
+  try {
+    const r = await db.query(
+      `${CLAIM_LIST_SELECT}
+       WHERE c.status IN ('APPROVED', 'PAID')
+         AND (c.hr_reviewed_at AT TIME ZONE 'Asia/Singapore')::date >= $1::date
+         AND (c.hr_reviewed_at AT TIME ZONE 'Asia/Singapore')::date < ($1::date + INTERVAL '1 month')
+       ORDER BY u.full_name ASC, c.purchase_date ASC`,
+      [`${month}-01`]
+    );
+    return res.status(200).json({ success: true, data: r.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to export claims.', detail: error.message });
+  }
+});
+
+app.get('/api/v1/claims/scan-usage', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session || !requireClaimsHr(session, res)) return;
+  try {
+    const r = await db.query(
+      `SELECT COALESCE(SUM(cost_usd), 0) AS cost,
+              COUNT(*) FILTER (WHERE outcome = 'ok')::int AS scans,
+              COUNT(*) FILTER (WHERE outcome = 'error')::int AS errors,
+              COUNT(*) FILTER (WHERE outcome = 'blocked')::int AS blocked
+       FROM claim_scans WHERE created_at >= ${SGT_MONTH_START_SQL}`
+    );
+    const row = r.rows[0];
+    return res.status(200).json({
+      success: true,
+      data: {
+        costUsd: Number(row.cost), scans: row.scans, errors: row.errors, blocked: row.blocked,
+        monthlyCapUsd: CLAIM_SCAN_MONTHLY_CAP_USD, dailyLimitPerUser: CLAIM_SCAN_DAILY_LIMIT,
+        configured: Boolean(process.env.GEMINI_API_KEY), model: GEMINI_MODEL,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load scan usage.', detail: error.message });
+  }
+});
+
+// HR marks approved claims paid (bulk), with the payment date and reference.
+app.patch('/api/v1/claims/mark-paid', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session || !requireClaimsHr(session, res)) return;
+  const { claimIds, paidDate, paidReference } = req.body;
+  const ids = Array.isArray(claimIds) ? claimIds.filter((id) => UUID_RE.test(String(id))) : [];
+  if (ids.length === 0) return res.status(400).json({ error: 'Select at least one claim.' });
+  if (!isRealYmd(paidDate)) return res.status(400).json({ error: 'Please enter the payment date.' });
+  const reference = String(paidReference || '').trim().slice(0, 200) || null;
+  try {
+    const r = await db.query(
+      `UPDATE claims SET status = 'PAID', paid_at = $2, paid_reference = $3, updated_at = CURRENT_TIMESTAMP
+       WHERE claim_id = ANY($1::uuid[]) AND status = 'APPROVED'
+       RETURNING claim_id, user_id, merchant, currency, total_amount, purchase_date::text AS purchase_date`,
+      [ids, paidDate, reference]
+    );
+    for (const c of r.rows) {
+      await auditInterceptor('claims', c.claim_id, session.user_id, { status: 'APPROVED' }, { status: 'PAID', paid_at: paidDate, paid_reference: reference });
+      await notifyClaimUser(c.user_id, 'Claim Paid', `Your claim for ${claimSummary(c)} was paid on ${formatDateDMY(paidDate)}.`);
+    }
+    return res.status(200).json({ success: true, data: { updated: r.rows.length, skipped: ids.length - r.rows.length } });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to mark claims paid.', detail: error.message });
+  }
+});
+
+// Edit your own claim while it is still waiting for your manager. A new receipt photo is optional.
+app.patch('/api/v1/claims/:claimId', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session) return;
+  const { claimId } = req.params;
+  if (!UUID_RE.test(claimId)) return res.status(400).json({ error: 'Claim id is not valid.' });
+  const input = validateClaimInput(req.body);
+  if (input.error) return res.status(400).json({ error: input.error });
+  let newImage = null;
+  if (req.body.receiptImage) {
+    const image = parseReceiptImage(req.body.receiptImage);
+    if (image.error) return res.status(400).json({ error: image.error });
+    newImage = req.body.receiptImage;
+  }
+  const v = input.value;
+  const client = await db.pool.connect();
+  try {
+    const before = await fetchClaimForUpdate(claimId);
+    if (!before) return res.status(404).json({ error: 'Claim not found.' });
+    if (before.user_id !== session.user_id) return res.status(403).json({ error: 'You can only edit your own claims.' });
+    if (before.status !== 'PENDING') return res.status(400).json({ error: 'This claim has already been reviewed and can no longer be edited.' });
+    const projectError = await checkClaimProject(session, v.projectCode);
+    if (projectError) return res.status(400).json({ error: projectError });
+    const beforeItems = (await db.query('SELECT description, quantity, amount FROM claim_items WHERE claim_id = $1 ORDER BY sort_order', [claimId])).rows;
+
+    await client.query('BEGIN');
+    const updated = await client.query(
+      `UPDATE claims SET purchase_date = $2, merchant = $3, category = $4, currency = $5, total_amount = $6,
+              project_code = $7, notes = $8, receipt_image = COALESCE($9, receipt_image), updated_at = CURRENT_TIMESTAMP
+       WHERE claim_id = $1 AND status = 'PENDING' RETURNING *`,
+      [claimId, v.purchaseDate, v.merchant, v.category, v.currency, v.total, v.projectCode, v.notes, newImage]
+    );
+    if (updated.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This claim has already been reviewed and can no longer be edited.' });
+    }
+    await saveClaimItems(client, claimId, v.items);
+    await client.query('COMMIT');
+    await auditInterceptor('claims', claimId, session.user_id, claimAuditSnapshot(before, beforeItems),
+      { ...claimAuditSnapshot(updated.rows[0], v.items), receipt_replaced: Boolean(newImage) });
+    return res.status(200).json({ success: true, data: { claim_id: claimId } });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    return res.status(500).json({ error: 'Failed to update the claim.', detail: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/v1/claims/:claimId', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session) return;
+  const { claimId } = req.params;
+  if (!UUID_RE.test(claimId)) return res.status(400).json({ error: 'Claim id is not valid.' });
+  try {
+    const before = await fetchClaimForUpdate(claimId);
+    if (!before) return res.status(404).json({ error: 'Claim not found.' });
+    if (before.user_id !== session.user_id) return res.status(403).json({ error: 'You can only delete your own claims.' });
+    if (before.status !== 'PENDING') return res.status(400).json({ error: 'This claim has already been reviewed and can no longer be deleted.' });
+    const items = (await db.query('SELECT description, quantity, amount FROM claim_items WHERE claim_id = $1 ORDER BY sort_order', [claimId])).rows;
+    const r = await db.query(`DELETE FROM claims WHERE claim_id = $1 AND status = 'PENDING'`, [claimId]);
+    if (r.rowCount === 0) return res.status(400).json({ error: 'This claim has already been reviewed and can no longer be deleted.' });
+    await auditInterceptor('claims', claimId, session.user_id, claimAuditSnapshot(before, items), null);
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to delete the claim.', detail: error.message });
+  }
+});
+
+// The receipt photo: only the claimant, their manager, or HR.
+app.get('/api/v1/claims/:claimId/receipt', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session) return;
+  const { claimId } = req.params;
+  if (!UUID_RE.test(claimId)) return res.status(400).json({ error: 'Claim id is not valid.' });
+  try {
+    const claim = await fetchClaimForUpdate(claimId);
+    if (!claim) return res.status(404).json({ error: 'Claim not found.' });
+    const allowed = claim.user_id === session.user_id || claim.supervisor_id === session.user_id || isPrivilegedAccount(session);
+    if (!allowed) return res.status(403).json({ error: 'You cannot view this receipt.' });
+    return res.status(200).json({ success: true, data: { receiptImage: claim.receipt_image } });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load the receipt.', detail: error.message });
+  }
+});
+
+function readClaimDecision(body) {
+  const action = String(body.action || '').toUpperCase();
+  if (!['APPROVED', 'REJECTED'].includes(action)) return { error: 'Invalid action. Must be APPROVED or REJECTED.' };
+  const remarks = String(body.remarks || '').trim().slice(0, 1000);
+  if (action === 'REJECTED' && !remarks) return { error: 'Please give a reason for rejecting this claim.' };
+  return { action, remarks: remarks || null };
+}
+
+app.patch('/api/v1/claims/:claimId/manager-review', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session) return;
+  const { claimId } = req.params;
+  if (!UUID_RE.test(claimId)) return res.status(400).json({ error: 'Claim id is not valid.' });
+  const decision = readClaimDecision(req.body);
+  if (decision.error) return res.status(400).json({ error: decision.error });
+  try {
+    const before = await fetchClaimForUpdate(claimId);
+    if (!before) return res.status(404).json({ error: 'Claim not found.' });
+    if (before.user_id === session.user_id) return res.status(403).json({ error: "You can't review your own claim." });
+    if (before.supervisor_id !== session.user_id) return res.status(403).json({ error: 'This claim is not from a member of your team.' });
+    const newStatus = decision.action === 'APPROVED' ? 'MANAGER_APPROVED' : 'REJECTED';
+    const r = await db.query(
+      `UPDATE claims SET status = $2, manager_reviewed_by = $3, manager_reviewed_at = CURRENT_TIMESTAMP,
+              manager_remarks = $4, updated_at = CURRENT_TIMESTAMP
+       WHERE claim_id = $1 AND status = 'PENDING'
+       RETURNING claim_id, status, merchant, currency, total_amount, purchase_date::text AS purchase_date`,
+      [claimId, newStatus, session.user_id, decision.remarks]
+    );
+    if (r.rows.length === 0) return res.status(409).json({ error: 'This claim has already been reviewed.' });
+    await auditInterceptor('claims', claimId, session.user_id, { status: before.status }, { status: newStatus, manager_remarks: decision.remarks });
+    const c = r.rows[0];
+    await notifyClaimUser(before.user_id,
+      newStatus === 'REJECTED' ? 'Claim Rejected' : 'Claim Approved by Manager',
+      newStatus === 'REJECTED'
+        ? `Your claim for ${claimSummary(c)} was rejected by your manager. Reason: ${decision.remarks}`
+        : `Your claim for ${claimSummary(c)} was approved by your manager and is waiting for HR.`);
+    return res.status(200).json({ success: true, data: c });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to review the claim.', detail: error.message });
+  }
+});
+
+app.patch('/api/v1/claims/:claimId/hr-review', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session || !requireClaimsHr(session, res)) return;
+  const { claimId } = req.params;
+  if (!UUID_RE.test(claimId)) return res.status(400).json({ error: 'Claim id is not valid.' });
+  const decision = readClaimDecision(req.body);
+  if (decision.error) return res.status(400).json({ error: decision.error });
+  try {
+    const before = await fetchClaimForUpdate(claimId);
+    if (!before) return res.status(404).json({ error: 'Claim not found.' });
+    if (before.user_id === session.user_id) return res.status(403).json({ error: "You can't approve your own claim. Another HR user must review it." });
+    const r = await db.query(
+      `UPDATE claims SET status = $2, hr_reviewed_by = $3, hr_reviewed_at = CURRENT_TIMESTAMP,
+              hr_remarks = $4, updated_at = CURRENT_TIMESTAMP
+       WHERE claim_id = $1 AND status = 'MANAGER_APPROVED'
+       RETURNING claim_id, status, merchant, currency, total_amount, purchase_date::text AS purchase_date`,
+      [claimId, decision.action, session.user_id, decision.remarks]
+    );
+    if (r.rows.length === 0) return res.status(409).json({ error: 'This claim is not waiting for HR approval.' });
+    await auditInterceptor('claims', claimId, session.user_id, { status: before.status }, { status: decision.action, hr_remarks: decision.remarks });
+    const c = r.rows[0];
+    await notifyClaimUser(before.user_id,
+      decision.action === 'REJECTED' ? 'Claim Rejected' : 'Claim Approved',
+      decision.action === 'REJECTED'
+        ? `Your claim for ${claimSummary(c)} was rejected by HR. Reason: ${decision.remarks}`
+        : `Your claim for ${claimSummary(c)} was approved by HR and will be paid with your salary.`);
+    return res.status(200).json({ success: true, data: c });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to review the claim.', detail: error.message });
   }
 });
 
