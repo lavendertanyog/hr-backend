@@ -6038,6 +6038,27 @@ app.get('/api/v1/hr/leave-requests', async (req, res) => {
   }
 });
 
+// HR: the MC proof attached to one leave request. The proof is stored as a base64 data URL in
+// leave_applications.mc_file_url; the HR portal's /mc/<leaveId> page turns it back into a file.
+app.get('/api/v1/hr/leave/:leaveId/mc-proof', async (req, res) => {
+  const { requesterId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+
+  try {
+    const result = await db.query(
+      `SELECT la.leave_id, la.category, la.start_date, la.end_date, la.mc_file_url, u.full_name
+       FROM leave_applications la JOIN users u ON u.user_id = la.user_id
+       WHERE la.leave_id = $1`,
+      [req.params.leaveId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Leave request not found.' });
+    if (!result.rows[0].mc_file_url) return res.status(404).json({ error: 'No MC proof was attached to this leave request.' });
+    return res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch MC proof.', detail: error.message });
+  }
+});
+
 app.get('/api/v1/manager/:managerId/progress-logs', async (req, res) => {
   const { managerId } = req.params;
 
