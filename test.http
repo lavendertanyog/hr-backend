@@ -30,3 +30,71 @@ Content-Type: application/json
   "completionPercentage": 45.50,
   "progressSummary": "Database persistence tables initialized and backend routing layers verified via integration tests."
 }
+
+### Log In and Remember This Device (returns session.token)
+POST http://localhost:5000/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "test.staff@nextan.com.sg",
+  "password": "<password>",
+  "trustDevice": true,
+  "portal": "staff"
+}
+
+### Resume a Remembered Sign-in (returns a new token; the old one stops working)
+POST http://localhost:5000/api/v1/auth/resume
+Content-Type: application/json
+
+{
+  "token": "<session.token>"
+}
+
+### List My Remembered Devices
+GET http://localhost:5000/api/v1/auth/sessions
+Authorization: Bearer <session.token>
+
+### Sign Out All My Other Devices
+POST http://localhost:5000/api/v1/auth/sessions/revoke
+Authorization: Bearer <session.token>
+Content-Type: application/json
+
+{
+  "allOthers": true
+}
+
+### Log Out (ends this device's session)
+POST http://localhost:5000/api/v1/auth/logout
+Authorization: Bearer <session.token>
+
+### Undo a Leave Decision (manager, within 10 minutes; back to PENDING)
+PATCH http://localhost:5000/api/v1/leave/undo-review
+Content-Type: application/json
+
+{
+  "leaveId": "<leave_id>",
+  "reviewerId": "<manager user_id>"
+}
+
+### Pending Budget Requests for one manager (only projects they manage; HR sees all)
+GET http://localhost:5000/api/v1/projects/budget-requests?reviewerId=<manager user_id>
+
+### Budget Requests awaiting one Account Manager (only their projects; HR sees all)
+GET http://localhost:5000/api/v1/projects/budget-requests/pending-am?reviewerId=<account manager user_id>
+
+### My Inbox Feed (owner only: needs this user's session token)
+GET http://localhost:5000/api/v1/users/<user_id>/inbox
+Authorization: Bearer <session.token>
+
+### Mark a Notification Read (owner only)
+PATCH http://localhost:5000/api/v1/notifications/<notification_id>/read
+Authorization: Bearer <session.token>
+
+### Undo a Budget Decision (manager, within 10 minutes; back to PENDING)
+PATCH http://localhost:5000/api/v1/projects/budget-request/undo-review
+Content-Type: application/json
+
+{
+  "requestId": "<request_id>",
+  "reviewerId": "<manager user_id>"
+}

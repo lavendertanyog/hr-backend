@@ -1,7 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { randomUUID } = require('crypto');
+const { randomUUID, randomBytes, createHash } = require('crypto');
 const bcrypt = require('bcryptjs');
 const dotenv = require('dotenv');
 const db = require('./db');
@@ -206,6 +206,30 @@ function userCanManageProjectLifecycle(userRow) {
   return userHasRole(userRow, 'hr') || userHasRole(userRow, 'account_manager');
 }
 
+// Budget request reviewers: a manager may only review requests on projects they manage
+// (projects.manager_ids), and an Account Manager only on projects they are the Account
+// Manager of. HR / is_admin users skip the project check.
+function userIsHrOrAdmin(userRow) {
+  return Boolean(userRow?.is_admin) || userHasRole(userRow, 'hr');
+}
+
+async function isProjectManagerOf(userId, projectCode) {
+  const r = await db.query(
+    'SELECT 1 FROM projects WHERE project_code = $1 AND $2::uuid = ANY(manager_ids::uuid[])',
+    [projectCode, userId]
+  );
+  return r.rows.length > 0;
+}
+
+async function isProjectAccountManagerOf(userId, projectCode) {
+  const r = await db.query(
+    `SELECT 1 FROM projects
+     WHERE project_code = $1 AND (account_manager_id = $2::uuid OR $2::uuid = ANY(account_manager_ids::uuid[]))`,
+    [projectCode, userId]
+  );
+  return r.rows.length > 0;
+}
+
 // Returns the first of the given project codes that is DEPLOYED (or legacy INACTIVE), or null.
 // Deployed projects keep their assignments, so this — not the assignment check — is what stops
 // time, progress and budget requests being logged against them.
@@ -344,6 +368,7 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_status TEXT NOT NULL DEFAULT 'PENDING';`);
   await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_reviewer_id UUID REFERENCES users(user_id);`);
   await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_reviewed_at TIMESTAMPTZ;`);
+  await db.query(`ALTER TABLE hour_allocations ADD COLUMN IF NOT EXISTS account_manager_remarks TEXT;`);
 
   // Projects: support multiple managers
   await db.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS manager_ids TEXT[] DEFAULT '{}';`);
@@ -583,6 +608,25 @@ async function ensureOperationalTables() {
   // name to explain it), optional for a named project. Lives per-allocation rather than per
   // session, since one session can hold several project blocks each with their own note.
   await db.query(`ALTER TABLE attendance_allocations ADD COLUMN IF NOT EXISTS description TEXT;`);
+
+  // Login sessions. Every login gets one; "Remember me" makes it a trusted-device session that
+  // the login page can resume without a password until it expires. Only a SHA-256 hash of the
+  // token is stored, so a copy of this table can't be used to sign in.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      session_id UUID PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      portal TEXT,
+      device_label TEXT,
+      trusted BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      expires_at TIMESTAMPTZ NOT NULL,
+      revoked_at TIMESTAMPTZ
+    );
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions (user_id);`);
 }
 
 const STANDARD_WORKDAY_HOURS = 8;
@@ -880,6 +924,7 @@ app.post('/api/v1/auth/forgot-password', async (req, res) => {
       const tempPassword = generateTempPassword();
       const hash = await bcrypt.hash(tempPassword, 10);
       await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, user.user_id]);
+      await revokeUserSessions(user.user_id);
       const portalOrigin = portalUrl.replace(/\/$/, '');
       await sendTemporaryPasswordEmail(normalized, tempPassword, portalOrigin);
       console.log('[forgot-password] sent temporary password to', normalized);
@@ -914,6 +959,7 @@ app.post('/api/v1/auth/change-password', async (req, res) => {
 
     const hash = await bcrypt.hash(newPassword, 10);
     await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, userId]);
+    await revokeUserSessions(userId, bearerToken(req));
     return res.status(200).json({ success: true, message: 'Password updated.' });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to change password.', detail: error.message });
@@ -945,6 +991,7 @@ app.post('/api/v1/auth/reset-password-token', async (req, res) => {
 
     const hash = await bcrypt.hash(newPassword, 10);
     await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, row.user_id]);
+    await revokeUserSessions(row.user_id);
     await db.query('UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP WHERE token_id = $1', [row.token_id]);
     return res.status(200).json({ success: true, message: 'Password updated. You can now log in.' });
   } catch (error) {
@@ -961,7 +1008,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
   const normalized = email.trim().toLowerCase();
   try {
     const result = await db.query(
-      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status FROM users WHERE LOWER(email) = $1 LIMIT 1',
+      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status, is_admin FROM users WHERE LOWER(email) = $1 LIMIT 1',
       [normalized]
     );
     const user = result.rows[0];
@@ -990,15 +1037,203 @@ app.post('/api/v1/auth/login', async (req, res) => {
       const valid = await bcrypt.compare(password, user.password_hash);
       if (!valid) return res.status(401).json({ error: 'Incorrect password.' });
     }
-    const { password_hash, account_status, ...safeUser } = user;
-    safeUser.full_name = deriveNameFromEmail(normalized);
-    // Ensure user_roles is always an array in the response
-    safeUser.user_roles = Array.isArray(safeUser.user_roles) && safeUser.user_roles.length > 0
-      ? safeUser.user_roles
-      : [safeUser.user_role].filter(Boolean);
-    return res.status(200).json({ success: true, data: safeUser });
+    const session = await createAuthSession(user, {
+      trusted: req.body.trustDevice === true,
+      portal: req.body.portal,
+      deviceLabel: deviceLabelFrom(req),
+    });
+    return res.status(200).json({ success: true, data: sessionUserPayload(user), session });
   } catch (error) {
     return res.status(500).json({ error: 'Login failed.', detail: error.message });
+  }
+});
+
+// ========================================================================
+// LOGIN SESSIONS ("Remember me on this device")
+// ========================================================================
+// A login returns a session token. With "Remember me" ticked the portal keeps it in
+// localStorage and the login page trades it for a fresh one via /auth/resume, so the user skips
+// the password until the session expires: 30 days, or 1 day for HR and admin accounts because of
+// what they can change. Sessions keep the expiry set at password login (resuming doesn't extend
+// it), and each resume replaces the token so a copied one stops working once the device is used.
+// Tokens are sent as `Authorization: Bearer <token>`, ready for the rest of the API to use.
+const SESSION_DAY_MS = 24 * 60 * 60 * 1000;
+const TRUSTED_SESSION_DAYS = 30;
+const PRIVILEGED_TRUSTED_SESSION_DAYS = 1;
+const UNTRUSTED_SESSION_DAYS = 1;
+const SESSION_PORTALS = ['staff', 'manager', 'account_manager', 'hr'];
+
+function hashSessionToken(token) {
+  return createHash('sha256').update(String(token)).digest('hex');
+}
+
+function isPrivilegedAccount(user) {
+  return Boolean(user.is_admin) || userHasRole(user, 'hr');
+}
+
+function sessionDaysFor(user, trusted) {
+  if (!trusted) return UNTRUSTED_SESSION_DAYS;
+  return isPrivilegedAccount(user) ? PRIVILEGED_TRUSTED_SESSION_DAYS : TRUSTED_SESSION_DAYS;
+}
+
+// "Chrome on Windows" etc., so people can recognise their devices on the Profile page.
+function deviceLabelFrom(req) {
+  const ua = String(req.headers['user-agent'] || '');
+  const browser = /Edg\//.test(ua) ? 'Edge'
+    : /OPR\//.test(ua) ? 'Opera'
+    : /Chrome\//.test(ua) ? 'Chrome'
+    : /Firefox\//.test(ua) ? 'Firefox'
+    : /Safari\//.test(ua) ? 'Safari'
+    : 'Browser';
+  const os = /Windows/.test(ua) ? 'Windows'
+    : /iPhone|iPad/.test(ua) ? 'iOS'
+    : /Android/.test(ua) ? 'Android'
+    : /Mac OS X/.test(ua) ? 'macOS'
+    : /Linux/.test(ua) ? 'Linux'
+    : 'unknown device';
+  return `${browser} on ${os}`;
+}
+
+function bearerToken(req) {
+  const match = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ''));
+  return match ? match[1].trim() : null;
+}
+
+// The user object the portals keep in sessionStorage — same shape /auth/login has always returned.
+function sessionUserPayload(user) {
+  const { password_hash, account_status, is_admin, ...safeUser } = user;
+  safeUser.full_name = deriveNameFromEmail(user.email);
+  safeUser.user_roles = Array.isArray(safeUser.user_roles) && safeUser.user_roles.length > 0
+    ? safeUser.user_roles
+    : [safeUser.user_role].filter(Boolean);
+  return safeUser;
+}
+
+async function createAuthSession(user, { trusted, portal, deviceLabel, expiresAt }) {
+  const token = randomBytes(32).toString('base64url');
+  let expires = new Date(Date.now() + sessionDaysFor(user, trusted) * SESSION_DAY_MS);
+  // A resumed session keeps its original expiry, unless the account has since become HR/admin.
+  if (expiresAt && new Date(expiresAt) < expires) expires = new Date(expiresAt);
+  await db.query(
+    `INSERT INTO auth_sessions (session_id, user_id, token_hash, portal, device_label, trusted, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [randomUUID(), user.user_id, hashSessionToken(token),
+      SESSION_PORTALS.includes(portal) ? portal : null, deviceLabel || null, Boolean(trusted), expires]
+  );
+  return { token, trusted: Boolean(trusted), expiresAt: expires.toISOString() };
+}
+
+// The live session for a token, joined with its user, or null if it's unknown, revoked or expired.
+async function findAuthSession(token) {
+  if (!token) return null;
+  const result = await db.query(
+    `SELECT s.session_id, s.portal, s.device_label, s.trusted, s.expires_at,
+            u.user_id, u.full_name, u.user_role, u.user_roles, u.email, u.account_status, u.is_admin
+     FROM auth_sessions s JOIN users u ON u.user_id = s.user_id
+     WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > CURRENT_TIMESTAMP
+     LIMIT 1`,
+    [hashSessionToken(token)]
+  );
+  return result.rows[0] || null;
+}
+
+// For routes that need to know who is calling: the live session from the Bearer token, or null
+// after responding 401. Use this rather than trusting a userId sent in the request.
+async function requireSession(req, res) {
+  const session = await findAuthSession(bearerToken(req));
+  if (!session || String(session.account_status || 'active').toLowerCase() !== 'active') {
+    res.status(401).json({ error: 'Your sign-in has ended. Please log in again.', signedOut: true });
+    return null;
+  }
+  return session;
+}
+
+// Signs a user out everywhere: after a password change or reset, or a change to their roles.
+// `exceptToken` keeps the session that made the change (changing your own password).
+async function revokeUserSessions(userId, exceptToken = null) {
+  await db.query(
+    `UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP
+     WHERE user_id = $1 AND revoked_at IS NULL AND token_hash IS DISTINCT FROM $2`,
+    [userId, exceptToken ? hashSessionToken(exceptToken) : null]
+  );
+}
+
+app.post('/api/v1/auth/resume', async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'token is required.' });
+  try {
+    const session = await findAuthSession(token);
+    if (!session || !session.trusted || String(session.account_status || 'active').toLowerCase() !== 'active') {
+      return res.status(401).json({ error: 'Your saved sign-in has expired. Please log in again.' });
+    }
+    await db.query('UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE session_id = $1', [session.session_id]);
+    const next = await createAuthSession(session, {
+      trusted: true,
+      portal: session.portal,
+      deviceLabel: deviceLabelFrom(req),
+      expiresAt: session.expires_at,
+    });
+    return res.status(200).json({ success: true, data: sessionUserPayload(session), session: next });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to resume sign-in.', detail: error.message });
+  }
+});
+
+// Log out: ends this device's session. Always succeeds, so logging out never gets stuck.
+app.post('/api/v1/auth/logout', async (req, res) => {
+  const token = bearerToken(req);
+  try {
+    if (token) {
+      await db.query(
+        'UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE token_hash = $1 AND revoked_at IS NULL',
+        [hashSessionToken(token)]
+      );
+    }
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to log out.', detail: error.message });
+  }
+});
+
+// The signed-in user's own remembered devices, for the Profile page.
+app.get('/api/v1/auth/sessions', async (req, res) => {
+  try {
+    const current = await findAuthSession(bearerToken(req));
+    if (!current) return res.status(401).json({ error: 'Please log in again to see your devices.' });
+    const result = await db.query(
+      `SELECT session_id, portal, device_label, created_at, last_used_at, expires_at
+       FROM auth_sessions
+       WHERE user_id = $1 AND trusted AND revoked_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+       ORDER BY created_at DESC`,
+      [current.user_id]
+    );
+    const data = result.rows.map((row) => ({ ...row, is_current: row.session_id === current.session_id }));
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load your devices.', detail: error.message });
+  }
+});
+
+// Forget one remembered device (`sessionId`), or every one except this device (`allOthers: true`).
+app.post('/api/v1/auth/sessions/revoke', async (req, res) => {
+  const { sessionId, allOthers } = req.body;
+  if (!sessionId && allOthers !== true) return res.status(400).json({ error: 'sessionId or allOthers is required.' });
+  if (sessionId && !UUID_RE.test(sessionId)) return res.status(400).json({ error: 'sessionId is not valid.' });
+  try {
+    const current = await findAuthSession(bearerToken(req));
+    if (!current) return res.status(401).json({ error: 'Please log in again to manage your devices.' });
+    const result = allOthers === true
+      ? await db.query(
+        `UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1 AND session_id <> $2 AND revoked_at IS NULL`,
+        [current.user_id, current.session_id])
+      : await db.query(
+        `UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1 AND session_id = $2 AND revoked_at IS NULL`,
+        [current.user_id, sessionId]);
+    return res.status(200).json({ success: true, data: { revoked: result.rowCount } });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to sign out the device.', detail: error.message });
   }
 });
 
@@ -1089,6 +1324,7 @@ app.patch('/api/v1/admin/approve-reset', async (req, res) => {
 
     if (action === 'approve') {
       await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [row.new_password_hash, row.user_id]);
+      await revokeUserSessions(row.user_id);
     }
     await db.query(
       `UPDATE password_reset_requests SET status = $1, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = $2 WHERE request_id = $3`,
@@ -1150,6 +1386,20 @@ app.get('/api/v1/hr/pending-registrations', async (req, res) => {
 });
 
 // HR Admin only: approve or reject any pending registration (Manager, Account Manager, or Staff)
+// Tells someone their account is now active: a new sign-up approved, or a rejected or revoked
+// account reactivated. Sent by both the HR and the Account Manager registration routes.
+async function sendAccountActiveEmail(toEmail) {
+  const html = brandedEmailHtml({
+    linkOrigin: STAFF_PORTAL_URL,
+    heading: 'Your Nextan Portal account is active',
+    bodyHtml: 'Your account has been approved. You can now log in with the email and password you signed up with.',
+    buttonText: 'Log in',
+    buttonUrl: STAFF_PORTAL_URL,
+    footerText: "You're receiving this because an account was requested with this email address.",
+  });
+  await sendEmail(toEmail, 'Your Nextan Portal account is active', html, 'account-active');
+}
+
 app.patch('/api/v1/hr/approve-registration', async (req, res) => {
   const { requesterId, userId, action } = req.body;
   if (!await requireAdmin(requesterId, res)) return;
@@ -1157,10 +1407,14 @@ app.patch('/api/v1/hr/approve-registration', async (req, res) => {
     return res.status(400).json({ error: 'userId and action (approve|reject) are required.' });
   }
   try {
-    const target = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    const target = await db.query('SELECT user_role, user_roles, email, account_status FROM users WHERE user_id = $1 LIMIT 1', [userId]);
     if (!target.rows[0]) return res.status(404).json({ error: 'User not found.' });
     const newStatus = action === 'approve' ? 'active' : 'rejected';
     await db.query('UPDATE users SET account_status = $1 WHERE user_id = $2', [newStatus, userId]);
+    if (target.rows[0].account_status !== 'active' && newStatus === 'active' && target.rows[0].email) {
+      sendAccountActiveEmail(target.rows[0].email)
+        .catch((e) => console.error('[email] Account active email failed:', e.message));
+    }
     return res.status(200).json({ success: true, message: `Account ${newStatus}.` });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update registration status.', detail: err.message });
@@ -1194,7 +1448,7 @@ app.patch('/api/v1/account-manager/approve-staff-registration', async (req, res)
     return res.status(400).json({ error: 'userId and action (approve|reject) are required.' });
   }
   try {
-    const target = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    const target = await db.query('SELECT user_role, user_roles, email, account_status FROM users WHERE user_id = $1 LIMIT 1', [userId]);
     if (!target.rows[0]) return res.status(404).json({ error: 'User not found.' });
     const targetRow = target.rows[0];
     if (!userHasRole(targetRow, 'staff')) {
@@ -1202,6 +1456,10 @@ app.patch('/api/v1/account-manager/approve-staff-registration', async (req, res)
     }
     const newStatus = action === 'approve' ? 'active' : 'rejected';
     await db.query('UPDATE users SET account_status = $1 WHERE user_id = $2', [newStatus, userId]);
+    if (targetRow.account_status !== 'active' && newStatus === 'active' && targetRow.email) {
+      sendAccountActiveEmail(targetRow.email)
+        .catch((e) => console.error('[email] Account active email failed:', e.message));
+    }
     return res.status(200).json({ success: true, message: `Staff account ${newStatus}.` });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update staff registration status.', detail: err.message });
@@ -1248,8 +1506,15 @@ app.get('/api/v1/admin/reset-history', async (req, res) => {
 // ========================================================================
 // ROUTE: NOTIFICATIONS
 // ========================================================================
+// Notifications are private: reading or marking them read needs the owner's session token.
+// Creating one by API is HR/admin only (the server inserts its own notifications directly).
 app.get('/api/v1/notifications/:userId', async (req, res) => {
   try {
+    const session = await requireSession(req, res);
+    if (!session) return;
+    if (session.user_id !== req.params.userId) {
+      return res.status(403).json({ error: 'You can only see your own notifications.' });
+    }
     const result = await db.query(
       'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
       [req.params.userId]
@@ -1264,6 +1529,11 @@ app.post('/api/v1/notifications', async (req, res) => {
   const { userId, title, body } = req.body;
   if (!userId || !title || !body) return res.status(400).json({ error: 'userId, title and body are required.' });
   try {
+    const session = await requireSession(req, res);
+    if (!session) return;
+    if (!isPrivilegedAccount(session)) {
+      return res.status(403).json({ error: 'Only HR can send notifications.' });
+    }
     const result = await db.query(
       'INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3) RETURNING *',
       [userId, title, body]
@@ -1275,8 +1545,15 @@ app.post('/api/v1/notifications', async (req, res) => {
 });
 
 app.patch('/api/v1/notifications/:notifId/read', async (req, res) => {
+  if (!UUID_RE.test(req.params.notifId)) return res.status(400).json({ error: 'Notification id is not valid.' });
   try {
-    await db.query('UPDATE notifications SET is_read = TRUE WHERE notification_id = $1', [req.params.notifId]);
+    const session = await requireSession(req, res);
+    if (!session) return;
+    const result = await db.query(
+      'UPDATE notifications SET is_read = TRUE WHERE notification_id = $1 AND user_id = $2',
+      [req.params.notifId, session.user_id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Notification not found.' });
     return res.status(200).json({ success: true });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to mark notification read.', detail: error.message });
@@ -1302,6 +1579,8 @@ app.post('/api/v1/allocations', async (req, res) => {
     }
     const userRow = await db.query('SELECT user_id, full_name FROM users WHERE user_id = $1', [userId]);
     if (!userRow.rows[0]) return res.status(404).json({ error: 'Target user not found.' });
+    const projectRow = await db.query('SELECT 1 FROM projects WHERE project_code = $1', [projectCode]);
+    if (projectRow.rows.length === 0) return res.status(404).json({ error: 'Project code not found.' });
 
     const result = await db.query(
       `INSERT INTO hour_allocations (
@@ -1374,8 +1653,9 @@ app.get('/api/v1/allocations/history-account-manager', async (req, res) => {
 
 app.patch('/api/v1/allocations/:allocationId/account-manager-review', async (req, res) => {
   const { allocationId } = req.params;
-  const { reviewerId, action } = req.body;
+  const { reviewerId, action, reviewerRemarks } = req.body;
   const normalizedAction = String(action || '').toUpperCase();
+  const remarks = String(reviewerRemarks || '').trim() || null;
 
   if (!reviewerId || !['APPROVED', 'REJECTED'].includes(normalizedAction)) {
     return res.status(400).json({ error: 'reviewerId and valid action (APPROVED/REJECTED) are required.' });
@@ -1391,17 +1671,24 @@ app.patch('/api/v1/allocations/:allocationId/account-manager-review', async (req
       return res.status(403).json({ error: 'Only account managers can review allocation submissions.' });
     }
 
+    // Only a PENDING allocation can be reviewed; an approved or rejected one used to be
+    // flippable here with no record of the change.
     const updated = await db.query(
       `UPDATE hour_allocations
        SET account_manager_status = $1,
            account_manager_reviewer_id = $2,
-           account_manager_reviewed_at = CURRENT_TIMESTAMP
-       WHERE allocation_id = $3
+           account_manager_reviewed_at = CURRENT_TIMESTAMP,
+           account_manager_remarks = $4
+       WHERE allocation_id = $3 AND account_manager_status = 'PENDING'
        RETURNING *`,
-      [normalizedAction, reviewerId, allocationId]
+      [normalizedAction, reviewerId, allocationId, remarks]
     );
 
     if (!updated.rows[0]) {
+      const exists = await db.query('SELECT 1 FROM hour_allocations WHERE allocation_id = $1', [allocationId]);
+      if (exists.rows.length > 0) {
+        return res.status(409).json({ error: 'This allocation has already been reviewed.' });
+      }
       return res.status(404).json({ error: 'Allocation request not found.' });
     }
 
@@ -1411,7 +1698,7 @@ app.patch('/api/v1/allocations/:allocationId/account-manager-review', async (req
 
     await db.query(
       'INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)',
-      [row.user_id, `Allocation ${normalizedAction}`, `${reviewerName} ${statusWord} your allocation for ${row.project_code} (${row.hours_per_week} hrs/week).`]
+      [row.user_id, `Allocation ${normalizedAction}`, `${reviewerName} ${statusWord} your allocation for ${row.project_code} (${row.hours_per_week} hrs/week).${remarks ? ` Remark: ${remarks}` : ''}`]
     );
 
     if (row.allocated_by) {
@@ -1563,6 +1850,16 @@ app.get('/api/v1/auth/verify-session', async (req, res) => {
       [userId]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'User not found.' });
+    // A tab that sends its session token is signed out once that session is revoked (log out
+    // elsewhere, password change, Sign out on the Profile device list) or has expired. Tabs from
+    // before login sessions existed send no token and keep the old behaviour.
+    const token = bearerToken(req);
+    if (token) {
+      const session = await findAuthSession(token);
+      if (!session || session.user_id !== userId) {
+        return res.status(401).json({ error: 'Your sign-in has ended. Please log in again.', signedOut: true });
+      }
+    }
     const row = result.rows[0];
     const roles = Array.isArray(row.user_roles) && row.user_roles.length > 0
       ? row.user_roles : [row.user_role].filter(Boolean);
@@ -1617,6 +1914,11 @@ app.get('/api/v1/users/:userId/inbox', async (req, res) => {
   const { userId } = req.params;
 
   try {
+    const session = await requireSession(req, res);
+    if (!session) return;
+    if (session.user_id !== userId) {
+      return res.status(403).json({ error: 'You can only see your own inbox.' });
+    }
     const hasBudgetRequestsTable = await tableExists('public.budget_requests');
     const budgetUnion = hasBudgetRequestsTable
       ? `
@@ -1687,7 +1989,7 @@ app.get('/api/v1/leave/my-requests/:userId', async (req, res) => {
 
   try {
     const result = await db.query(
-      `SELECT leave_id, category, start_date, end_date, workflow_status, reviewer_remarks, mc_file_url, created_at
+      `SELECT leave_id, category, start_date, end_date, workflow_status, reviewer_remarks, reason, mc_file_url, created_at
        FROM leave_applications
        WHERE user_id = $1
        ORDER BY created_at DESC`,
@@ -2032,7 +2334,7 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
     const { clippedHours, ratio } = await clipOverlappingHours(
       userId, logCheck.rows[0].project_code, clockIn.toISOString(), currentOut.toISOString(), attendanceId
     );
-    const outHour = currentOut.getHours();
+    const outHour = sgtHourOf(currentOut);
     const crossesLunch = sessionOverlapsSgtLunch(clockIn, currentOut);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(clippedHours - 1, 0) : Math.max(clippedHours, 0)) * 100) / 100;
     const otHoursAccrued = clippedHours > 9.5 && outHour >= 18 ? Math.round((clippedHours - 9.5) * 100) / 100 : 0;
@@ -2170,7 +2472,7 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
     // Unlike live clock-out, a Manual Entry always credits exactly what was entered — no
     // overlap-deduplication against other sessions. It's a deliberate, precise record the staff
     // member is entering by hand, not a live timer that could double-count a forgotten clock-out.
-    const outHour = end.getHours();
+    const outHour = sgtHourOf(end);
     const crossesLunch = sessionOverlapsSgtLunch(start, end);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(actualDurationHours - 1, 0) : Math.max(actualDurationHours, 0)) * 100) / 100;
     const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
@@ -2256,7 +2558,7 @@ app.patch('/api/v1/attendance/:attendanceId/edit-times', async (req, res) => {
     }
 
     const actualDurationHours = (end.getTime() - start.getTime()) / 3600000;
-    const outHour = end.getHours();
+    const outHour = sgtHourOf(end);
     const crossesLunch = sessionOverlapsSgtLunch(start, end);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(actualDurationHours - 1, 0) : Math.max(actualDurationHours, 0)) * 100) / 100;
     const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
@@ -2359,7 +2661,7 @@ app.delete('/api/v1/attendance/:attendanceId', async (req, res) => {
   }
   try {
     const existing = await db.query(
-      'SELECT attendance_id, clock_out_time FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2',
+      'SELECT * FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2',
       [attendanceId, userId]
     );
     if (existing.rows.length === 0) {
@@ -2368,7 +2670,10 @@ app.delete('/api/v1/attendance/:attendanceId', async (req, res) => {
     if (!existing.rows[0].clock_out_time) {
       return res.status(400).json({ error: 'This session is still active — clock it out before deleting it.' });
     }
+    // The delete cascades to the entry's project blocks, so keep them in the audit snapshot too.
+    const blocks = await db.query('SELECT * FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC', [attendanceId]);
     await db.query('DELETE FROM attendance_logs WHERE attendance_id = $1', [attendanceId]);
+    await auditInterceptor('attendance_logs', attendanceId, userId, { ...existing.rows[0], allocations: blocks.rows }, null);
     res.status(200).json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete attendance entry.', detail: error.message });
@@ -2782,7 +3087,9 @@ app.delete('/api/v1/attendance/allocations/:allocationId', async (req, res) => {
       return res.status(400).json({ error: 'Can\'t delete the only project on this entry.' });
     }
 
+    const deletedBlock = await db.query('SELECT * FROM attendance_allocations WHERE allocation_id = $1', [allocationId]);
     await db.query('DELETE FROM attendance_allocations WHERE allocation_id = $1', [allocationId]);
+    await auditInterceptor('attendance_allocations', allocationId, userId, deletedBlock.rows[0], null);
 
     const remaining = await db.query(
       `SELECT allocation_id, allocated_hours, status FROM attendance_allocations WHERE attendance_id = $1 ORDER BY seq ASC`,
@@ -3130,7 +3437,7 @@ app.post('/api/v1/projects/budget-request', async (req, res) => {
 // ========================================================================
 app.patch('/api/v1/projects/budget-request/:requestId', async (req, res, next) => {
   const { requestId } = req.params;
-  if (requestId === 'review' || requestId === 'am-review') return next();
+  if (requestId === 'review' || requestId === 'am-review' || requestId === 'undo-review') return next();
   const { userId, requestedHours, justification } = req.body;
   const requestedNumber = parseFloat(requestedHours);
 
@@ -3162,7 +3469,7 @@ app.patch('/api/v1/projects/budget-request/:requestId', async (req, res, next) =
 
 app.delete('/api/v1/projects/budget-request/:requestId', async (req, res, next) => {
   const { requestId } = req.params;
-  if (requestId === 'review' || requestId === 'am-review') return next();
+  if (requestId === 'review' || requestId === 'am-review' || requestId === 'undo-review') return next();
   const { userId } = req.body;
 
   try {
@@ -3202,7 +3509,7 @@ app.get('/api/v1/manager/:supervisorId/leave-all', async (req, res) => {
        FROM leave_applications la
        JOIN users u ON la.user_id = u.user_id
        LEFT JOIN users r ON r.user_id = la.reviewed_by
-       WHERE (u.supervisor_id = $1 OR la.workflow_status != 'PENDING')
+       WHERE u.supervisor_id = $1
          AND la.workflow_status != 'PENDING'
        ORDER BY la.created_at DESC`,
       [supervisorId]
@@ -3248,8 +3555,24 @@ app.post('/api/v1/leave/apply', async (req, res) => {
   if (!validCategories.includes(category?.toUpperCase())) {
     return res.status(400).json({ error: "Invalid category. Must be 'ANNUAL', 'EMERGENCY', or 'SICK'." });
   }
+  // Required fields: without these the request used to save a leave with no owner, or crash
+  // with a 500 on an empty date.
+  if (!userId || !UUID_RE.test(String(userId))) {
+    return res.status(400).json({ error: 'userId is required.' });
+  }
+  const isRealDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || '')) && !Number.isNaN(new Date(`${d}T00:00:00Z`).getTime())
+    && new Date(`${d}T00:00:00Z`).toISOString().slice(0, 10) === d;
+  if (!isRealDate(startDate) || !isRealDate(endDate)) {
+    return res.status(400).json({ error: 'Please select a start and end date.' });
+  }
+  if (endDate < startDate) {
+    return res.status(400).json({ error: 'The end date cannot be before the start date.' });
+  }
 
   try {
+    const applicant = await db.query('SELECT 1 FROM users WHERE user_id = $1', [userId]);
+    if (applicant.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+
     const leaveStartTimestamp = new Date(startDate);
     const currentTimestamp = new Date();
     const hoursPastStart = (currentTimestamp.getTime() - leaveStartTimestamp.getTime()) / (1000 * 60 * 60);
@@ -3311,10 +3634,23 @@ app.patch('/api/v1/leave/re-review', async (req, res) => {
     return res.status(400).json({ error: 'Invalid action. Must be APPROVED or REJECTED.' });
   }
   try {
-    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
+    const reviewerProfile = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1', [reviewerId]);
     if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
     const role = normalizeRole(reviewerProfile.rows[0].user_role);
     if (role === 'staff') return res.status(403).json({ error: 'Staff users cannot review leave.' });
+    // Only the applicant's own manager (or HR/admin) may change a past decision — previously any
+    // non-staff user could override any team's leave from their History tab.
+    const isHrReviewer = Boolean(reviewerProfile.rows[0].is_admin) || userHasRole(reviewerProfile.rows[0], 'hr');
+    if (!isHrReviewer) {
+      const ownership = await db.query(
+        `SELECT 1 FROM leave_applications la JOIN users u ON u.user_id = la.user_id
+         WHERE la.leave_id = $1 AND u.supervisor_id = $2`,
+        [leaveId, reviewerId]
+      );
+      if (ownership.rows.length === 0) {
+        return res.status(403).json({ error: 'This leave request does not belong to a member of your team.' });
+      }
+    }
     const beforeLeave = await db.query('SELECT * FROM leave_applications WHERE leave_id = $1', [leaveId]);
     const result = await db.query(
       `UPDATE leave_applications SET workflow_status = $1, reviewer_remarks = $2, reviewed_by = $3, updated_at = CURRENT_TIMESTAMP WHERE leave_id = $4 RETURNING *`,
@@ -3334,10 +3670,51 @@ app.patch('/api/v1/leave/re-review', async (req, res) => {
   }
 });
 
+// PATCH /api/v1/leave/undo-review - the Undo on the manager's toast. Puts a decision the same
+// manager made in the last 10 minutes back to PENDING, so it can be decided again. (Undo used to
+// call /leave/review with the opposite action, which only works on PENDING requests, so it failed.)
+const UNDO_REVIEW_WINDOW_MINUTES = 10;
+app.patch('/api/v1/leave/undo-review', async (req, res) => {
+  const { leaveId, reviewerId } = req.body;
+  if (!leaveId || !reviewerId) return res.status(400).json({ error: 'leaveId and reviewerId are required.' });
+  try {
+    const before = await db.query(
+      `SELECT la.* FROM leave_applications la JOIN users u ON u.user_id = la.user_id
+       WHERE la.leave_id = $1 AND u.supervisor_id = $2`,
+      [leaveId, reviewerId]
+    );
+    if (!before.rows[0]) return res.status(403).json({ error: 'This leave request does not belong to a member of your team.' });
+    const result = await db.query(
+      `UPDATE leave_applications
+       SET workflow_status = 'PENDING', reviewer_remarks = NULL, reviewed_by = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE leave_id = $1 AND reviewed_by = $2 AND workflow_status IN ('APPROVED', 'REJECTED')
+         AND updated_at > CURRENT_TIMESTAMP - make_interval(mins => $3)
+       RETURNING *`,
+      [leaveId, reviewerId, UNDO_REVIEW_WINDOW_MINUTES]
+    );
+    const updated = result.rows[0];
+    if (!updated) {
+      return res.status(409).json({ error: 'This decision can no longer be undone. Use History to change it instead.' });
+    }
+    await auditInterceptor('leave_applications', leaveId, reviewerId, before.rows[0], updated);
+    try {
+      const notifTitle = 'Leave Decision Withdrawn';
+      const notifBody = `${updated.category} • ${formatDateDMY(updated.start_date)} → ${formatDateDMY(updated.end_date)} • Back to pending manager review.`;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updated.user_id, notifTitle, notifBody]);
+      await sendPushToUser(updated.user_id, notifTitle, notifBody);
+    } catch (_) {}
+    return res.status(200).json({ success: true, data: updated });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to undo the decision.', detail: error.message });
+  }
+});
+
 app.patch('/api/v1/leave/review', async (req, res) => {
   const { leaveId, reviewerId, action, reviewerRemarks } = req.body;
 
-  const approvedActions = ['APPROVED', 'REJECTED', 'FORWARD_TO_ACCOUNT_MANAGER'];
+  // FORWARD_TO_ACCOUNT_MANAGER used to be accepted here, but the leave status type in the database
+  // has no such value, so it crashed with a 500. No portal sends it; leave goes manager-only.
+  const approvedActions = ['APPROVED', 'REJECTED'];
   if (!approvedActions.includes(action?.toUpperCase())) {
     return res.status(400).json({ error: "Invalid review action." });
   }
@@ -3504,13 +3881,14 @@ app.delete('/api/v1/leave/:leaveId', async (req, res) => {
     const result = await db.query(
       `DELETE FROM leave_applications
        WHERE leave_id = $1 AND user_id = $2 AND workflow_status = 'PENDING'
-       RETURNING leave_id, user_id, category, start_date, end_date`,
+       RETURNING *`,
       [leaveId, userId]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Leave request not found or it is not eligible for cancellation.' });
     }
+    await auditInterceptor('leave_applications', leaveId, userId, result.rows[0], null);
 
     try {
       const cancelled = result.rows[0];
@@ -3518,7 +3896,8 @@ app.delete('/api/v1/leave/:leaveId', async (req, res) => {
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, 'Leave Request Deleted', message]);
     } catch (_) {}
 
-    return res.status(200).json({ success: true, data: result.rows[0] });
+    const { leave_id, user_id, category, start_date, end_date } = result.rows[0];
+    return res.status(200).json({ success: true, data: { leave_id, user_id, category, start_date, end_date } });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to delete leave application.', detail: error.message });
   }
@@ -3662,7 +4041,7 @@ app.delete('/api/v1/projects/progress-log/:logId', async (req, res) => {
   const { userId } = req.body;
 
   try {
-    const existing = await db.query('SELECT reporter_id, progress_summary FROM project_progress_logs WHERE log_id = $1', [logId]);
+    const existing = await db.query('SELECT * FROM project_progress_logs WHERE log_id = $1', [logId]);
     if (existing.rows.length === 0) {
       return res.status(404).json({ error: 'Progress log entry not found.' });
     }
@@ -3674,6 +4053,7 @@ app.delete('/api/v1/projects/progress-log/:logId', async (req, res) => {
     }
 
     await db.query('DELETE FROM project_progress_logs WHERE log_id = $1', [logId]);
+    await auditInterceptor('project_progress_logs', logId, userId, existing.rows[0], null);
     res.status(200).json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete progress entry.', detail: error.message });
@@ -3914,6 +4294,11 @@ app.post('/api/v1/projects/create', async (req, res) => {
     const amIds = Array.isArray(accountManagerIds) ? accountManagerIds : [];
     const mgrIds = Array.isArray(managerIds) ? managerIds : [];
 
+    const existing = await db.query('SELECT 1 FROM projects WHERE project_code = $1', [code]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: `Project code ${code} already exists.` });
+    }
+
     const insertResult = await db.query(
       `INSERT INTO projects (project_code, project_name, budget_hours, total_tracked_hours, start_date, end_date, created_at)
        VALUES ($1, $2, $3, 0.00, $4, $5, CURRENT_TIMESTAMP)
@@ -3983,19 +4368,32 @@ app.delete('/api/v1/projects/:projectCode', async (req, res) => {
     if (editorCheck.rows.length === 0 || !userIsManagerial(editorCheck.rows[0])) {
       return res.status(403).json({ error: 'Access Denied.' });
     }
-    await db.query('DELETE FROM projects WHERE project_code = $1', [projectCode.toUpperCase().trim()]);
-    res.status(200).json({ success: true, message: `Project ${projectCode} deleted.` });
+    const code = projectCode.toUpperCase().trim();
+    const before = await db.query('SELECT * FROM projects WHERE project_code = $1', [code]);
+    if (before.rows.length === 0) return res.status(404).json({ error: 'Project not found.' });
+    await db.query('DELETE FROM projects WHERE project_code = $1', [code]);
+    await auditInterceptor('projects', code, editorId, before.rows[0], null);
+    res.status(200).json({ success: true, message: `Project ${code} deleted.` });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete project.', detail: error.message });
   }
 });
 
-// FETCH ALL PENDING BUDGET REQUESTS
+// FETCH ALL PENDING BUDGET REQUESTS. With ?reviewerId=, only the projects that manager manages
+// (HR / admin still see all), so the Manager portal lists only requests it is allowed to review.
 app.get('/api/v1/projects/budget-requests', async (req, res) => {
+  const { reviewerId } = req.query;
   try {
     const hasBudgetRequestsTable = await tableExists('public.budget_requests');
     if (!hasBudgetRequestsTable) {
       return res.status(200).json({ success: true, data: [] });
+    }
+
+    let scopeToManager = false;
+    if (reviewerId) {
+      const reviewer = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1', [reviewerId]);
+      if (reviewer.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
+      scopeToManager = !userIsHrOrAdmin(reviewer.rows[0]);
     }
 
     const result = await db.query(
@@ -4004,7 +4402,9 @@ app.get('/api/v1/projects/budget-requests', async (req, res) => {
        JOIN projects p ON br.project_code = p.project_code
        LEFT JOIN users u ON u.user_id = br.user_id
        WHERE br.status = 'PENDING'
-       ORDER BY br.created_at ASC`
+         ${scopeToManager ? 'AND $1::uuid = ANY(p.manager_ids::uuid[])' : ''}
+       ORDER BY br.created_at ASC`,
+      scopeToManager ? [reviewerId] : []
     );
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
@@ -4063,15 +4463,29 @@ app.get('/api/v1/projects/budget-requests/history', async (req, res) => {
 app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
   const { requestId, reviewerId, action } = req.body;
 
-  const validActions = ['MANAGER_APPROVED', 'REJECTED', 'REFER_TO_AM'];
+  // REFER_TO_AM used to be accepted here, but nothing listed or acted on a referred request,
+  // so it went nowhere. A manager who approves already hands the request to the Account Manager.
+  const validActions = ['MANAGER_APPROVED', 'REJECTED'];
   if (!validActions.includes(action?.toUpperCase())) {
     return res.status(400).json({ error: "Invalid action. Must be MANAGER_APPROVED or REJECTED." });
+  }
+  if (!requestId || !reviewerId) {
+    return res.status(400).json({ error: 'requestId and reviewerId are required.' });
   }
 
   try {
     const hasBudgetRequestsTable = await tableExists('public.budget_requests');
     if (!hasBudgetRequestsTable) {
       return res.status(503).json({ error: 'budget_requests table is not initialized in this environment.' });
+    }
+
+    const reviewer = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1', [reviewerId]);
+    if (reviewer.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
+    const requestRow = await db.query('SELECT project_code FROM budget_requests WHERE request_id = $1', [requestId]);
+    if (requestRow.rows.length === 0) return res.status(404).json({ error: "Request not found or already processed." });
+    const requestProject = requestRow.rows[0].project_code;
+    if (!userIsHrOrAdmin(reviewer.rows[0]) && !(await isProjectManagerOf(reviewerId, requestProject))) {
+      return res.status(403).json({ error: `Only a manager of project ${requestProject} can review this budget request.` });
     }
 
     // A project without an Account Manager has no one to hand the second approval step to —
@@ -4081,16 +4495,13 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
     let finalAction = action.toUpperCase();
     let projectHasAM = true;
     if (finalAction === 'MANAGER_APPROVED') {
-      const pending = await db.query('SELECT project_code FROM budget_requests WHERE request_id = $1', [requestId]);
-      if (pending.rows.length > 0) {
-        const proj = await db.query(
-          'SELECT account_manager_id, account_manager_ids FROM projects WHERE project_code = $1',
-          [pending.rows[0].project_code]
-        );
-        const amIds = proj.rows[0]?.account_manager_ids || [];
-        projectHasAM = Boolean(proj.rows[0]?.account_manager_id) || amIds.length > 0;
-        if (!projectHasAM) finalAction = 'APPROVED';
-      }
+      const proj = await db.query(
+        'SELECT account_manager_id, account_manager_ids FROM projects WHERE project_code = $1',
+        [requestProject]
+      );
+      const amIds = proj.rows[0]?.account_manager_ids || [];
+      projectHasAM = Boolean(proj.rows[0]?.account_manager_id) || amIds.length > 0;
+      if (!projectHasAM) finalAction = 'APPROVED';
     }
 
     const beforeBudgetRequest = await db.query('SELECT * FROM budget_requests WHERE request_id = $1', [requestId]);
@@ -4141,23 +4552,92 @@ app.patch('/api/v1/projects/budget-request/review', async (req, res) => {
   }
 });
 
+// PATCH /api/v1/projects/budget-request/undo-review - the Undo on the manager's toast. Puts a
+// decision the same manager made in the last 10 minutes back to PENDING. (Undo used to call
+// /review with the opposite action, which only works on PENDING requests, so it failed.) A
+// MANAGER_APPROVED request can't be undone once the Account Manager has decided it, because its
+// status has moved on. A manager approval that was final (project with no Account Manager) also
+// takes the added hours back off the project budget and the requester's allocation.
+app.patch('/api/v1/projects/budget-request/undo-review', async (req, res) => {
+  const { requestId, reviewerId } = req.body;
+  if (!requestId || !reviewerId) return res.status(400).json({ error: 'requestId and reviewerId are required.' });
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    const before = await client.query(
+      `SELECT * FROM budget_requests
+       WHERE request_id = $1 AND reviewed_by = $2 AND status IN ('MANAGER_APPROVED', 'APPROVED', 'REJECTED')
+         AND reviewed_at > CURRENT_TIMESTAMP - make_interval(mins => $3)
+       FOR UPDATE`,
+      [requestId, reviewerId, UNDO_REVIEW_WINDOW_MINUTES]
+    );
+    const row = before.rows[0];
+    if (!row) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'This decision can no longer be undone.' });
+    }
+    if (row.status === 'APPROVED') {
+      await client.query('UPDATE projects SET budget_hours = budget_hours - $1 WHERE project_code = $2', [row.requested_hours, row.project_code]);
+      await client.query(
+        `UPDATE hour_allocations SET hours_per_week = hours_per_week - $1
+         WHERE user_id = $2 AND project_code = $3 AND account_manager_status = 'APPROVED'`,
+        [row.requested_hours, row.user_id, row.project_code]
+      );
+    }
+    const result = await client.query(
+      `UPDATE budget_requests SET status = 'PENDING', reviewed_by = NULL, reviewed_at = NULL, reviewer_remarks = NULL
+       WHERE request_id = $1 RETURNING *`,
+      [requestId]
+    );
+    await client.query('COMMIT');
+    const updated = result.rows[0];
+    await auditInterceptor('budget_requests', requestId, reviewerId, row, updated);
+    try {
+      const notifTitle = 'Budget Decision Withdrawn';
+      const notifBody = `Your request for additional hours of ${updated.requested_hours}hrs for project ${updated.project_code} is back to pending manager review.`;
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updated.user_id, notifTitle, notifBody]);
+      await sendPushToUser(updated.user_id, notifTitle, notifBody);
+    } catch (_) {}
+    return res.status(200).json({ success: true, data: updated });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    return res.status(500).json({ error: 'Failed to undo the decision.', detail: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // GET budget requests pending Account Manager final approval — normally status = MANAGER_APPROVED
 // (the manager already reviewed it), but also includes a still-PENDING request on a project that
 // has no manager to review it, mirroring the "only one approver exists" logic in am-review.
+// REFER_TO_AM rows (an action the manager review no longer accepts) are listed with
+// MANAGER_APPROVED so any left from before can still be finished. With ?reviewerId=, only that
+// Account Manager's projects (HR / admin still see all).
 app.get('/api/v1/projects/budget-requests/pending-am', async (req, res) => {
+  const { reviewerId } = req.query;
   try {
     const hasBudgetRequestsTable = await tableExists('public.budget_requests');
     if (!hasBudgetRequestsTable) {
       return res.status(200).json({ success: true, data: [] });
     }
+
+    let scopeToAm = false;
+    if (reviewerId) {
+      const reviewer = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1', [reviewerId]);
+      if (reviewer.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
+      scopeToAm = !userIsHrOrAdmin(reviewer.rows[0]);
+    }
+
     const result = await db.query(
       `SELECT br.*, p.project_name, u.full_name AS requester_name, u.email AS requester_email
        FROM budget_requests br
        JOIN projects p ON br.project_code = p.project_code
        LEFT JOIN users u ON u.user_id = br.user_id
-       WHERE br.status = 'MANAGER_APPROVED'
-          OR (br.status = 'PENDING' AND (p.manager_ids IS NULL OR array_length(p.manager_ids, 1) IS NULL))
-       ORDER BY br.created_at ASC`
+       WHERE (br.status IN ('MANAGER_APPROVED', 'REFER_TO_AM')
+          OR (br.status = 'PENDING' AND (p.manager_ids IS NULL OR array_length(p.manager_ids, 1) IS NULL)))
+         ${scopeToAm ? 'AND (p.account_manager_id = $1::uuid OR $1::uuid = ANY(p.account_manager_ids::uuid[]))' : ''}
+       ORDER BY br.created_at ASC`,
+      scopeToAm ? [reviewerId] : []
     );
     res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
@@ -4182,10 +4662,12 @@ app.patch('/api/v1/hr/update-user-roles', async (req, res) => {
   const primaryRole = PRIORITY.find((r) => cleaned.includes(r)) || cleaned[0];
   try {
     const resolvedPrimary = await getDefaultUserRole(primaryRole);
-    await db.query(
+    const changed = await db.query(
       'UPDATE users SET user_role = $1, user_roles = $2 WHERE user_id = $3',
       [resolvedPrimary, cleaned, userId]
     );
+    if (changed.rowCount === 0) return res.status(404).json({ error: 'User not found.' });
+    await revokeUserSessions(userId);
     const updated = await db.query(
       'SELECT user_id, full_name, email, user_role, user_roles, account_status FROM users WHERE user_id = $1 LIMIT 1',
       [userId]
@@ -4436,9 +4918,11 @@ app.post('/api/v1/hr/public-holidays/bulk', async (req, res) => {
     return res.status(400).json({ error: 'holidays must be a non-empty array.' });
   }
   try {
+    // Rows without a date or a name are skipped and counted, so the portal can say how many.
     const saved = [];
+    let skipped = 0;
     for (const h of holidays) {
-      if (!h.holiday_date || !h.name || !String(h.name).trim()) continue;
+      if (!h.holiday_date || !h.name || !String(h.name).trim()) { skipped++; continue; }
       const result = await db.query(
         `INSERT INTO public_holidays (holiday_date, name, updated_by, updated_at)
          VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
@@ -4448,7 +4932,7 @@ app.post('/api/v1/hr/public-holidays/bulk', async (req, res) => {
       );
       saved.push(result.rows[0]);
     }
-    return res.status(200).json({ success: true, data: saved });
+    return res.status(200).json({ success: true, data: saved, skipped });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to save public holidays.', detail: error.message });
   }
@@ -4761,21 +5245,26 @@ app.patch('/api/v1/projects/budget-request/am-review', async (req, res) => {
     return res.status(400).json({ error: "Invalid action. Must be APPROVED or REJECTED." });
   }
   try {
-    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
+    const reviewerProfile = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1', [reviewerId]);
     if (reviewerProfile.rows.length === 0) return res.status(404).json({ error: 'Reviewer not found.' });
     if (!userHasRole(reviewerProfile.rows[0], 'account_manager')) return res.status(403).json({ error: 'Only Account Managers can perform final budget approval.' });
 
     const beforeBudgetRequest = await db.query('SELECT * FROM budget_requests WHERE request_id = $1', [requestId]);
     if (beforeBudgetRequest.rows.length === 0) return res.status(404).json({ error: 'Budget request not found.' });
+    const requestProject = beforeBudgetRequest.rows[0].project_code;
 
-    const proj = await db.query('SELECT manager_ids FROM projects WHERE project_code = $1', [beforeBudgetRequest.rows[0].project_code]);
+    if (!userIsHrOrAdmin(reviewerProfile.rows[0]) && !(await isProjectAccountManagerOf(reviewerId, requestProject))) {
+      return res.status(403).json({ error: `Only the Account Manager of project ${requestProject} can give final approval.` });
+    }
+
+    const proj = await db.query('SELECT manager_ids FROM projects WHERE project_code = $1', [requestProject]);
     const projectHasManager = (proj.rows[0]?.manager_ids || []).length > 0;
-    const acceptedSourceStatus = projectHasManager ? 'MANAGER_APPROVED' : 'PENDING';
+    const acceptedSourceStatuses = projectHasManager ? ['MANAGER_APPROVED', 'REFER_TO_AM'] : ['PENDING'];
 
     const result = await db.query(
       `UPDATE budget_requests SET status = $1, reviewed_by = $2, reviewed_at = CURRENT_TIMESTAMP
-       WHERE request_id = $3 AND status = $4 RETURNING *`,
-      [action.toUpperCase(), reviewerId, requestId, acceptedSourceStatus]
+       WHERE request_id = $3 AND status = ANY($4) RETURNING *`,
+      [action.toUpperCase(), reviewerId, requestId, acceptedSourceStatuses]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Budget request not found or not awaiting AM approval.' });
 
@@ -5618,6 +6107,71 @@ app.get('/api/v1/admin/audit-logs', async (req, res) => {
   }
 });
 
+// HR Portal > Audit Log: read-only, filterable, paginated view of audit_logs. Each row is
+// resolved to the person who made the change ("changed by") and, where the record belongs to
+// someone, the person it belongs to ("affected"). Allocation snapshots carry no user_id, so
+// those are traced through their attendance entry; project changes have no affected person.
+const AUDIT_TABLES = ['attendance_logs', 'attendance_allocations', 'leave_applications', 'project_progress_logs', 'budget_requests', 'projects', 'users'];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+app.get('/api/v1/hr/audit-logs', async (req, res) => {
+  const { requesterId, from, to, tableName, alteredBy, subjectUserId } = req.query;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  const isoDate = /^\d{4}-\d{2}-\d{2}$/;
+  if ((from && !isoDate.test(from)) || (to && !isoDate.test(to)) || (from && to && from > to)) {
+    return res.status(400).json({ error: 'from and to must be YYYY-MM-DD dates, with from on or before to.' });
+  }
+  if (tableName && !AUDIT_TABLES.includes(tableName)) {
+    return res.status(400).json({ error: 'Unknown record type.' });
+  }
+  if ((alteredBy && !UUID_RE.test(alteredBy)) || (subjectUserId && !UUID_RE.test(subjectUserId))) {
+    return res.status(400).json({ error: 'Invalid user filter.' });
+  }
+  const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 20, 1), 100);
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  try {
+    const result = await db.query(
+      `WITH a AS (
+         SELECT l.*,
+           CASE l.table_name
+             WHEN 'users' THEN l.record_id
+             WHEN 'projects' THEN NULL
+             WHEN 'project_progress_logs' THEN COALESCE(l.post_value->>'reporter_id', l.pre_value->>'reporter_id')
+             -- Only the entry's owner can edit its blocks, so fall back to the editor once the
+             -- entry itself has been deleted.
+             WHEN 'attendance_allocations' THEN COALESCE((
+               SELECT al.user_id::text FROM attendance_logs al
+               WHERE al.attendance_id::text = COALESCE(l.post_value->>'attendance_id', l.pre_value->>'attendance_id')),
+               l.altered_by::text)
+             ELSE COALESCE(l.post_value->>'user_id', l.pre_value->>'user_id')
+           END AS subject_user_id
+         FROM audit_logs l
+       )
+       SELECT a.audit_id, a.table_name, a.record_id, a.altered_by, a.pre_value, a.post_value, a.created_at,
+              a.subject_user_id, ab.full_name AS altered_by_name, su.full_name AS subject_name,
+              COUNT(*) OVER() AS total_count
+       FROM a
+       LEFT JOIN users ab ON ab.user_id::text = a.altered_by::text
+       LEFT JOIN users su ON su.user_id::text = a.subject_user_id
+       WHERE ($1::date IS NULL OR (a.created_at AT TIME ZONE 'Asia/Singapore')::date >= $1::date)
+         AND ($2::date IS NULL OR (a.created_at AT TIME ZONE 'Asia/Singapore')::date <= $2::date)
+         AND ($3::text IS NULL OR a.table_name = $3)
+         AND ($4::text IS NULL OR a.altered_by::text = $4)
+         AND ($5::text IS NULL OR a.subject_user_id = $5)
+       ORDER BY a.created_at DESC, a.audit_id DESC
+       LIMIT $6 OFFSET $7`,
+      [from || null, to || null, tableName || null, alteredBy ? alteredBy.toLowerCase() : null, subjectUserId ? subjectUserId.toLowerCase() : null, pageSize, (page - 1) * pageSize]
+    );
+    const total = result.rows.length ? Number(result.rows[0].total_count) : 0;
+    return res.status(200).json({
+      success: true,
+      data: result.rows.map(({ total_count, ...row }) => row),
+      pagination: { page, pageSize, total },
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch audit logs.', detail: error.message });
+  }
+});
+
 // ========================================================================
 // SERVER-SIDE BACKSTOP: force clock-out any session that's gone 4+ hours since its last
 // confirmation (Continue press, or clock-in if never confirmed) — independent of whether
@@ -5636,6 +6190,11 @@ function sgtNowServer() {
   // comment in AttendanceReminders.js for why only the UTC getters on the result are valid.
   const now = new Date();
   return new Date(now.getTime() + 8 * 60 * 60 * 1000);
+}
+// Hour of day (0-23) in SGT for any instant. Overtime used to read Date#getHours(), which is the
+// server's own time zone — UTC on Render — so "clock-out at 18:00 or later" was really 2am SGT.
+function sgtHourOf(instant) {
+  return new Date(new Date(instant).getTime() + 8 * 60 * 60 * 1000).getUTCHours();
 }
 function isSgtLunchWindow(sgt) {
   const hourDecimal = sgt.getUTCHours() + sgt.getUTCMinutes() / 60;
