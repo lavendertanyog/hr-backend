@@ -776,16 +776,23 @@ app.post('/api/v1/auth/signup', async (req, res) => {
     };
     const origin = (portalUrl || PORTAL_URL_BY_ROLE[signupRole] || STAFF_PORTAL_URL).replace(/\/$/, '');
     const verifyUrl = `${origin}/verify-email?token=${verifyToken}`;
+    // A failed send must not look like success: the account exists either way, so report it and the
+    // portal offers the user a Resend button and the HR contact instead of "check your email".
+    let emailSent = true;
     try {
       await sendVerificationEmail(normalized, verifyUrl);
     } catch (emailError) {
+      emailSent = false;
       console.error('[signup] verification email failed for', normalized, emailError);
     }
 
     return res.status(201).json({
       success: true,
       unverified: true,
-      message: 'Account created. Check your email for a link to verify your account before signing in.',
+      emailSent,
+      message: emailSent
+        ? 'Account created. Check your email for a link to verify your account before signing in.'
+        : "Account created, but we couldn't send the verification email. Use Resend, or contact HR.",
       data: result.rows[0],
     });
   } catch (error) {
@@ -832,7 +839,18 @@ app.post('/api/v1/auth/resend-verification', async (req, res) => {
     const userRes = await db.query(`SELECT user_id FROM users WHERE LOWER(email) = $1 AND account_status = 'unverified' LIMIT 1`, [normalized]);
     const user = userRes.rows[0];
     // Same generic response regardless of match, so this can't be used to probe accounts.
-    if (user) {
+    // A link was issued in the last 30 seconds: skip quietly (same generic reply) so repeated taps
+    // can't turn this into an email flood.
+    const recent = user
+      ? (await db.query(
+        `SELECT 1 FROM email_verification_tokens
+         WHERE user_id = $1 AND used_at IS NULL AND created_at > CURRENT_TIMESTAMP - INTERVAL '30 seconds' LIMIT 1`,
+        [user.user_id]
+      )).rows.length > 0
+      : false;
+    if (user && recent) {
+      console.log('[resend-verification] skipped, a link was just sent to', normalized);
+    } else if (user) {
       const verifyToken = randomUUID() + randomUUID();
       await db.query(
         `INSERT INTO email_verification_tokens (user_id, token, expires_at) VALUES ($1, $2, CURRENT_TIMESTAMP + INTERVAL '24 hours')`,
