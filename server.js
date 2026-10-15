@@ -524,6 +524,24 @@ async function ensureOperationalTables() {
       sort_order INTEGER NOT NULL DEFAULT 0
     );
   `);
+  // Lines between a receipt's items and its total: service charge, each tax (a receipt can have
+  // more than one, e.g. SST at 6% and 8%, or SST on labour only), rounding, discounts. Amounts are
+  // in the claim's own currency; a DISCOUNT is stored positive and subtracted.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS claim_charges (
+      charge_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      claim_id UUID NOT NULL REFERENCES claims(claim_id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('SERVICE_CHARGE', 'TAX', 'ROUNDING', 'DISCOUNT', 'OTHER')),
+      label TEXT,
+      rate NUMERIC(5,2),
+      amount NUMERIC(10,2) NOT NULL,
+      sort_order INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS claim_charges_claim_idx ON claim_charges (claim_id);`);
+  // true when the item prices already include the tax (e.g. "prices include GST"), so tax lines
+  // are recorded but not added on top of the items.
+  await db.query(`ALTER TABLE claims ADD COLUMN IF NOT EXISTS tax_inclusive BOOLEAN NOT NULL DEFAULT false;`);
   await db.query(`
     CREATE TABLE IF NOT EXISTS claim_scans (
       scan_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -4707,8 +4725,9 @@ app.get('/api/v1/projects/budget-requests/pending-am', async (req, res) => {
 // ROUTE: EXPENSE CLAIMS (receipt scan with Gemini; manager -> HR approval -> paid)
 // ========================================================================
 // Every claim route works from the signed-in session (requireSession), never a userId in the
-// request. Receipt scanning is capped twice: Google AI Studio's project spend cap ($20/month, set
-// in AI Studio) and our own CLAIM_SCAN_MONTHLY_CAP_USD below it, counted from claim_scans. When a
+// request. Receipt scanning is capped twice: the Gemini API's prepaid credit balance (AI Studio
+// billing is prepay; with auto-reload off, scans stop when it runs out) and our own
+// CLAIM_SCAN_MONTHLY_CAP_USD, counted from claim_scans. When a
 // scan can't run (not set up, a cap reached, or Gemini failing) the portal falls back to manual
 // entry, so claims never depend on the scan.
 const CLAIM_CATEGORIES = [
@@ -4723,6 +4742,8 @@ const CLAIM_CATEGORIES = [
   { code: 'OTHERS', label: 'Others' },
 ];
 const CLAIM_CATEGORY_CODES = CLAIM_CATEGORIES.map((c) => c.code);
+const CLAIM_CHARGE_KINDS = ['SERVICE_CHARGE', 'TAX', 'ROUNDING', 'DISCOUNT', 'OTHER'];
+const CLAIM_CHARGE_LABELS = { SERVICE_CHARGE: 'Service charge', TAX: 'Tax', ROUNDING: 'Rounding', DISCOUNT: 'Discount', OTHER: 'Other' };
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite';
 const GEMINI_PRICE_IN_PER_M = Number(process.env.GEMINI_PRICE_IN_PER_M || 0.25);
 const GEMINI_PRICE_OUT_PER_M = Number(process.env.GEMINI_PRICE_OUT_PER_M || 1.5);
@@ -4788,10 +4809,26 @@ function validateClaimInput(body) {
     if (amount !== null && !Number.isFinite(amount)) return { error: `Check the amount for "${description}".` };
     items.push({ description: description.slice(0, 200), quantity, amount: amount === null ? null : roundMoney(amount) });
   }
+  const rawCharges = Array.isArray(body.charges) ? body.charges : [];
+  if (rawCharges.length > 10) return { error: 'A claim can list at most 10 charges and taxes.' };
+  const charges = [];
+  for (const ch of rawCharges) {
+    if (ch?.amount === null || ch?.amount === undefined || ch?.amount === '') continue;
+    const kind = String(ch.kind || '').toUpperCase();
+    if (!CLAIM_CHARGE_KINDS.includes(kind)) return { error: 'Choose a type for each charge or tax line.' };
+    const label = String(ch.label || '').trim().slice(0, 60) || CLAIM_CHARGE_LABELS[kind];
+    const amount = Number(ch.amount);
+    // Rounding can go either way; every other line is entered as the positive amount printed.
+    if (!Number.isFinite(amount) || (kind !== 'ROUNDING' && amount < 0)) return { error: `Check the amount for "${label}".` };
+    const rate = ch.rate === null || ch.rate === undefined || ch.rate === '' ? null : Number(ch.rate);
+    if (rate !== null && (!Number.isFinite(rate) || rate < 0 || rate > 100)) return { error: `Check the rate for "${label}" (0 to 100%).` };
+    charges.push({ kind, label, rate, amount: roundMoney(amount) });
+  }
+  const taxInclusive = body.taxInclusive === true;
   const notes = String(body.notes || '').trim();
   if (notes.length > 1000) return { error: 'Notes are too long (1,000 characters at most).' };
   const projectCode = body.projectCode ? String(body.projectCode).toUpperCase().trim() : null;
-  return { value: { purchaseDate, merchant, category, currency, total: roundMoney(total), items, notes: notes || null, projectCode } };
+  return { value: { purchaseDate, merchant, category, currency, total: roundMoney(total), items, charges, taxInclusive, notes: notes || null, projectCode } };
 }
 
 // A project on a claim must exist, not be deployed, and (for staff) be one they are assigned to.
@@ -4826,11 +4863,13 @@ const CLAIM_LIST_SELECT = `
          c.currency, c.total_amount, c.project_code, p.project_name, c.notes,
          c.manager_reviewed_by, c.manager_reviewed_at, c.manager_remarks,
          c.hr_reviewed_by, c.hr_reviewed_at, c.hr_remarks, c.paid_at::text AS paid_at, c.paid_reference,
-         c.created_at, c.updated_at,
+         c.created_at, c.updated_at, c.tax_inclusive,
          u.full_name AS claimant_name, u.email AS claimant_email,
          mr.full_name AS manager_reviewer_name, hrr.full_name AS hr_reviewer_name,
          COALESCE((SELECT json_agg(json_build_object('description', i.description, 'quantity', i.quantity, 'amount', i.amount) ORDER BY i.sort_order)
-                   FROM claim_items i WHERE i.claim_id = c.claim_id), '[]'::json) AS items
+                   FROM claim_items i WHERE i.claim_id = c.claim_id), '[]'::json) AS items,
+         COALESCE((SELECT json_agg(json_build_object('kind', ch.kind, 'label', ch.label, 'rate', ch.rate, 'amount', ch.amount) ORDER BY ch.sort_order)
+                   FROM claim_charges ch WHERE ch.claim_id = c.claim_id), '[]'::json) AS charges
   FROM claims c
   JOIN users u ON u.user_id = c.user_id
   LEFT JOIN projects p ON p.project_code = c.project_code
@@ -4865,14 +4904,30 @@ async function saveClaimItems(client, claimId, items) {
   }
 }
 
+async function saveClaimCharges(client, claimId, charges) {
+  await client.query('DELETE FROM claim_charges WHERE claim_id = $1', [claimId]);
+  for (let i = 0; i < charges.length; i += 1) {
+    const ch = charges[i];
+    await client.query(
+      'INSERT INTO claim_charges (claim_id, kind, label, rate, amount, sort_order) VALUES ($1, $2, $3, $4, $5, $6)',
+      [claimId, ch.kind, ch.label, ch.rate, ch.amount, i]
+    );
+  }
+}
+
 const RECEIPT_SCAN_PROMPT = [
-  'You read a photo of a receipt for a staff expense claim in Singapore.',
+  'You read a photo of a receipt for a staff expense claim in Singapore or Malaysia.',
   'Extract only what is printed on the receipt. Never guess an amount; use null for anything you cannot read.',
+  '- document_type: RECEIPT for a receipt, tax invoice or invoice; QUOTATION for a quotation, estimate or proforma; OTHER if it is not a bill.',
   '- purchase_date: the date on the receipt as YYYY-MM-DD.',
   '- merchant: the shop, restaurant or company name.',
-  '- currency: ISO 4217 code; use SGD when the receipt shows only "$" with no other currency.',
-  '- items: each line purchased, with its quantity and line amount. Leave out subtotal, GST, service charge, rounding, change and payment lines.',
-  '- tax: the GST amount if printed.',
+  '- currency: ISO 4217 code. "RM" means MYR. Use SGD when the receipt shows only "$" with no other currency.',
+  '- items: each line purchased, with its quantity and line amount. Leave out subtotal, tax, service charge, rounding, discount, change, payment and tax-summary lines.',
+  '- charges: every line between the items and the total that changes the amount, once each:',
+  '  SERVICE_CHARGE for a service charge; TAX for GST, SST, service tax, sales tax or government tax (one line per tax rate);',
+  '  ROUNDING for a rounding adjustment (negative if it lowers the total); DISCOUNT for a discount or voucher (as a positive amount); OTHER for anything else.',
+  '  Give the label as printed and the rate as a percentage when printed. Skip tax summary tables that repeat a tax line already listed.',
+  '- tax_inclusive: true when the item prices already include the tax (for example "prices include GST"), so the tax was not added on top.',
   '- total: the final amount paid.',
   `- category: the best fit from ${CLAIM_CATEGORY_CODES.join(', ')}.`,
   '- readable: false if the photo is not a receipt or the total cannot be read.',
@@ -4883,6 +4938,7 @@ const RECEIPT_SCAN_SCHEMA = {
   type: 'object',
   properties: {
     readable: { type: 'boolean' },
+    document_type: { type: 'string', enum: ['RECEIPT', 'QUOTATION', 'OTHER'] },
     purchase_date: { ...nullable('string'), description: 'YYYY-MM-DD' },
     merchant: nullable('string'),
     currency: nullable('string'),
@@ -4895,10 +4951,23 @@ const RECEIPT_SCAN_SCHEMA = {
         required: ['description', 'quantity', 'amount'],
       },
     },
-    tax: nullable('number'),
+    charges: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', enum: CLAIM_CHARGE_KINDS },
+          label: { type: 'string' },
+          rate: nullable('number'),
+          amount: nullable('number'),
+        },
+        required: ['kind', 'label', 'rate', 'amount'],
+      },
+    },
+    tax_inclusive: { type: 'boolean' },
     total: nullable('number'),
   },
-  required: ['readable', 'purchase_date', 'merchant', 'currency', 'category', 'items', 'tax', 'total'],
+  required: ['readable', 'document_type', 'purchase_date', 'merchant', 'currency', 'category', 'items', 'charges', 'tax_inclusive', 'total'],
 };
 
 // Turns Gemini's JSON into the form fields the portal fills in, dropping anything malformed.
@@ -4916,7 +4985,20 @@ function normalizeReceiptScan(raw) {
     currency,
     category: CLAIM_CATEGORY_CODES.includes(raw?.category) ? raw.category : 'OTHERS',
     items,
-    tax: num(raw?.tax),
+    charges: (Array.isArray(raw?.charges) ? raw.charges : []).slice(0, 10)
+      .filter((ch) => CLAIM_CHARGE_KINDS.includes(ch?.kind) && num(ch?.amount) !== null)
+      .map((ch) => {
+        const rate = num(ch.rate);
+        return {
+          kind: ch.kind,
+          label: String(ch.label || '').trim().slice(0, 60) || CLAIM_CHARGE_LABELS[ch.kind],
+          rate: rate !== null && rate >= 0 && rate <= 100 ? rate : null,
+          // Discounts are kept positive (they're subtracted); only rounding may be negative.
+          amount: ch.kind === 'ROUNDING' ? num(ch.amount) : Math.abs(num(ch.amount)),
+        };
+      }),
+    taxInclusive: raw?.tax_inclusive === true,
+    documentType: ['RECEIPT', 'QUOTATION', 'OTHER'].includes(raw?.document_type) ? raw.document_type : 'RECEIPT',
     totalAmount: num(raw?.total) !== null && num(raw?.total) > 0 ? num(raw.total) : null,
   };
 }
@@ -4994,6 +5076,10 @@ app.post('/api/v1/claims/scan', async (req, res) => {
     if (!fields.readable) {
       return res.status(200).json({ success: true, available: true, scanId, data: fields, message: "This photo doesn't look like a readable receipt. Check the details or retake the photo." });
     }
+    // A quotation or estimate isn't proof of payment; the details are still filled in.
+    if (fields.documentType === 'QUOTATION') {
+      return res.status(200).json({ success: true, available: true, scanId, data: fields, message: 'This looks like a quotation or estimate, not a receipt. Claims need the final receipt or tax invoice, so upload that instead if you have it.' });
+    }
     return res.status(200).json({ success: true, available: true, scanId, data: fields });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to scan the receipt.', detail: error.message });
@@ -5038,15 +5124,16 @@ app.post('/api/v1/claims', async (req, res) => {
     await client.query('BEGIN');
     const inserted = await client.query(
       `INSERT INTO claims (user_id, status, purchase_date, merchant, category, currency, total_amount, project_code,
-                           notes, receipt_image, ai_extraction, manager_remarks)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                           notes, receipt_image, ai_extraction, manager_remarks, tax_inclusive)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING claim_id, status, purchase_date::text AS purchase_date, merchant, currency, total_amount`,
       [session.user_id, status, v.purchaseDate, v.merchant, v.category, v.currency, v.total, v.projectCode,
         v.notes, req.body.receiptImage, aiExtraction ? JSON.stringify(aiExtraction) : null,
-        supervisorId ? null : 'No manager assigned; sent straight to HR.']
+        supervisorId ? null : 'No manager assigned; sent straight to HR.', v.taxInclusive]
     );
     const claim = inserted.rows[0];
     await saveClaimItems(client, claim.claim_id, v.items);
+    await saveClaimCharges(client, claim.claim_id, v.charges);
     await client.query('COMMIT');
 
     await notifyClaimUser(session.user_id, 'Claim Submitted',
@@ -5245,22 +5332,26 @@ app.patch('/api/v1/claims/:claimId', async (req, res) => {
     const projectError = await checkClaimProject(session, v.projectCode);
     if (projectError) return res.status(400).json({ error: projectError });
     const beforeItems = (await db.query('SELECT description, quantity, amount FROM claim_items WHERE claim_id = $1 ORDER BY sort_order', [claimId])).rows;
+    const beforeCharges = (await db.query('SELECT kind, label, rate, amount FROM claim_charges WHERE claim_id = $1 ORDER BY sort_order', [claimId])).rows;
 
     await client.query('BEGIN');
     const updated = await client.query(
       `UPDATE claims SET purchase_date = $2, merchant = $3, category = $4, currency = $5, total_amount = $6,
-              project_code = $7, notes = $8, receipt_image = COALESCE($9, receipt_image), updated_at = CURRENT_TIMESTAMP
+              project_code = $7, notes = $8, receipt_image = COALESCE($9, receipt_image), tax_inclusive = $10,
+              updated_at = CURRENT_TIMESTAMP
        WHERE claim_id = $1 AND status = 'PENDING' RETURNING *`,
-      [claimId, v.purchaseDate, v.merchant, v.category, v.currency, v.total, v.projectCode, v.notes, newImage]
+      [claimId, v.purchaseDate, v.merchant, v.category, v.currency, v.total, v.projectCode, v.notes, newImage, v.taxInclusive]
     );
     if (updated.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'This claim has already been reviewed and can no longer be edited.' });
     }
     await saveClaimItems(client, claimId, v.items);
+    await saveClaimCharges(client, claimId, v.charges);
     await client.query('COMMIT');
-    await auditInterceptor('claims', claimId, session.user_id, claimAuditSnapshot(before, beforeItems),
-      { ...claimAuditSnapshot(updated.rows[0], v.items), receipt_replaced: Boolean(newImage) });
+    await auditInterceptor('claims', claimId, session.user_id,
+      { ...claimAuditSnapshot(before, beforeItems), charges: beforeCharges },
+      { ...claimAuditSnapshot(updated.rows[0], v.items), charges: v.charges, receipt_replaced: Boolean(newImage) });
     return res.status(200).json({ success: true, data: { claim_id: claimId } });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
@@ -5281,9 +5372,10 @@ app.delete('/api/v1/claims/:claimId', async (req, res) => {
     if (before.user_id !== session.user_id) return res.status(403).json({ error: 'You can only delete your own claims.' });
     if (before.status !== 'PENDING') return res.status(400).json({ error: 'This claim has already been reviewed and can no longer be deleted.' });
     const items = (await db.query('SELECT description, quantity, amount FROM claim_items WHERE claim_id = $1 ORDER BY sort_order', [claimId])).rows;
+    const charges = (await db.query('SELECT kind, label, rate, amount FROM claim_charges WHERE claim_id = $1 ORDER BY sort_order', [claimId])).rows;
     const r = await db.query(`DELETE FROM claims WHERE claim_id = $1 AND status = 'PENDING'`, [claimId]);
     if (r.rowCount === 0) return res.status(400).json({ error: 'This claim has already been reviewed and can no longer be deleted.' });
-    await auditInterceptor('claims', claimId, session.user_id, claimAuditSnapshot(before, items), null);
+    await auditInterceptor('claims', claimId, session.user_id, { ...claimAuditSnapshot(before, items), charges }, null);
     return res.status(200).json({ success: true });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to delete the claim.', detail: error.message });

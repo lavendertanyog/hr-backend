@@ -114,12 +114,17 @@ Content-Type: application/json
 Authorization: Bearer <session.token>
 
 {
-  "purchaseDate": "2026-10-12",
-  "merchant": "Kopitiam",
+  "purchaseDate": "2026-10-04",
+  "merchant": "Oracle Symphony (Tropicana) Sdn Bhd",
   "category": "MEALS",
-  "currency": "SGD",
-  "totalAmount": 12.5,
-  "items": [{ "description": "Chicken rice", "quantity": 2, "amount": 9 }],
+  "currency": "MYR",
+  "totalAmount": 70.8,
+  "items": [{ "description": "Head charges (WK) A5", "quantity": 2, "amount": 60 }],
+  "charges": [
+    { "kind": "SERVICE_CHARGE", "label": "Service charge", "rate": 10, "amount": 6 },
+    { "kind": "TAX", "label": "SST 8%", "rate": 8, "amount": 4.8 }
+  ],
+  "taxInclusive": false,
   "receiptImage": "data:image/jpeg;base64,<base64>",
   "scanId": "<scanId from the scan, optional>"
 }
