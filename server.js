@@ -4914,6 +4914,31 @@ async function claimFxFields(v) {
   return { fxRate: fx.rate, fxRateDate: fx.rateDate, fxSource: fx.source, amountBase: roundMoney(v.total * fx.rate) };
 }
 
+// Fills in the exchange rate for unpaid claims that don't have one yet: claims made before rates
+// were added, or while the rate service was down. Runs at startup and hourly. Paid and rejected
+// claims are left as they are.
+async function backfillClaimFxRates() {
+  try {
+    const r = await db.query(
+      `SELECT claim_id, purchase_date::text AS purchase_date, currency, total_amount FROM claims
+       WHERE fx_rate IS NULL AND status NOT IN ('PAID', 'REJECTED') ORDER BY created_at ASC LIMIT 200`
+    );
+    let filled = 0;
+    for (const c of r.rows) {
+      const fx = await claimFxFields({ currency: c.currency, purchaseDate: c.purchase_date, total: Number(c.total_amount) });
+      if (fx.fxRate === null) continue;
+      await db.query(
+        `UPDATE claims SET fx_rate = $2, fx_rate_date = $3, fx_source = $4, amount_base = $5 WHERE claim_id = $1 AND fx_rate IS NULL`,
+        [c.claim_id, fx.fxRate, fx.fxRateDate, fx.fxSource, fx.amountBase]
+      );
+      filled += 1;
+    }
+    if (filled) console.log(`[claims] Filled in the exchange rate for ${filled} claim(s).`);
+  } catch (err) {
+    console.error('[claims] Exchange rate backfill failed:', err.message);
+  }
+}
+
 async function notifyClaimUser(userId, title, body) {
   if (!userId) return;
   try {
@@ -7309,6 +7334,8 @@ ensureOperationalTables()
       finalizeOrphanedBudgetApprovals();
       setInterval(checkClockInEmailReminders, 15 * 60 * 1000);
       checkClockInEmailReminders();
+      setInterval(backfillClaimFxRates, 60 * 60 * 1000);
+      backfillClaimFxRates();
     });
   })
   .catch((error) => {
