@@ -2348,7 +2348,11 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
       }
     }
 
-    const currentOut = clockOutTime ? new Date(clockOutTime) : new Date();
+    // The portal sends the moment the button was pressed, so a delayed or retried request still
+    // records the right time. A time more than 5 minutes ahead of the server (a device clock that
+    // runs fast) is treated as "now" rather than refused or stored in the future.
+    let currentOut = clockOutTime ? new Date(clockOutTime) : new Date();
+    if (clockOutTime && currentOut.getTime() > Date.now() + 5 * 60 * 1000) currentOut = new Date();
     const { clippedHours, ratio } = await clipOverlappingHours(
       userId, logCheck.rows[0].project_code, clockIn.toISOString(), currentOut.toISOString(), attendanceId
     );
