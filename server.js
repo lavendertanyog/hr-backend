@@ -542,6 +542,9 @@ async function ensureOperationalTables() {
   // true when the item prices already include the tax (e.g. "prices include GST"), so tax lines
   // are recorded but not added on top of the items.
   await db.query(`ALTER TABLE claims ADD COLUMN IF NOT EXISTS tax_inclusive BOOLEAN NOT NULL DEFAULT false;`);
+  // true when the claimant was warned that this looked like one of their earlier claims and
+  // submitted it anyway; approvers see it next to the duplicate flag.
+  await db.query(`ALTER TABLE claims ADD COLUMN IF NOT EXISTS duplicate_acknowledged BOOLEAN NOT NULL DEFAULT false;`);
   await db.query(`
     CREATE TABLE IF NOT EXISTS claim_scans (
       scan_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -4856,6 +4859,46 @@ function claimSummary(c) {
   return `${c.merchant}, ${c.currency} ${Number(c.total_amount).toFixed(2)} on ${formatDateDMY(c.purchase_date)}`;
 }
 
+// Two claims look like the same receipt when they have the same purchase date, amount, currency
+// and merchant (compared without case, spaces or punctuation, so "Sdn. Bhd." matches "Sdn Bhd").
+// Rejected claims are ignored.
+const CLAIM_MERCHANT_KEY_SQL = (col) => `regexp_replace(lower(${col}), '[^a-z0-9]', '', 'g')`;
+const CLAIM_SAME_RECEIPT_SQL = (a, b) => `${b}.purchase_date = ${a}.purchase_date AND ${b}.total_amount = ${a}.total_amount
+  AND ${b}.currency = ${a}.currency AND ${CLAIM_MERCHANT_KEY_SQL(`${b}.merchant`)} = ${CLAIM_MERCHANT_KEY_SQL(`${a}.merchant`)}
+  AND ${b}.status <> 'REJECTED'`;
+
+// Adds possible_duplicates to each claim for managers and HR: other claims, by anyone, that look
+// like the same receipt. HR sees every name; a manager sees names only for their own team (and
+// the claimant themselves), otherwise "another employee".
+async function attachClaimDuplicates(rows, viewer) {
+  if (rows.length === 0) return rows;
+  const r = await db.query(
+    `SELECT c.claim_id, d.claim_id AS dup_id, d.user_id AS dup_user_id, d.status AS dup_status,
+            d.created_at AS dup_created_at, u.full_name AS dup_name, u.supervisor_id AS dup_supervisor_id
+     FROM claims c
+     JOIN claims d ON d.claim_id <> c.claim_id AND ${CLAIM_SAME_RECEIPT_SQL('c', 'd')}
+     JOIN users u ON u.user_id = d.user_id
+     WHERE c.claim_id = ANY($1::uuid[])
+     ORDER BY d.created_at ASC`,
+    [rows.map((row) => row.claim_id)]
+  );
+  const byClaim = new Map();
+  for (const d of r.rows) {
+    const claim = rows.find((row) => row.claim_id === d.claim_id);
+    const samePerson = claim && d.dup_user_id === claim.user_id;
+    const showName = viewer.isHr || samePerson || d.dup_supervisor_id === viewer.userId;
+    if (!byClaim.has(d.claim_id)) byClaim.set(d.claim_id, []);
+    byClaim.get(d.claim_id).push({
+      claim_id: d.dup_id,
+      same_person: Boolean(samePerson),
+      claimant_name: showName ? d.dup_name : null,
+      status: d.dup_status,
+      submitted_at: d.dup_created_at,
+    });
+  }
+  return rows.map((row) => ({ ...row, possible_duplicates: byClaim.get(row.claim_id) || [] }));
+}
+
 // Lists never include the receipt photo (it can be hundreds of KB); it is fetched on its own.
 // Dates are cast to text so a DATE isn't shifted a day by the JSON timestamp conversion.
 const CLAIM_LIST_SELECT = `
@@ -4863,7 +4906,7 @@ const CLAIM_LIST_SELECT = `
          c.currency, c.total_amount, c.project_code, p.project_name, c.notes,
          c.manager_reviewed_by, c.manager_reviewed_at, c.manager_remarks,
          c.hr_reviewed_by, c.hr_reviewed_at, c.hr_remarks, c.paid_at::text AS paid_at, c.paid_reference,
-         c.created_at, c.updated_at, c.tax_inclusive,
+         c.created_at, c.updated_at, c.tax_inclusive, c.duplicate_acknowledged,
          u.full_name AS claimant_name, u.email AS claimant_email,
          mr.full_name AS manager_reviewer_name, hrr.full_name AS hr_reviewer_name,
          COALESCE((SELECT json_agg(json_build_object('description', i.description, 'quantity', i.quantity, 'amount', i.amount) ORDER BY i.sort_order)
@@ -5100,15 +5143,16 @@ app.post('/api/v1/claims', async (req, res) => {
     const projectError = await checkClaimProject(session, v.projectCode);
     if (projectError) return res.status(400).json({ error: projectError });
 
-    if (req.body.confirmDuplicate !== true) {
-      const dup = await db.query(
-        `SELECT 1 FROM claims WHERE user_id = $1 AND LOWER(merchant) = LOWER($2) AND purchase_date = $3
-           AND total_amount = $4 AND status <> 'REJECTED' LIMIT 1`,
-        [session.user_id, v.merchant, v.purchaseDate, v.total]
-      );
-      if (dup.rows.length > 0) {
-        return res.status(409).json({ error: `You already have a claim for ${v.merchant}, ${v.currency} ${v.total.toFixed(2)} on ${formatDateDMY(v.purchaseDate)}. Submit it again only if this is a different receipt.`, duplicate: true });
-      }
+    // The claimant is only ever warned about their own earlier claims; matches with other
+    // people's claims are shown to the manager and HR instead.
+    const ownDup = await db.query(
+      `SELECT 1 FROM (SELECT $2::date AS purchase_date, $3::numeric AS total_amount, $4::text AS currency, $5::text AS merchant) n
+       JOIN claims d ON d.user_id = $1 AND ${CLAIM_SAME_RECEIPT_SQL('n', 'd')} LIMIT 1`,
+      [session.user_id, v.purchaseDate, v.total, v.currency, v.merchant]
+    );
+    const duplicateAcknowledged = ownDup.rows.length > 0;
+    if (duplicateAcknowledged && req.body.confirmDuplicate !== true) {
+      return res.status(409).json({ error: `You already have a claim for ${v.merchant}, ${v.currency} ${v.total.toFixed(2)} on ${formatDateDMY(v.purchaseDate)}. Submit it again only if this is a different receipt.`, duplicate: true });
     }
 
     let aiExtraction = null;
@@ -5124,12 +5168,12 @@ app.post('/api/v1/claims', async (req, res) => {
     await client.query('BEGIN');
     const inserted = await client.query(
       `INSERT INTO claims (user_id, status, purchase_date, merchant, category, currency, total_amount, project_code,
-                           notes, receipt_image, ai_extraction, manager_remarks, tax_inclusive)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                           notes, receipt_image, ai_extraction, manager_remarks, tax_inclusive, duplicate_acknowledged)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING claim_id, status, purchase_date::text AS purchase_date, merchant, currency, total_amount`,
       [session.user_id, status, v.purchaseDate, v.merchant, v.category, v.currency, v.total, v.projectCode,
         v.notes, req.body.receiptImage, aiExtraction ? JSON.stringify(aiExtraction) : null,
-        supervisorId ? null : 'No manager assigned; sent straight to HR.', v.taxInclusive]
+        supervisorId ? null : 'No manager assigned; sent straight to HR.', v.taxInclusive, duplicateAcknowledged]
     );
     const claim = inserted.rows[0];
     await saveClaimItems(client, claim.claim_id, v.items);
@@ -5169,7 +5213,7 @@ app.get('/api/v1/claims/manager-pending', async (req, res) => {
       `${CLAIM_LIST_SELECT} WHERE c.status = 'PENDING' AND u.supervisor_id = $1 AND c.user_id <> $1 ORDER BY c.created_at ASC`,
       [session.user_id]
     );
-    return res.status(200).json({ success: true, data: r.rows });
+    return res.status(200).json({ success: true, data: await attachClaimDuplicates(r.rows, { isHr: false, userId: session.user_id }) });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to load claims to review.', detail: error.message });
   }
@@ -5183,7 +5227,7 @@ app.get('/api/v1/claims/manager-history', async (req, res) => {
       `${CLAIM_LIST_SELECT} WHERE c.manager_reviewed_by = $1 ORDER BY c.manager_reviewed_at DESC LIMIT 200`,
       [session.user_id]
     );
-    return res.status(200).json({ success: true, data: r.rows });
+    return res.status(200).json({ success: true, data: await attachClaimDuplicates(r.rows, { isHr: false, userId: session.user_id }) });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to load your claim decisions.', detail: error.message });
   }
@@ -5202,7 +5246,7 @@ app.get('/api/v1/claims/hr-pending', async (req, res) => {
   if (!session || !requireClaimsHr(session, res)) return;
   try {
     const r = await db.query(`${CLAIM_LIST_SELECT} WHERE c.status = 'MANAGER_APPROVED' ORDER BY c.created_at ASC`);
-    return res.status(200).json({ success: true, data: r.rows });
+    return res.status(200).json({ success: true, data: await attachClaimDuplicates(r.rows, { isHr: true, userId: session.user_id }) });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to load claims to approve.', detail: error.message });
   }
@@ -5230,7 +5274,7 @@ app.get('/api/v1/claims/hr-list', async (req, res) => {
       `${CLAIM_LIST_SELECT} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY c.created_at DESC LIMIT 500`,
       params
     );
-    return res.status(200).json({ success: true, data: r.rows });
+    return res.status(200).json({ success: true, data: await attachClaimDuplicates(r.rows, { isHr: true, userId: session.user_id }) });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to load claims.', detail: error.message });
   }
@@ -5251,7 +5295,7 @@ app.get('/api/v1/claims/export', async (req, res) => {
        ORDER BY u.full_name ASC, c.purchase_date ASC`,
       [`${month}-01`]
     );
-    return res.status(200).json({ success: true, data: r.rows });
+    return res.status(200).json({ success: true, data: await attachClaimDuplicates(r.rows, { isHr: true, userId: session.user_id }) });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to export claims.', detail: error.message });
   }
