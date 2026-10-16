@@ -545,6 +545,26 @@ async function ensureOperationalTables() {
   // true when the claimant was warned that this looked like one of their earlier claims and
   // submitted it anyway; approvers see it next to the duplicate flag.
   await db.query(`ALTER TABLE claims ADD COLUMN IF NOT EXISTS duplicate_acknowledged BOOLEAN NOT NULL DEFAULT false;`);
+  // Claims are paid in the company currency (SGD). A claim in another currency keeps its
+  // original amount and also stores the exchange rate for the purchase date, the date that rate
+  // was published (the last business day on or before the purchase), where it came from, and
+  // the amount in the company currency.
+  await db.query(`ALTER TABLE claims ADD COLUMN IF NOT EXISTS fx_rate NUMERIC(14,6);`);
+  await db.query(`ALTER TABLE claims ADD COLUMN IF NOT EXISTS fx_rate_date DATE;`);
+  await db.query(`ALTER TABLE claims ADD COLUMN IF NOT EXISTS fx_source TEXT;`);
+  await db.query(`ALTER TABLE claims ADD COLUMN IF NOT EXISTS amount_base NUMERIC(10,2);`);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS fx_rates (
+      currency TEXT NOT NULL,
+      base TEXT NOT NULL,
+      for_date DATE NOT NULL,
+      rate NUMERIC(14,6) NOT NULL,
+      rate_date DATE NOT NULL,
+      source TEXT NOT NULL,
+      fetched_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (currency, base, for_date)
+    );
+  `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS claim_scans (
       scan_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -4847,6 +4867,53 @@ async function checkClaimProject(session, projectCode) {
   return null;
 }
 
+// ── Exchange rates ──
+// Rates are the European Central Bank's daily reference rates, read through Frankfurter (free, no
+// key). MAS has no public API; to use MAS rates later, replace fetchFxRate and keep the rest.
+// The rate is for the purchase date; for a weekend or holiday it is the last rate published
+// before it, and rate_date records which day that was.
+const COMPANY_CURRENCY = (process.env.COMPANY_CURRENCY || 'SGD').toUpperCase();
+const FX_SOURCE = 'ECB reference rate';
+const FX_TIMEOUT_MS = 8_000;
+
+async function fetchFxRate(currency, date) {
+  const url = `https://api.frankfurter.dev/v1/${date}?base=${encodeURIComponent(currency)}&symbols=${encodeURIComponent(COMPANY_CURRENCY)}`;
+  const response = await fetch(url, { signal: AbortSignal.timeout(FX_TIMEOUT_MS) });
+  if (!response.ok) return null;
+  const body = await response.json();
+  const rate = Number(body?.rates?.[COMPANY_CURRENCY]);
+  if (!Number.isFinite(rate) || rate <= 0 || !isRealYmd(body?.date)) return null;
+  return { rate, rateDate: body.date };
+}
+
+// { rate, rateDate, source } for converting `currency` on `date` into the company currency, or
+// null when no rate can be found (an unknown currency, or the rate service is down).
+async function getFxRate(currency, date) {
+  if (currency === COMPANY_CURRENCY) return { rate: 1, rateDate: date, source: null };
+  const cached = await db.query(
+    'SELECT rate, rate_date::text AS rate_date, source FROM fx_rates WHERE currency = $1 AND base = $2 AND for_date = $3',
+    [currency, COMPANY_CURRENCY, date]
+  );
+  if (cached.rows[0]) return { rate: Number(cached.rows[0].rate), rateDate: cached.rows[0].rate_date, source: cached.rows[0].source };
+  let fetched = null;
+  try { fetched = await fetchFxRate(currency, date); } catch (err) { console.error('[claims] Exchange rate lookup failed:', err.message); }
+  if (!fetched) return null;
+  await db.query(
+    `INSERT INTO fx_rates (currency, base, for_date, rate, rate_date, source) VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (currency, base, for_date) DO NOTHING`,
+    [currency, COMPANY_CURRENCY, date, fetched.rate, fetched.rateDate, FX_SOURCE]
+  );
+  return { rate: fetched.rate, rateDate: fetched.rateDate, source: FX_SOURCE };
+}
+
+// The exchange-rate columns for a validated claim. A claim is never blocked by a missing rate;
+// the fields stay empty and HR sees that no rate was found.
+async function claimFxFields(v) {
+  const fx = await getFxRate(v.currency, v.purchaseDate);
+  if (!fx) return { fxRate: null, fxRateDate: null, fxSource: null, amountBase: null };
+  return { fxRate: fx.rate, fxRateDate: fx.rateDate, fxSource: fx.source, amountBase: roundMoney(v.total * fx.rate) };
+}
+
 async function notifyClaimUser(userId, title, body) {
   if (!userId) return;
   try {
@@ -4907,6 +4974,7 @@ const CLAIM_LIST_SELECT = `
          c.manager_reviewed_by, c.manager_reviewed_at, c.manager_remarks,
          c.hr_reviewed_by, c.hr_reviewed_at, c.hr_remarks, c.paid_at::text AS paid_at, c.paid_reference,
          c.created_at, c.updated_at, c.tax_inclusive, c.duplicate_acknowledged,
+         c.fx_rate, c.fx_rate_date::text AS fx_rate_date, c.fx_source, c.amount_base,
          u.full_name AS claimant_name, u.email AS claimant_email,
          mr.full_name AS manager_reviewer_name, hrr.full_name AS hr_reviewer_name,
          COALESCE((SELECT json_agg(json_build_object('description', i.description, 'quantity', i.quantity, 'amount', i.amount) ORDER BY i.sort_order)
@@ -5059,6 +5127,24 @@ app.get('/api/v1/claims/categories', (req, res) => {
   res.status(200).json({ success: true, data: CLAIM_CATEGORIES });
 });
 
+// Exchange rate into the company currency for a purchase date, so the form can show the
+// converted amount. The same rate is looked up again on submit; this one is only for display.
+app.get('/api/v1/claims/fx-rate', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session) return;
+  const currency = String(req.query.currency || '').toUpperCase();
+  const date = String(req.query.date || '');
+  if (!/^[A-Z]{3}$/.test(currency)) return res.status(400).json({ error: 'currency must be a 3-letter code.' });
+  if (!isRealYmd(date) || date > sgtTodayYmd()) return res.status(400).json({ error: 'date must be a past YYYY-MM-DD date.' });
+  try {
+    const fx = await getFxRate(currency, date);
+    if (!fx) return res.status(200).json({ success: true, data: null, base: COMPANY_CURRENCY, message: `No exchange rate found for ${currency}.` });
+    return res.status(200).json({ success: true, base: COMPANY_CURRENCY, data: fx });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to look up the exchange rate.', detail: error.message });
+  }
+});
+
 // Reads a receipt photo with Gemini and returns the fields for the staff member to check.
 // Nothing is saved except the scan log. Expected "can't scan" cases answer 200 with
 // available:false and a message, so the portal simply switches to manual entry.
@@ -5161,6 +5247,7 @@ app.post('/api/v1/claims', async (req, res) => {
       aiExtraction = scan.rows[0]?.extraction || null;
     }
 
+    const fx = await claimFxFields(v);
     const me = await db.query('SELECT supervisor_id FROM users WHERE user_id = $1', [session.user_id]);
     const supervisorId = me.rows[0]?.supervisor_id && me.rows[0].supervisor_id !== session.user_id ? me.rows[0].supervisor_id : null;
     const status = supervisorId ? 'PENDING' : 'MANAGER_APPROVED';
@@ -5168,12 +5255,14 @@ app.post('/api/v1/claims', async (req, res) => {
     await client.query('BEGIN');
     const inserted = await client.query(
       `INSERT INTO claims (user_id, status, purchase_date, merchant, category, currency, total_amount, project_code,
-                           notes, receipt_image, ai_extraction, manager_remarks, tax_inclusive, duplicate_acknowledged)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                           notes, receipt_image, ai_extraction, manager_remarks, tax_inclusive, duplicate_acknowledged,
+                           fx_rate, fx_rate_date, fx_source, amount_base)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
        RETURNING claim_id, status, purchase_date::text AS purchase_date, merchant, currency, total_amount`,
       [session.user_id, status, v.purchaseDate, v.merchant, v.category, v.currency, v.total, v.projectCode,
         v.notes, req.body.receiptImage, aiExtraction ? JSON.stringify(aiExtraction) : null,
-        supervisorId ? null : 'No manager assigned; sent straight to HR.', v.taxInclusive, duplicateAcknowledged]
+        supervisorId ? null : 'No manager assigned; sent straight to HR.', v.taxInclusive, duplicateAcknowledged,
+        fx.fxRate, fx.fxRateDate, fx.fxSource, fx.amountBase]
     );
     const claim = inserted.rows[0];
     await saveClaimItems(client, claim.claim_id, v.items);
@@ -5377,14 +5466,16 @@ app.patch('/api/v1/claims/:claimId', async (req, res) => {
     if (projectError) return res.status(400).json({ error: projectError });
     const beforeItems = (await db.query('SELECT description, quantity, amount FROM claim_items WHERE claim_id = $1 ORDER BY sort_order', [claimId])).rows;
     const beforeCharges = (await db.query('SELECT kind, label, rate, amount FROM claim_charges WHERE claim_id = $1 ORDER BY sort_order', [claimId])).rows;
+    const fx = await claimFxFields(v);
 
     await client.query('BEGIN');
     const updated = await client.query(
       `UPDATE claims SET purchase_date = $2, merchant = $3, category = $4, currency = $5, total_amount = $6,
               project_code = $7, notes = $8, receipt_image = COALESCE($9, receipt_image), tax_inclusive = $10,
-              updated_at = CURRENT_TIMESTAMP
+              fx_rate = $11, fx_rate_date = $12, fx_source = $13, amount_base = $14, updated_at = CURRENT_TIMESTAMP
        WHERE claim_id = $1 AND status = 'PENDING' RETURNING *`,
-      [claimId, v.purchaseDate, v.merchant, v.category, v.currency, v.total, v.projectCode, v.notes, newImage, v.taxInclusive]
+      [claimId, v.purchaseDate, v.merchant, v.category, v.currency, v.total, v.projectCode, v.notes, newImage, v.taxInclusive,
+        fx.fxRate, fx.fxRateDate, fx.fxSource, fx.amountBase]
     );
     if (updated.rows.length === 0) {
       await client.query('ROLLBACK');

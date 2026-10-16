@@ -129,6 +129,10 @@ Authorization: Bearer <session.token>
   "scanId": "<scanId from the scan, optional>"
 }
 
+### Claims: exchange rate into SGD for a purchase date (ECB reference rate; weekends use the last business day)
+GET http://localhost:5000/api/v1/claims/fx-rate?currency=MYR&date=2026-10-04
+Authorization: Bearer <session.token>
+
 ### Claims: manager decision (reason required to reject)
 PATCH http://localhost:5000/api/v1/claims/<claim_id>/manager-review
 Content-Type: application/json
