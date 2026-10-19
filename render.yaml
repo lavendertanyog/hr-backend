@@ -23,3 +23,12 @@ services:
         sync: false
       - key: DB_SSL
         value: true
+      # Expense claims: receipt scanning with Gemini (paid tier). Set the key in Render; never commit it.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.1-flash-lite
+      - key: CLAIM_SCAN_MONTHLY_CAP_USD
+        value: 19
+      - key: CLAIM_SCAN_DAILY_LIMIT_PER_USER
+        value: 20
