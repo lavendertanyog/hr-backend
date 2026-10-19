@@ -63,6 +63,15 @@ Content-Type: application/json
   "allOthers": true
 }
 
+### Mark This Portal's First-Login Walkthrough as Seen (portal: staff | manager | account_manager | hr)
+POST http://localhost:5000/api/v1/auth/tours/complete
+Authorization: Bearer <session.token>
+Content-Type: application/json
+
+{
+  "portal": "staff"
+}
+
 ### Log Out (ends this device's session)
 POST http://localhost:5000/api/v1/auth/logout
 Authorization: Bearer <session.token>

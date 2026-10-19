@@ -461,6 +461,10 @@ async function ensureOperationalTables() {
   // Multi-role support: additive roles array alongside legacy single role
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS user_roles TEXT[] DEFAULT '{}';`);
 
+  // First-login walkthrough: the portals ('staff', 'manager', 'account_manager', 'hr') whose tour
+  // this person has finished or skipped, so each portal shows its tour once per account.
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tours_completed TEXT[] NOT NULL DEFAULT '{}';`);
+
   // Project-scoped role: what function does this person serve within this specific project?
   // Values: 'account_manager' | 'manager' | 'staff' (independent of global user_roles)
   await db.query(`ALTER TABLE project_assignments ADD COLUMN IF NOT EXISTS project_role TEXT NOT NULL DEFAULT 'staff';`);
@@ -1107,7 +1111,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
   const normalized = email.trim().toLowerCase();
   try {
     const result = await db.query(
-      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status, is_admin FROM users WHERE LOWER(email) = $1 LIMIT 1',
+      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status, is_admin, tours_completed FROM users WHERE LOWER(email) = $1 LIMIT 1',
       [normalized]
     );
     const user = result.rows[0];
@@ -1227,7 +1231,7 @@ async function findAuthSession(token) {
   if (!token) return null;
   const result = await db.query(
     `SELECT s.session_id, s.portal, s.device_label, s.trusted, s.expires_at,
-            u.user_id, u.full_name, u.user_role, u.user_roles, u.email, u.account_status, u.is_admin
+            u.user_id, u.full_name, u.user_role, u.user_roles, u.email, u.account_status, u.is_admin, u.tours_completed
      FROM auth_sessions s JOIN users u ON u.user_id = s.user_id
      WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > CURRENT_TIMESTAMP
      LIMIT 1`,
@@ -1291,6 +1295,28 @@ app.post('/api/v1/auth/logout', async (req, res) => {
     return res.status(200).json({ success: true });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to log out.', detail: error.message });
+  }
+});
+
+// First-login walkthrough: marks this portal's tour as seen for the signed-in user, whether they
+// finished it or skipped it. Login and resume return `tours_completed` so the portal knows.
+app.post('/api/v1/auth/tours/complete', async (req, res) => {
+  const { portal } = req.body || {};
+  if (!SESSION_PORTALS.includes(portal)) return res.status(400).json({ error: 'portal is not valid.' });
+  try {
+    const session = await requireSession(req, res);
+    if (!session) return;
+    const result = await db.query(
+      `UPDATE users SET tours_completed = array_append(COALESCE(tours_completed, '{}'), $2::text)
+       WHERE user_id = $1 AND NOT ($2::text = ANY(COALESCE(tours_completed, '{}')))
+       RETURNING tours_completed`,
+      [session.user_id, portal]
+    );
+    const toursCompleted = result.rows[0]?.tours_completed
+      || [...new Set([...(session.tours_completed || []), portal])];
+    return res.status(200).json({ success: true, data: { tours_completed: toursCompleted } });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to save the walkthrough.', detail: error.message });
   }
 });
 
