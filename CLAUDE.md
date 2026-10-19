@@ -5,6 +5,6 @@ The REST API for the Nextan Timesheet System: Node 20, Express 5, PostgreSQL (`p
 Shared workspace notes, skills and agents live one folder up, in `../CLAUDE.md` and `../.claude/`. If the `nextan-*` skills are not loaded, read them directly from `../.claude/skills/<name>/SKILL.md`.
 
 - Before adding or changing a route, column or job, follow `nextan-backend-endpoint`.
-- `main` auto-deploys the live backend on Render. Only the team lead, Eunice (`janicelav9`), pushes or merges to it; everyone else never does.
+- `main` auto-deploys the live backend on Render. Never push to it. Work on your own branch (see the Team table in `../CLAUDE.md`).
 - All business rules use Singapore time (SGT, UTC+8).
 - Before reporting a task as done, run `nextan-release-check`.
