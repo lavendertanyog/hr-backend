@@ -18,6 +18,7 @@ const expo = new Expo();
 // so any flow that sends email stays fully testable locally without sending real mail. Sends
 // from the verified mail.nextantech.com domain identity now that its DKIM records are in place.
 const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
+const { emailText, normalizeLanguage } = require('./emailText');
 const sesClient = process.env.AWS_ACCESS_KEY_ID
   ? new SESClient({ region: process.env.AWS_REGION || 'ap-southeast-1' })
   : null;
@@ -55,7 +56,7 @@ async function sendEmail(toEmail, subject, html, emailType = 'general') {
 // specifically so emails like the temporary password below contain no link at all — Microsoft
 // and other mail filters weigh links heavily when scoring a message as phishing, and a brand-new
 // sending domain is already fighting an uphill reputation battle without one.
-function brandedEmailHtml({ linkOrigin, heading, bodyHtml, buttonText, buttonUrl, codeBlock, footerText }) {
+function brandedEmailHtml({ linkOrigin, heading, bodyHtml, buttonText, buttonUrl, codeBlock, footerText, lang }) {
   const logoUrl = `${linkOrigin}/nextan-logo.png`;
   const actionHtml = codeBlock
     ? `<div style="background:#f1f5f9;border-radius:12px;padding:16px;text-align:center;">
@@ -63,9 +64,9 @@ function brandedEmailHtml({ linkOrigin, heading, bodyHtml, buttonText, buttonUrl
        </div>`
     : `<a href="${buttonUrl}" style="display:inline-block;background:#0c3b8f;color:#ffffff;text-decoration:none;font-size:14px;font-weight:700;padding:12px 28px;border-radius:12px;">${buttonText}</a>`;
   return `<!doctype html>
-<html><head><meta charset="utf-8" /></head>
+<html lang="${lang === 'zh' ? 'zh-CN' : 'en'}"><head><meta charset="utf-8" /></head>
 <body style="margin:0;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 16px;font-family:Arial,Helvetica,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 16px;font-family:Arial,Helvetica,'Microsoft YaHei','PingFang SC','Noto Sans CJK SC',sans-serif;">
   <tr><td align="center">
     <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:16px;overflow:hidden;">
       <tr><td style="padding:32px 40px 0 40px;text-align:center;">
@@ -92,43 +93,49 @@ function brandedEmailHtml({ linkOrigin, heading, bodyHtml, buttonText, buttonUrl
 </body></html>`;
 }
 
-async function sendTemporaryPasswordEmail(toEmail, tempPassword, portalOrigin) {
+async function sendTemporaryPasswordEmail(toEmail, tempPassword, portalOrigin, lang = 'en') {
   // No link at all, by design — see brandedEmailHtml's comment. The temp password itself is the
   // whole "action"; the user logs in with it directly and changes it from their Profile page.
+  const text = emailText(lang).tempPassword;
   const html = brandedEmailHtml({
+    lang: normalizeLanguage(lang),
     linkOrigin: portalOrigin,
-    heading: 'Your temporary password',
-    bodyHtml: "We received a request to reset the password for your Nextan Portal account. Use the temporary password below to log in, then set a new password from your Profile page.",
+    heading: text.heading,
+    bodyHtml: text.body,
     codeBlock: tempPassword,
-    footerText: "If you didn't request a password reset, please let your HR admin know - your password has already been changed to the one above.",
+    footerText: text.footer,
   });
-  await sendEmail(toEmail, 'Your temporary Nextan Portal password', html, 'password-reset');
+  await sendEmail(toEmail, text.subject, html, 'password-reset');
 }
 
-async function sendVerificationEmail(toEmail, verifyUrl) {
+async function sendVerificationEmail(toEmail, verifyUrl, lang = 'en') {
+  const text = emailText(lang).verification;
   const html = brandedEmailHtml({
+    lang: normalizeLanguage(lang),
     linkOrigin: new URL(verifyUrl).origin,
-    heading: 'Verify your email',
-    bodyHtml: `Confirm this is your email address (${toEmail}) to finish setting up your account - this link expires in 24 hours.`,
-    buttonText: 'Verify email',
+    heading: text.heading,
+    bodyHtml: text.body(toEmail),
+    buttonText: text.button,
     buttonUrl: verifyUrl,
-    footerText: "If you didn't create an account, you can safely ignore this email.",
+    footerText: text.footer,
   });
-  await sendEmail(toEmail, 'Verify your Nextan Portal email', html, 'email-verification');
+  await sendEmail(toEmail, text.subject, html, 'email-verification');
 }
 
 const STAFF_PORTAL_URL = process.env.STAFF_PORTAL_URL || 'https://staff.nextantech.com';
 
-async function sendClockInReminderEmail(toEmail, fullName) {
+async function sendClockInReminderEmail(toEmail, fullName, lang = 'en') {
+  const text = emailText(lang).clockIn;
   const html = brandedEmailHtml({
+    lang: normalizeLanguage(lang),
     linkOrigin: STAFF_PORTAL_URL,
-    heading: 'Time to clock in',
-    bodyHtml: "Hi, it's past 8:30am and you haven't clocked in today. Head to the Staff Portal to clock in.",
-    buttonText: 'Clock in now',
+    heading: text.heading,
+    bodyHtml: text.body,
+    buttonText: text.button,
     buttonUrl: `${STAFF_PORTAL_URL}/attendance`,
-    footerText: 'Already clocked in? You can ignore this.',
+    footerText: text.footer,
   });
-  await sendEmail(toEmail, "You haven't clocked in yet", html, 'clockin-reminder');
+  await sendEmail(toEmail, text.subject, html, 'clockin-reminder');
 }
 
 // Send push notification to a user via their stored Expo push token
@@ -303,6 +310,13 @@ async function ensureOperationalTables() {
   // Ensure password_hash column exists on users
   await db.query(`
     ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+  `);
+
+  // The language a person uses the portals and receives emails in ('en' or 'zh'), and whether they
+  // have confirmed it on first entering the portal (the welcome card shows until they do).
+  await db.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS preferred_language TEXT NOT NULL DEFAULT 'en';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS language_confirmed BOOLEAN NOT NULL DEFAULT FALSE;
   `);
 
   // Ensure email column exists for email/password auth
@@ -746,8 +760,9 @@ app.post('/api/v1/auth/signup', async (req, res) => {
     // self-service email verification (see /auth/verify-email) rather than admin approval.
     // 'pending' stays supported for any accounts already sitting in that state, and admins can
     // still revoke a verified account by rejecting it via /admin/approve-account.
-    const insertCols = ['user_id', 'full_name', 'user_role', 'user_roles', 'email', 'password_hash', 'account_status'];
-    const insertVals = [userId, fullName, resolvedRole, allRoles, normalized, passwordHash, 'unverified'];
+    const preferredLanguage = normalizeLanguage(req.body.preferredLanguage);
+    const insertCols = ['user_id', 'full_name', 'user_role', 'user_roles', 'email', 'password_hash', 'account_status', 'preferred_language'];
+    const insertVals = [userId, fullName, resolvedRole, allRoles, normalized, passwordHash, 'unverified', preferredLanguage];
     if (columns.has('phone')) {
       insertCols.push('phone');
       insertVals.push('');
@@ -759,7 +774,7 @@ app.post('/api/v1/auth/signup', async (req, res) => {
 
     const placeholders = insertVals.map((_, i) => `$${i + 1}`).join(', ');
     const result = await db.query(
-      `INSERT INTO users (${insertCols.join(', ')}) VALUES (${placeholders}) RETURNING user_id, full_name, user_role, user_roles, email`,
+      `INSERT INTO users (${insertCols.join(', ')}) VALUES (${placeholders}) RETURNING user_id, full_name, user_role, user_roles, email, preferred_language, language_confirmed`,
       insertVals
     );
 
@@ -780,7 +795,7 @@ app.post('/api/v1/auth/signup', async (req, res) => {
     // portal offers the user a Resend button and the HR contact instead of "check your email".
     let emailSent = true;
     try {
-      await sendVerificationEmail(normalized, verifyUrl);
+      await sendVerificationEmail(normalized, verifyUrl, preferredLanguage);
     } catch (emailError) {
       emailSent = false;
       console.error('[signup] verification email failed for', normalized, emailError);
@@ -836,7 +851,7 @@ app.post('/api/v1/auth/resend-verification', async (req, res) => {
   const normalized = email.trim().toLowerCase();
 
   try {
-    const userRes = await db.query(`SELECT user_id FROM users WHERE LOWER(email) = $1 AND account_status = 'unverified' LIMIT 1`, [normalized]);
+    const userRes = await db.query(`SELECT user_id, preferred_language FROM users WHERE LOWER(email) = $1 AND account_status = 'unverified' LIMIT 1`, [normalized]);
     const user = userRes.rows[0];
     // Same generic response regardless of match, so this can't be used to probe accounts.
     // A link was issued in the last 30 seconds: skip quietly (same generic reply) so repeated taps
@@ -858,7 +873,7 @@ app.post('/api/v1/auth/resend-verification', async (req, res) => {
       );
       const origin = portalUrl.replace(/\/$/, '');
       const verifyUrl = `${origin}/verify-email?token=${verifyToken}`;
-      await sendVerificationEmail(normalized, verifyUrl);
+      await sendVerificationEmail(normalized, verifyUrl, user.preferred_language);
       console.log('[resend-verification] sent to', normalized);
     } else {
       console.log('[resend-verification] no unverified account for', normalized);
@@ -934,7 +949,7 @@ app.post('/api/v1/auth/forgot-password', async (req, res) => {
   const normalized = email.trim().toLowerCase();
 
   try {
-    const userRes = await db.query('SELECT user_id FROM users WHERE LOWER(email) = $1 LIMIT 1', [normalized]);
+    const userRes = await db.query('SELECT user_id, preferred_language FROM users WHERE LOWER(email) = $1 LIMIT 1', [normalized]);
     const user = userRes.rows[0];
     // Always respond success even if the email isn't found, so this endpoint can't be used
     // to check which emails have accounts.
@@ -944,7 +959,7 @@ app.post('/api/v1/auth/forgot-password', async (req, res) => {
       await db.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, user.user_id]);
       await revokeUserSessions(user.user_id);
       const portalOrigin = portalUrl.replace(/\/$/, '');
-      await sendTemporaryPasswordEmail(normalized, tempPassword, portalOrigin);
+      await sendTemporaryPasswordEmail(normalized, tempPassword, portalOrigin, user.preferred_language);
       console.log('[forgot-password] sent temporary password to', normalized);
     } else {
       console.log('[forgot-password] no account found for', normalized);
@@ -1026,7 +1041,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
   const normalized = email.trim().toLowerCase();
   try {
     const result = await db.query(
-      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status, is_admin FROM users WHERE LOWER(email) = $1 LIMIT 1',
+      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status, is_admin, preferred_language, language_confirmed FROM users WHERE LOWER(email) = $1 LIMIT 1',
       [normalized]
     );
     const user = result.rows[0];
@@ -1146,7 +1161,8 @@ async function findAuthSession(token) {
   if (!token) return null;
   const result = await db.query(
     `SELECT s.session_id, s.portal, s.device_label, s.trusted, s.expires_at,
-            u.user_id, u.full_name, u.user_role, u.user_roles, u.email, u.account_status, u.is_admin
+            u.user_id, u.full_name, u.user_role, u.user_roles, u.email, u.account_status, u.is_admin,
+            u.preferred_language, u.language_confirmed
      FROM auth_sessions s JOIN users u ON u.user_id = s.user_id
      WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > CURRENT_TIMESTAMP
      LIMIT 1`,
@@ -1175,6 +1191,24 @@ async function revokeUserSessions(userId, exceptToken = null) {
     [userId, exceptToken ? hashSessionToken(exceptToken) : null]
   );
 }
+
+// The signed-in person changes their own language. `confirmed` marks the welcome card as done.
+app.patch('/api/v1/auth/language', async (req, res) => {
+  try {
+    const session = await requireSession(req, res);
+    if (!session) return;
+    const requested = String(req.body.language || '').trim().toLowerCase();
+    if (!['en', 'zh'].includes(requested)) return res.status(400).json({ error: "language must be 'en' or 'zh'." });
+    const confirmed = req.body.confirmed === false ? false : true;
+    const result = await db.query(
+      'UPDATE users SET preferred_language = $1, language_confirmed = $2 WHERE user_id = $3 RETURNING preferred_language, language_confirmed',
+      [requested, confirmed, session.user_id]
+    );
+    return res.status(200).json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to save the language.', detail: error.message });
+  }
+});
 
 app.post('/api/v1/auth/resume', async (req, res) => {
   const { token } = req.body;
@@ -1406,16 +1440,18 @@ app.get('/api/v1/hr/pending-registrations', async (req, res) => {
 // HR Admin only: approve or reject any pending registration (Manager, Account Manager, or Staff)
 // Tells someone their account is now active: a new sign-up approved, or a rejected or revoked
 // account reactivated. Sent by both the HR and the Account Manager registration routes.
-async function sendAccountActiveEmail(toEmail) {
+async function sendAccountActiveEmail(toEmail, lang = 'en') {
+  const text = emailText(lang).accountActive;
   const html = brandedEmailHtml({
+    lang: normalizeLanguage(lang),
     linkOrigin: STAFF_PORTAL_URL,
-    heading: 'Your Nextan Portal account is active',
-    bodyHtml: 'Your account has been approved. You can now log in with the email and password you signed up with.',
-    buttonText: 'Log in',
+    heading: text.heading,
+    bodyHtml: text.body,
+    buttonText: text.button,
     buttonUrl: STAFF_PORTAL_URL,
-    footerText: "You're receiving this because an account was requested with this email address.",
+    footerText: text.footer,
   });
-  await sendEmail(toEmail, 'Your Nextan Portal account is active', html, 'account-active');
+  await sendEmail(toEmail, text.subject, html, 'account-active');
 }
 
 app.patch('/api/v1/hr/approve-registration', async (req, res) => {
@@ -1425,12 +1461,12 @@ app.patch('/api/v1/hr/approve-registration', async (req, res) => {
     return res.status(400).json({ error: 'userId and action (approve|reject) are required.' });
   }
   try {
-    const target = await db.query('SELECT user_role, user_roles, email, account_status FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    const target = await db.query('SELECT user_role, user_roles, email, account_status, preferred_language FROM users WHERE user_id = $1 LIMIT 1', [userId]);
     if (!target.rows[0]) return res.status(404).json({ error: 'User not found.' });
     const newStatus = action === 'approve' ? 'active' : 'rejected';
     await db.query('UPDATE users SET account_status = $1 WHERE user_id = $2', [newStatus, userId]);
     if (target.rows[0].account_status !== 'active' && newStatus === 'active' && target.rows[0].email) {
-      sendAccountActiveEmail(target.rows[0].email)
+      sendAccountActiveEmail(target.rows[0].email, target.rows[0].preferred_language)
         .catch((e) => console.error('[email] Account active email failed:', e.message));
     }
     return res.status(200).json({ success: true, message: `Account ${newStatus}.` });
@@ -1466,7 +1502,7 @@ app.patch('/api/v1/account-manager/approve-staff-registration', async (req, res)
     return res.status(400).json({ error: 'userId and action (approve|reject) are required.' });
   }
   try {
-    const target = await db.query('SELECT user_role, user_roles, email, account_status FROM users WHERE user_id = $1 LIMIT 1', [userId]);
+    const target = await db.query('SELECT user_role, user_roles, email, account_status, preferred_language FROM users WHERE user_id = $1 LIMIT 1', [userId]);
     if (!target.rows[0]) return res.status(404).json({ error: 'User not found.' });
     const targetRow = target.rows[0];
     if (!userHasRole(targetRow, 'staff')) {
@@ -1475,7 +1511,7 @@ app.patch('/api/v1/account-manager/approve-staff-registration', async (req, res)
     const newStatus = action === 'approve' ? 'active' : 'rejected';
     await db.query('UPDATE users SET account_status = $1 WHERE user_id = $2', [newStatus, userId]);
     if (targetRow.account_status !== 'active' && newStatus === 'active' && targetRow.email) {
-      sendAccountActiveEmail(targetRow.email)
+      sendAccountActiveEmail(targetRow.email, targetRow.preferred_language)
         .catch((e) => console.error('[email] Account active email failed:', e.message));
     }
     return res.status(200).json({ success: true, message: `Staff account ${newStatus}.` });
@@ -6386,7 +6422,7 @@ async function checkClockInEmailReminders() {
   const reminderTitle = "You haven't clocked in yet";
   try {
     const staffUsers = await db.query(
-      `SELECT user_id, full_name, email FROM users
+      `SELECT user_id, full_name, email, preferred_language FROM users
        WHERE account_status = 'active' AND NOT is_hidden AND email IS NOT NULL
          AND (user_role = 'staff' OR 'staff' = ANY(user_roles))`
     );
@@ -6412,7 +6448,7 @@ async function checkClockInEmailReminders() {
       const body = "It's past 8:30am and you haven't clocked in today. Head to the Staff Portal to clock in.";
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [row.user_id, reminderTitle, body]);
       try {
-        await sendClockInReminderEmail(row.email, row.full_name);
+        await sendClockInReminderEmail(row.email, row.full_name, row.preferred_language);
         sent += 1;
       } catch (emailError) {
         console.error('[clockin-reminder] email failed for', row.email, emailError.message);
