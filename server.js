@@ -324,8 +324,10 @@ async function ensureOperationalTables() {
   `);
 
   // Public holidays — editable by HR, read by every portal (attendance calendars, reports, and
-  // the annual reminder job below). Seeded once with the known 2026 SG gazetted dates so nothing
-  // regresses for existing users; HR can add/edit/delete freely from here on.
+  // the annual reminder job below). One list per office country (SG, MY, CN, LK); a Malaysian
+  // holiday that only some states observe lists them in `states` (NULL = nationwide). Seeded once
+  // with the known 2026 SG gazetted dates (only into an empty table, so a holiday HR renamed or
+  // deleted never comes back); HR can add/edit/delete freely from here on.
   await db.query(`
     CREATE TABLE IF NOT EXISTS public_holidays (
       holiday_date DATE PRIMARY KEY,
@@ -335,23 +337,45 @@ async function ensureOperationalTables() {
     );
   `);
   await db.query(`
-    INSERT INTO public_holidays (holiday_date, name) VALUES
-      ('2026-01-01', 'New Year''s Day'),
-      ('2026-02-17', 'Chinese New Year'),
-      ('2026-02-18', 'Chinese New Year'),
-      ('2026-03-21', 'Hari Raya Puasa'),
-      ('2026-04-03', 'Good Friday'),
-      ('2026-05-01', 'Labour Day'),
-      ('2026-05-27', 'Hari Raya Haji'),
-      ('2026-05-31', 'Vesak Day'),
-      ('2026-06-01', 'Vesak Day (in lieu)'),
-      ('2026-08-09', 'National Day'),
-      ('2026-08-10', 'National Day (in lieu)'),
-      ('2026-11-08', 'Deepavali'),
-      ('2026-11-09', 'Deepavali (in lieu)'),
-      ('2026-12-25', 'Christmas Day')
-    ON CONFLICT (holiday_date) DO NOTHING;
+    INSERT INTO public_holidays (holiday_date, name)
+    SELECT v.holiday_date::date, v.name FROM (VALUES
+        ('2026-01-01', 'New Year''s Day'),
+        ('2026-02-17', 'Chinese New Year'),
+        ('2026-02-18', 'Chinese New Year'),
+        ('2026-03-21', 'Hari Raya Puasa'),
+        ('2026-04-03', 'Good Friday'),
+        ('2026-05-01', 'Labour Day'),
+        ('2026-05-27', 'Hari Raya Haji'),
+        ('2026-05-31', 'Vesak Day'),
+        ('2026-06-01', 'Vesak Day (in lieu)'),
+        ('2026-08-09', 'National Day'),
+        ('2026-08-10', 'National Day (in lieu)'),
+        ('2026-11-08', 'Deepavali'),
+        ('2026-11-09', 'Deepavali (in lieu)'),
+        ('2026-12-25', 'Christmas Day')
+    ) AS v (holiday_date, name)
+    WHERE NOT EXISTS (SELECT 1 FROM public_holidays);
   `);
+  // Countries: the table used to hold Singapore only, keyed by date. Existing rows become SG, and
+  // the key moves to an id so the same date can be a holiday in several countries (or carry two
+  // Malaysian state holidays). Runs once: the old key is only dropped while it is still on the date.
+  await db.query(`ALTER TABLE public_holidays ADD COLUMN IF NOT EXISTS country_code VARCHAR(2) NOT NULL DEFAULT 'SG';`);
+  await db.query(`ALTER TABLE public_holidays ADD COLUMN IF NOT EXISTS states TEXT[];`);
+  await db.query(`ALTER TABLE public_holidays ADD COLUMN IF NOT EXISTS holiday_id BIGSERIAL;`);
+  await db.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+        WHERE c.conrelid = 'public_holidays'::regclass AND c.contype = 'p' AND a.attname = 'holiday_date'
+      ) THEN
+        ALTER TABLE public_holidays DROP CONSTRAINT public_holidays_pkey;
+        ALTER TABLE public_holidays ADD PRIMARY KEY (holiday_id);
+      END IF;
+    END $$;
+  `);
+  await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS public_holidays_country_date_name ON public_holidays (country_code, holiday_date, name);`);
 
   // Hour allocations table
   await db.query(`
@@ -1111,7 +1135,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
   const normalized = email.trim().toLowerCase();
   try {
     const result = await db.query(
-      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status, is_admin, tours_completed FROM users WHERE LOWER(email) = $1 LIMIT 1',
+      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status, is_admin, tours_completed, home_office_country FROM users WHERE LOWER(email) = $1 LIMIT 1',
       [normalized]
     );
     const user = result.rows[0];
@@ -1231,7 +1255,7 @@ async function findAuthSession(token) {
   if (!token) return null;
   const result = await db.query(
     `SELECT s.session_id, s.portal, s.device_label, s.trusted, s.expires_at,
-            u.user_id, u.full_name, u.user_role, u.user_roles, u.email, u.account_status, u.is_admin, u.tours_completed
+            u.user_id, u.full_name, u.user_role, u.user_roles, u.email, u.account_status, u.is_admin, u.tours_completed, u.home_office_country
      FROM auth_sessions s JOIN users u ON u.user_id = s.user_id
      WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > CURRENT_TIMESTAMP
      LIMIT 1`,
@@ -1971,7 +1995,7 @@ app.get('/api/v1/auth/verify-session', async (req, res) => {
   if (!userId) return res.status(400).json({ error: 'userId is required.' });
   try {
     const result = await db.query(
-      'SELECT user_id, user_role, user_roles, account_status FROM users WHERE user_id = $1 LIMIT 1',
+      'SELECT user_id, user_role, user_roles, account_status, home_office_country FROM users WHERE user_id = $1 LIMIT 1',
       [userId]
     );
     if (!result.rows[0]) return res.status(404).json({ error: 'User not found.' });
@@ -1995,6 +2019,7 @@ app.get('/api/v1/auth/verify-session', async (req, res) => {
         user_role: row.user_role,
         user_roles: roles,
         account_status: row.account_status,
+        home_office_country: row.home_office_country,
       },
     });
   } catch (error) {
@@ -2178,7 +2203,7 @@ async function resolveGeospatialMetrics(lat, lng, homeCountry) {
     }
 
     const current = countryCode.toUpperCase();
-    const isDomestic = current === 'SG';
+    const isDomestic = current === String(homeCountry || 'SG').toUpperCase();
 
     const travelMode = isDomestic ? 'DOMESTIC_ATTENDANCE' : 'OVERSEAS_ATTENDANCE';
 
@@ -2188,7 +2213,7 @@ async function resolveGeospatialMetrics(lat, lng, homeCountry) {
     return {
       locationName: 'Location unavailable',
       countryCode: homeCountry,
-      travelMode: String(homeCountry || '').toUpperCase() === 'SG' ? 'DOMESTIC_ATTENDANCE' : 'OVERSEAS_ATTENDANCE'
+      travelMode: 'DOMESTIC_ATTENDANCE'
     };
   }
 }
@@ -2345,7 +2370,8 @@ app.post('/api/v1/attendance/clock-in', async (req, res) => {
     const homeCountry = userProfile.rows[0].home_office_country;
     let locationName = manualLocationText || 'Location unavailable';
     let countryCode = homeCountry;
-    let travelMode = String(homeCountry || '').toUpperCase() === 'SG' ? 'DOMESTIC_ATTENDANCE' : 'OVERSEAS_ATTENDANCE';
+    // Without a GPS fix the session is recorded at the staff member's own office.
+    let travelMode = 'DOMESTIC_ATTENDANCE';
 
     if (!isManualLocation && latitude && longitude) {
       const geoData = await resolveGeospatialMetrics(latitude, longitude, homeCountry);
@@ -2416,7 +2442,9 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
 
   try {
     const logCheck = await db.query(
-      "SELECT clock_in_time, project_code, description FROM attendance_logs WHERE attendance_id = $1 AND user_id = $2",
+      `SELECT al.clock_in_time, al.project_code, al.description, u.home_office_country
+       FROM attendance_logs al JOIN users u ON u.user_id = al.user_id
+       WHERE al.attendance_id = $1 AND al.user_id = $2`,
       [attendanceId, userId]
     );
 
@@ -2459,8 +2487,9 @@ app.post('/api/v1/attendance/clock-out', async (req, res) => {
     const { clippedHours, ratio } = await clipOverlappingHours(
       userId, logCheck.rows[0].project_code, clockIn.toISOString(), currentOut.toISOString(), attendanceId
     );
-    const outHour = sgtHourOf(currentOut);
-    const crossesLunch = sessionOverlapsSgtLunch(clockIn, currentOut);
+    const timeZone = timeZoneForCountry(logCheck.rows[0].home_office_country);
+    const outHour = localHourOf(currentOut, timeZone);
+    const crossesLunch = sessionOverlapsLunch(clockIn, currentOut, timeZone);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(clippedHours - 1, 0) : Math.max(clippedHours, 0)) * 100) / 100;
     const otHoursAccrued = clippedHours > 9.5 && outHour >= 18 ? Math.round((clippedHours - 9.5) * 100) / 100 : 0;
 
@@ -2561,7 +2590,7 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
   const actualDurationHours = (end.getTime() - start.getTime()) / 3600000;
 
   try {
-    const userProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [userId]);
+    const userProfile = await db.query('SELECT user_role, user_roles, home_office_country FROM users WHERE user_id = $1', [userId]);
     if (userProfile.rows.length === 0) {
       return res.status(404).json({ error: 'User profile not found' });
     }
@@ -2597,8 +2626,9 @@ app.post('/api/v1/attendance/manual-entry', async (req, res) => {
     // Unlike live clock-out, a Manual Entry always credits exactly what was entered — no
     // overlap-deduplication against other sessions. It's a deliberate, precise record the staff
     // member is entering by hand, not a live timer that could double-count a forgotten clock-out.
-    const outHour = sgtHourOf(end);
-    const crossesLunch = sessionOverlapsSgtLunch(start, end);
+    const timeZone = timeZoneForCountry(userProfile.rows[0].home_office_country);
+    const outHour = localHourOf(end, timeZone);
+    const crossesLunch = sessionOverlapsLunch(start, end, timeZone);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(actualDurationHours - 1, 0) : Math.max(actualDurationHours, 0)) * 100) / 100;
     const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
 
@@ -2683,8 +2713,9 @@ app.patch('/api/v1/attendance/:attendanceId/edit-times', async (req, res) => {
     }
 
     const actualDurationHours = (end.getTime() - start.getTime()) / 3600000;
-    const outHour = sgtHourOf(end);
-    const crossesLunch = sessionOverlapsSgtLunch(start, end);
+    const timeZone = await userTimeZone(userId);
+    const outHour = localHourOf(end, timeZone);
+    const crossesLunch = sessionOverlapsLunch(start, end, timeZone);
     const dailyWorktimeHours = Math.round((crossesLunch ? Math.max(actualDurationHours - 1, 0) : Math.max(actualDurationHours, 0)) * 100) / 100;
     const otHoursAccrued = actualDurationHours > 9.5 && outHour >= 18 ? Math.round((actualDurationHours - 9.5) * 100) / 100 : 0;
 
@@ -2884,10 +2915,10 @@ app.get('/api/v1/attendance/project-log/:userId', async (req, res) => {
   try {
     const result = await db.query(
       `WITH sessions AS (
-         SELECT attendance_id, (clock_in_time AT TIME ZONE 'Asia/Singapore')::date AS day, project_code, daily_worktime_hours,
+         SELECT attendance_id, (clock_in_time AT TIME ZONE $4::text)::date AS day, project_code, daily_worktime_hours,
                 EXISTS (SELECT 1 FROM attendance_allocations aa WHERE aa.attendance_id = al.attendance_id) AS has_allocations
          FROM attendance_logs al
-         WHERE al.user_id = $1 AND (al.clock_in_time AT TIME ZONE 'Asia/Singapore')::date BETWEEN $2::date AND $3::date
+         WHERE al.user_id = $1 AND (al.clock_in_time AT TIME ZONE $4::text)::date BETWEEN $2::date AND $3::date
        ),
        legacy AS (
          SELECT day, COALESCE(project_code, 'General') AS project_code, COALESCE(daily_worktime_hours, 0) AS hours
@@ -2903,7 +2934,7 @@ app.get('/api/v1/attendance/project-log/:userId', async (req, res) => {
        FROM (SELECT * FROM legacy UNION ALL SELECT * FROM allocated) combined
        GROUP BY day, project_code
        ORDER BY day`,
-      [userId, start, end]
+      [userId, start, end, await userTimeZone(userId)]
     );
     return res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
@@ -2926,7 +2957,7 @@ app.get('/api/v1/attendance/sessions/:userId', async (req, res) => {
     const result = await db.query(
       `SELECT
          al.attendance_id,
-         to_char((al.clock_in_time AT TIME ZONE 'Asia/Singapore')::date, 'YYYY-MM-DD') AS day,
+         to_char((al.clock_in_time AT TIME ZONE $4::text)::date, 'YYYY-MM-DD') AS day,
          al.clock_in_time,
          al.clock_out_time,
          COALESCE(
@@ -2936,9 +2967,9 @@ app.get('/api/v1/attendance/sessions/:userId', async (req, res) => {
          ) AS allocations
        FROM attendance_logs al
        WHERE al.user_id = $1
-         AND (al.clock_in_time AT TIME ZONE 'Asia/Singapore')::date BETWEEN $2::date AND $3::date
+         AND (al.clock_in_time AT TIME ZONE $4::text)::date BETWEEN $2::date AND $3::date
        ORDER BY al.clock_in_time ASC`,
-      [userId, start, end]
+      [userId, start, end, await userTimeZone(userId)]
     );
     return res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
@@ -2946,7 +2977,7 @@ app.get('/api/v1/attendance/sessions/:userId', async (req, res) => {
   }
 });
 
-// Raw clock-in/out time ranges already logged for one SGT calendar day — used by Manual Entry
+// Raw clock-in/out time ranges already logged for one calendar day in the user's own time zone — used by Manual Entry
 // to warn "you've already logged time today" with the actual period, before creating a
 // possibly-duplicate entry.
 app.get('/api/v1/attendance/day-entries/:userId', async (req, res) => {
@@ -2959,9 +2990,9 @@ app.get('/api/v1/attendance/day-entries/:userId', async (req, res) => {
     const result = await db.query(
       `SELECT attendance_id, clock_in_time, clock_out_time
        FROM attendance_logs
-       WHERE user_id = $1 AND (clock_in_time AT TIME ZONE 'Asia/Singapore')::date = $2::date
+       WHERE user_id = $1 AND (clock_in_time AT TIME ZONE $3::text)::date = $2::date
        ORDER BY clock_in_time ASC`,
-      [userId, date]
+      [userId, date, await userTimeZone(userId)]
     );
     return res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
@@ -5698,7 +5729,7 @@ app.get('/api/v1/hr/active-users', async (req, res) => {
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   try {
     const result = await db.query(
-      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at, leave_entitlement_days
+      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at, leave_entitlement_days, home_office_country
        FROM users
        WHERE account_status = 'active' AND NOT is_hidden
        ORDER BY full_name ASC`
@@ -5779,12 +5810,35 @@ app.get('/api/v1/hr/leave-balances', async (req, res) => {
 
 // Public holidays — read is open to every portal (attendance calendars, reports); writes are
 // HR-only. Optional ?year=2027 filters to just that calendar year.
+// Malaysia's states and federal territories, the names a state-only holiday is tagged with.
+const MALAYSIA_STATES = [
+  'Johor', 'Kedah', 'Kelantan', 'Malacca', 'Negeri Sembilan', 'Pahang', 'Penang', 'Perak', 'Perlis',
+  'Sabah', 'Sarawak', 'Selangor', 'Terengganu', 'Kuala Lumpur', 'Labuan', 'Putrajaya',
+];
+// The holiday country asked for (SG, MY, CN or LK), Singapore when none is given; null if unknown.
+function holidayCountryParam(value) {
+  const code = String(value || 'SG').toUpperCase();
+  return OFFICE_TIME_ZONES[code] ? code : null;
+}
+// A holiday's states, validated: only Malaysia has state holidays, and only known state names.
+// Returns null for nationwide, or { error } for a name that isn't a Malaysian state.
+function holidayStatesParam(country, states) {
+  if (country !== 'MY' || !Array.isArray(states) || states.length === 0) return null;
+  const unknown = states.filter((st) => !MALAYSIA_STATES.includes(st));
+  if (unknown.length > 0) return { error: `Unknown Malaysian state: ${unknown.join(', ')}.` };
+  return MALAYSIA_STATES.filter((st) => states.includes(st)); // de-duplicated, in a fixed order
+}
+const HOLIDAY_COLUMNS = 'holiday_id, holiday_date, name, country_code, states';
+
+// ?country= picks the list (SG, MY, CN or LK; Singapore when left out, for older portals).
 app.get('/api/v1/public-holidays', async (req, res) => {
   const { year } = req.query;
+  const country = holidayCountryParam(req.query.country);
+  if (!country) return res.status(400).json({ error: 'country must be SG, MY, CN or LK.' });
   try {
     const result = year
-      ? await db.query(`SELECT holiday_date, name FROM public_holidays WHERE EXTRACT(YEAR FROM holiday_date) = $1 ORDER BY holiday_date ASC`, [year])
-      : await db.query(`SELECT holiday_date, name FROM public_holidays ORDER BY holiday_date ASC`);
+      ? await db.query(`SELECT ${HOLIDAY_COLUMNS} FROM public_holidays WHERE country_code = $1 AND EXTRACT(YEAR FROM holiday_date) = $2 ORDER BY holiday_date ASC, name ASC`, [country, year])
+      : await db.query(`SELECT ${HOLIDAY_COLUMNS} FROM public_holidays WHERE country_code = $1 ORDER BY holiday_date ASC, name ASC`, [country]);
     return res.status(200).json({ success: true, data: result.rows });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to fetch public holidays.', detail: error.message });
@@ -5822,92 +5876,185 @@ app.get('/api/v1/calendar/leave', async (req, res) => {
   }
 });
 
+// Add or edit one holiday. With holidayId it edits that holiday; without, it adds one (re-adding
+// the same country, date and name just updates its states). Portals from before countries
+// existed send no country: that is Singapore, and saving a date that already has one Singapore
+// holiday renames it, as it used to.
 app.post('/api/v1/hr/public-holidays', async (req, res) => {
-  const { requesterId, holidayDate, name } = req.body;
+  const { requesterId, holidayId, holidayDate, name } = req.body;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
-  if (!holidayDate || !name || !String(name).trim()) {
-    return res.status(400).json({ error: 'holidayDate and name are required.' });
+  const country = holidayCountryParam(req.body.country);
+  if (!country) return res.status(400).json({ error: 'Choose a country: Singapore, Malaysia, China or Sri Lanka.' });
+  if (!holidayDate || !/^\d{4}-\d{2}-\d{2}$/.test(String(holidayDate)) || !name || !String(name).trim()) {
+    return res.status(400).json({ error: 'Enter a date and a name for the holiday.' });
   }
+  const states = holidayStatesParam(country, req.body.states);
+  if (states?.error) return res.status(400).json({ error: states.error });
+  const cleanName = String(name).trim();
   try {
-    const result = await db.query(
-      `INSERT INTO public_holidays (holiday_date, name, updated_by, updated_at)
-       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-       ON CONFLICT (holiday_date) DO UPDATE SET name = $2, updated_by = $3, updated_at = CURRENT_TIMESTAMP
-       RETURNING holiday_date, name`,
-      [holidayDate, String(name).trim(), requesterId]
-    );
+    let targetId = holidayId || null;
+    if (!targetId && req.body.country === undefined) {
+      const legacy = await db.query(`SELECT holiday_id FROM public_holidays WHERE country_code = 'SG' AND holiday_date = $1`, [holidayDate]);
+      if (legacy.rows.length === 1) targetId = legacy.rows[0].holiday_id;
+    }
+    let result;
+    if (targetId) {
+      const before = await db.query('SELECT holiday_id FROM public_holidays WHERE holiday_id = $1', [targetId]);
+      if (before.rows.length === 0) return res.status(404).json({ error: 'That holiday no longer exists. Refresh the page.' });
+      result = await db.query(
+        `UPDATE public_holidays SET holiday_date = $2, name = $3, country_code = $4, states = $5, updated_by = $6, updated_at = CURRENT_TIMESTAMP
+         WHERE holiday_id = $1 RETURNING ${HOLIDAY_COLUMNS}`,
+        [targetId, holidayDate, cleanName, country, states, requesterId]
+      );
+    } else {
+      result = await db.query(
+        `INSERT INTO public_holidays (holiday_date, name, country_code, states, updated_by, updated_at)
+         VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+         ON CONFLICT (country_code, holiday_date, name) DO UPDATE SET states = $4, updated_by = $5, updated_at = CURRENT_TIMESTAMP
+         RETURNING ${HOLIDAY_COLUMNS}`,
+        [holidayDate, cleanName, country, states, requesterId]
+      );
+    }
     return res.status(200).json({ success: true, data: result.rows[0] });
   } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'This country already has a holiday with that name on that date.' });
+    }
     return res.status(500).json({ error: 'Failed to save public holiday.', detail: error.message });
   }
 });
 
-app.delete('/api/v1/hr/public-holidays/:holidayDate', async (req, res) => {
-  const { holidayDate } = req.params;
+// Deletes one holiday by id. A YYYY-MM-DD in place of the id is the older portals' delete-by-date,
+// which only ever meant Singapore.
+app.delete('/api/v1/hr/public-holidays/:holidayId', async (req, res) => {
+  const { holidayId } = req.params;
   const { requesterId } = req.body;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  const isLegacyDate = /^\d{4}-\d{2}-\d{2}$/.test(holidayId);
+  if (!isLegacyDate && !/^\d+$/.test(holidayId)) return res.status(400).json({ error: 'Unknown holiday.' });
   try {
-    await db.query('DELETE FROM public_holidays WHERE holiday_date = $1', [holidayDate]);
+    if (isLegacyDate) {
+      await db.query(`DELETE FROM public_holidays WHERE country_code = 'SG' AND holiday_date = $1`, [holidayId]);
+    } else {
+      await db.query('DELETE FROM public_holidays WHERE holiday_id = $1', [holidayId]);
+    }
     return res.status(200).json({ success: true });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to delete public holiday.', detail: error.message });
   }
 });
 
-// Fetches Singapore's official public holidays for a given year from data.gov.sg's consolidated
-// public-holidays dataset (2020-2027, refreshed annually by MOM) and flags which ones are
-// already in our own table, so the frontend can preview before writing anything.
+// Google's public holiday calendars, used to fetch Malaysia, China and Sri Lanka holidays (there
+// is no open government dataset for them like data.gov.sg). HR sees a preview and confirms
+// before anything is saved, and can fix or add any holiday by hand.
+const GOOGLE_HOLIDAY_CALENDARS = { MY: 'en.malaysia', CN: 'en.china', LK: 'en.lk' };
+
+// Parses Google's holiday .ics into { holiday_date, name, states } for one year. Observances
+// (Valentine's Day and the like) are left out, and Malaysia's "(regional holiday)" entries get
+// the states named in their description ("Public holiday in Sabah, Labuan").
+function parseHolidayIcs(text, year, country) {
+  const unfolded = String(text).replace(/\r?\n[ \t]/g, '');
+  const unescape = (v) => String(v || '').replace(/\\n/g, '\n').replace(/\\([,;\\])/g, '$1').trim();
+  const out = [];
+  for (const block of unfolded.split('BEGIN:VEVENT').slice(1)) {
+    const date = block.match(/\nDTSTART;VALUE=DATE:(\d{4})(\d{2})(\d{2})/) || [];
+    const summary = unescape((block.match(/\nSUMMARY:([^\r\n]*)/) || [])[1]);
+    const description = unescape((block.match(/\nDESCRIPTION:([^\r\n]*)/) || [])[1]);
+    if (date[1] !== String(year) || !summary || !/^Public holiday/i.test(description)) continue;
+    let states = null;
+    const inStates = description.match(/^Public holiday in ([^\n]+)/i);
+    if (country === 'MY' && inStates) {
+      const named = inStates[1].split(',').map((x) => x.trim());
+      states = MALAYSIA_STATES.filter((st) => named.includes(st));
+      if (states.length === 0) states = null;
+    }
+    out.push({
+      holiday_date: `${date[1]}-${date[2]}-${date[3]}`,
+      name: summary.replace(/\s*\(regional holiday\)\s*$/i, '').trim(),
+      states,
+    });
+  }
+  return out.sort((a, b) => (a.holiday_date === b.holiday_date ? a.name.localeCompare(b.name) : a.holiday_date < b.holiday_date ? -1 : 1));
+}
+
+// Fetches a country's public holidays for a year — Singapore from data.gov.sg's consolidated
+// dataset (refreshed annually by MOM), the others from Google's holiday calendars — and flags
+// which are already in our own table, so the frontend can preview before writing anything.
 app.get('/api/v1/hr/public-holidays/fetch-official', async (req, res) => {
   const { requesterId, year } = req.query;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
-  if (!year) return res.status(400).json({ error: 'year is required.' });
+  if (!/^\d{4}$/.test(String(year || ''))) return res.status(400).json({ error: 'year is required.' });
+  const country = holidayCountryParam(req.query.country);
+  if (!country) return res.status(400).json({ error: 'country must be SG, MY, CN or LK.' });
+  const sourceLabel = country === 'SG' ? 'data.gov.sg' : 'the Google public holiday calendar';
   try {
-    const officialRes = await axios.get('https://data.gov.sg/api/action/datastore_search', {
-      params: { resource_id: 'd_8ef23381f9417e4d4254ee8b4dcdb176', limit: 1000 },
-    });
-    const records = officialRes.data?.result?.records || [];
-    const forYear = records
-      .filter((r) => String(r.date || '').startsWith(String(year)))
-      .map((r) => ({ holiday_date: r.date, name: r.holiday }));
+    let forYear;
+    let source;
+    if (country === 'SG') {
+      const officialRes = await axios.get('https://data.gov.sg/api/action/datastore_search', {
+        params: { resource_id: 'd_8ef23381f9417e4d4254ee8b4dcdb176', limit: 1000 },
+      });
+      const records = officialRes.data?.result?.records || [];
+      forYear = records
+        .filter((r) => String(r.date || '').startsWith(String(year)))
+        .map((r) => ({ holiday_date: r.date, name: r.holiday, states: null }));
+      source = 'data.gov.sg — Ministry of Manpower';
+    } else {
+      const calendarId = encodeURIComponent(`${GOOGLE_HOLIDAY_CALENDARS[country]}#holiday@group.v.calendar.google.com`);
+      const icsRes = await axios.get(`https://calendar.google.com/calendar/ical/${calendarId}/public/basic.ics`, {
+        responseType: 'text', timeout: 15000,
+      });
+      forYear = parseHolidayIcs(icsRes.data, year, country);
+      source = 'Google public holiday calendar';
+    }
 
     const existingRes = await db.query(
-      `SELECT holiday_date, name FROM public_holidays WHERE EXTRACT(YEAR FROM holiday_date) = $1`,
-      [year]
+      `SELECT holiday_date, name FROM public_holidays WHERE country_code = $1 AND EXTRACT(YEAR FROM holiday_date) = $2`,
+      [country, year]
     );
-    const existingByDate = {};
-    existingRes.rows.forEach((h) => { existingByDate[h.holiday_date] = h.name; });
+    // Malaysia can have several holidays on one date (different states), so a fetched one only
+    // counts as saved when its name matches too. Elsewhere any holiday already on that date
+    // counts, as before, so a slightly different name ("Vesak Day (in lieu)") isn't duplicated.
+    const existing = new Set(existingRes.rows.map((h) => `${h.holiday_date}|${h.name.toLowerCase()}`));
+    const existingDates = new Set(existingRes.rows.map((h) => h.holiday_date));
 
     const data = forYear.map((h) => ({
       ...h,
-      alreadyExists: Object.prototype.hasOwnProperty.call(existingByDate, h.holiday_date),
+      alreadyExists: country === 'MY'
+        ? existing.has(`${h.holiday_date}|${h.name.toLowerCase()}`)
+        : existingDates.has(h.holiday_date),
     }));
 
-    return res.status(200).json({ success: true, data, source: 'data.gov.sg — Ministry of Manpower' });
+    return res.status(200).json({ success: true, data, source });
   } catch (error) {
-    return res.status(502).json({ error: 'Failed to fetch official holidays from data.gov.sg.', detail: error.message });
+    return res.status(502).json({ error: `Failed to fetch holidays from ${sourceLabel}. Try again, or add them by hand.`, detail: error.message });
   }
 });
 
-// Bulk-upserts holidays in one request — used after the "fetch official holidays" preview is
-// confirmed, so N holidays don't need N separate round trips.
+// Bulk-adds holidays for one country in one request — used after the "fetch official holidays"
+// preview is confirmed, so N holidays don't need N separate round trips.
 app.post('/api/v1/hr/public-holidays/bulk', async (req, res) => {
   const { requesterId, holidays } = req.body;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   if (!Array.isArray(holidays) || holidays.length === 0) {
     return res.status(400).json({ error: 'holidays must be a non-empty array.' });
   }
+  const country = holidayCountryParam(req.body.country);
+  if (!country) return res.status(400).json({ error: 'country must be SG, MY, CN or LK.' });
   try {
-    // Rows without a date or a name are skipped and counted, so the portal can say how many.
+    // Rows without a date or a name, or with an unknown state, are skipped and counted, so the
+    // portal can say how many.
     const saved = [];
     let skipped = 0;
     for (const h of holidays) {
-      if (!h.holiday_date || !h.name || !String(h.name).trim()) { skipped++; continue; }
+      const states = holidayStatesParam(country, h.states);
+      if (!h.holiday_date || !h.name || !String(h.name).trim() || states?.error) { skipped++; continue; }
       const result = await db.query(
-        `INSERT INTO public_holidays (holiday_date, name, updated_by, updated_at)
-         VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-         ON CONFLICT (holiday_date) DO UPDATE SET name = $2, updated_by = $3, updated_at = CURRENT_TIMESTAMP
-         RETURNING holiday_date, name`,
-        [h.holiday_date, String(h.name).trim(), requesterId]
+        `INSERT INTO public_holidays (holiday_date, name, country_code, states, updated_by, updated_at)
+         VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+         ON CONFLICT (country_code, holiday_date, name) DO UPDATE SET states = $4, updated_by = $5, updated_at = CURRENT_TIMESTAMP
+         RETURNING ${HOLIDAY_COLUMNS}`,
+        [h.holiday_date, String(h.name).trim(), country, states, requesterId]
       );
       saved.push(result.rows[0]);
     }
@@ -5919,11 +6066,12 @@ app.post('/api/v1/hr/public-holidays/bulk', async (req, res) => {
 
 // HR: permanently delete a user and every record tied to them. Irreversible — the frontend
 // gates this behind a confirmation modal.
-// HR: edit a user's basic info (name/email) — for correcting data entry mistakes
-// (e.g. an email that doesn't actually belong to the listed staff member).
+// HR: edit a user's basic info (name/email/office country) — for correcting data entry mistakes
+// (e.g. an email that doesn't actually belong to the listed staff member). The office country
+// sets the time zone the staff member's attendance is recorded and shown in.
 app.patch('/api/v1/hr/users/:userId', async (req, res) => {
   const { userId } = req.params;
-  const { requesterId, fullName, email } = req.body;
+  const { requesterId, fullName, email, homeOfficeCountry } = req.body;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   if (!fullName || !fullName.trim()) return res.status(400).json({ error: 'Full name is required.' });
   if (!email || !email.trim()) return res.status(400).json({ error: 'Email is required.' });
@@ -5931,16 +6079,23 @@ app.patch('/api/v1/hr/users/:userId', async (req, res) => {
   if (!normalizedEmail.endsWith('@nextan.com.sg')) {
     return res.status(400).json({ error: 'Only @nextan.com.sg emails are allowed.' });
   }
+  const country = homeOfficeCountry === undefined ? null : String(homeOfficeCountry).toUpperCase();
+  if (country !== null && !OFFICE_TIME_ZONES[country]) {
+    return res.status(400).json({ error: 'Choose an office country: Singapore, Malaysia, China or Sri Lanka.' });
+  }
 
   try {
     const dupe = await db.query('SELECT user_id FROM users WHERE LOWER(email) = $1 AND user_id != $2', [normalizedEmail, userId]);
     if (dupe.rows.length > 0) return res.status(409).json({ error: 'Another user already has this email.' });
 
+    const before = await db.query('SELECT user_id, full_name, email, home_office_country FROM users WHERE user_id = $1', [userId]);
+    if (before.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
     const result = await db.query(
-      'UPDATE users SET full_name = $1, email = $2 WHERE user_id = $3 RETURNING user_id, full_name, email',
-      [fullName.trim(), normalizedEmail, userId]
+      `UPDATE users SET full_name = $1, email = $2, home_office_country = COALESCE($4, home_office_country)
+       WHERE user_id = $3 RETURNING user_id, full_name, email, home_office_country`,
+      [fullName.trim(), normalizedEmail, userId, country]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    await auditInterceptor('users', userId, requesterId, before.rows[0], result.rows[0]);
     return res.status(200).json({ success: true, data: result.rows[0] });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update user.', detail: err.message });
@@ -6843,6 +6998,7 @@ app.get('/api/v1/manager/:managerId/attendance-logs', async (req, res) => {
          al.attendance_id,
          al.user_id,
          u.full_name,
+         u.home_office_country,
          al.project_code,
          al.clock_in_time,
          al.clock_out_time,
@@ -6895,6 +7051,7 @@ app.get('/api/v1/account-manager/:userId/attendance-logs', async (req, res) => {
          al.attendance_id,
          al.user_id,
          u.full_name,
+         u.home_office_country,
          al.project_code,
          al.clock_in_time,
          al.clock_out_time,
@@ -6947,6 +7104,7 @@ app.get('/api/v1/hr/attendance-logs', async (req, res) => {
          al.attendance_id,
          al.user_id,
          u.full_name,
+         u.home_office_country,
          al.project_code,
          al.clock_in_time,
          al.clock_out_time,
@@ -7156,30 +7314,70 @@ function sgtNowServer() {
   const now = new Date();
   return new Date(now.getTime() + 8 * 60 * 60 * 1000);
 }
-// Hour of day (0-23) in SGT for any instant. Overtime used to read Date#getHours(), which is the
-// server's own time zone — UTC on Render — so "clock-out at 18:00 or later" was really 2am SGT.
-function sgtHourOf(instant) {
-  return new Date(new Date(instant).getTime() + 8 * 60 * 60 * 1000).getUTCHours();
+// Each office's time zone, keyed by users.home_office_country (set by HR). Rules that depend on
+// the time of day — lunch, overtime, the 8:30am clock-in reminder and which calendar day a
+// session belongs to — follow the staff member's own office, so a 9am clock-in in Colombo is
+// 9am, not 11:30am SGT. Company-wide dates (claims, payroll, audit log) stay on SGT.
+const OFFICE_TIME_ZONES = {
+  SG: 'Asia/Singapore',
+  MY: 'Asia/Kuala_Lumpur',
+  CN: 'Asia/Shanghai',
+  LK: 'Asia/Colombo',
+};
+const DEFAULT_TIME_ZONE = 'Asia/Singapore';
+function timeZoneForCountry(country) {
+  return OFFICE_TIME_ZONES[String(country || '').toUpperCase()] || DEFAULT_TIME_ZONE;
 }
-function isSgtLunchWindow(sgt) {
-  const hourDecimal = sgt.getUTCHours() + sgt.getUTCMinutes() / 60;
+async function userTimeZone(userId) {
+  const result = await db.query('SELECT home_office_country FROM users WHERE user_id = $1', [userId]);
+  return timeZoneForCountry(result.rows[0]?.home_office_country);
+}
+
+// Minutes the time zone is ahead of UTC at a given instant (Colombo is +330, Singapore +480).
+function tzOffsetMinutes(instant, timeZone) {
+  const d = new Date(instant);
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(d).map((p) => [p.type, p.value])
+  );
+  const asUtc = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second);
+  return Math.round((asUtc - Math.floor(d.getTime() / 1000) * 1000) / 60000);
+}
+// The wall-clock time in `timeZone` as a Date whose UTC getters read that local time, the same
+// trick as sgtNowServer. Only the UTC getters on the result are meaningful.
+function zonedWallClock(instant, timeZone) {
+  const d = new Date(instant);
+  return new Date(d.getTime() + tzOffsetMinutes(d, timeZone) * 60000);
+}
+
+// Hour of day (0-23) in the staff member's own time zone. Overtime used to read Date#getHours(),
+// which is the server's own time zone — UTC on Render — so "clock-out at 18:00 or later" was
+// really 2am SGT.
+function localHourOf(instant, timeZone) {
+  return zonedWallClock(instant, timeZone).getUTCHours();
+}
+function isLunchWindow(wallClock) {
+  const hourDecimal = wallClock.getUTCHours() + wallClock.getUTCMinutes() / 60;
   return hourDecimal >= 12 && hourDecimal < 14;
 }
 
 // The automatic 1-hour lunch deduction should only apply to a session that actually ran through
 // lunch — previously it fired on ANY session over 1 hour long regardless of when it happened,
 // shorting attendance for people who simply worked a long evening or started late. This checks
-// real overlap against the 12pm-2pm SGT window on the day the session started.
-function sessionOverlapsSgtLunch(startInstant, endInstant) {
+// real overlap against 12pm-2pm in the staff member's own time zone on the day the session started.
+function sessionOverlapsLunch(startInstant, endInstant, timeZone) {
   const start = new Date(startInstant);
   const end = new Date(endInstant);
-  const startSgt = new Date(start.getTime() + 8 * 60 * 60 * 1000);
-  const lunchStartSgt = new Date(startSgt);
-  lunchStartSgt.setUTCHours(12, 0, 0, 0);
-  const lunchEndSgt = new Date(startSgt);
-  lunchEndSgt.setUTCHours(14, 0, 0, 0);
-  const lunchStart = new Date(lunchStartSgt.getTime() - 8 * 60 * 60 * 1000);
-  const lunchEnd = new Date(lunchEndSgt.getTime() - 8 * 60 * 60 * 1000);
+  const offsetMs = tzOffsetMinutes(start, timeZone) * 60000;
+  const startLocal = new Date(start.getTime() + offsetMs);
+  const lunchStartLocal = new Date(startLocal);
+  lunchStartLocal.setUTCHours(12, 0, 0, 0);
+  const lunchEndLocal = new Date(startLocal);
+  lunchEndLocal.setUTCHours(14, 0, 0, 0);
+  const lunchStart = new Date(lunchStartLocal.getTime() - offsetMs);
+  const lunchEnd = new Date(lunchEndLocal.getTime() - offsetMs);
   return start < lunchEnd && end > lunchStart;
 }
 
@@ -7237,17 +7435,16 @@ async function finalizeOrphanedBudgetApprovals() {
 }
 
 async function autoClockOutStaleSessions() {
-  const sgt = sgtNowServer();
-  if (isSgtLunchWindow(sgt)) return; // lunch: hold off the forced clock-out, same as the client
-
   try {
     const stale = await db.query(
-      `SELECT attendance_id, user_id
-       FROM attendance_logs
-       WHERE status = 'ACTIVE' AND clock_out_time IS NULL
-         AND COALESCE(last_activity_confirmed_at, clock_in_time) <= NOW() - INTERVAL '4 hours'`
+      `SELECT al.attendance_id, al.user_id, u.home_office_country
+       FROM attendance_logs al JOIN users u ON u.user_id = al.user_id
+       WHERE al.status = 'ACTIVE' AND al.clock_out_time IS NULL
+         AND COALESCE(al.last_activity_confirmed_at, al.clock_in_time) <= NOW() - INTERVAL '4 hours'`
     );
     for (const row of stale.rows) {
+      // Lunch in the staff member's own time zone: hold off the forced clock-out, same as the client.
+      if (isLunchWindow(zonedWallClock(new Date(), timeZoneForCountry(row.home_office_country)))) continue;
       try {
         await axios.post(`http://localhost:${process.env.PORT || 5000}/api/v1/attendance/clock-out`, {
           userId: row.user_id,
@@ -7299,35 +7496,35 @@ async function checkAnnualHolidayReminder() {
 // banner doesn't. Checked every 15 minutes; each run only sends to someone once, guarded by a
 // same-day notifications-table lookup (same dedup pattern as checkAnnualHolidayReminder).
 async function checkClockInEmailReminders() {
-  const sgt = sgtNowServer();
-  const isWeekday = sgt.getUTCDay() !== 0 && sgt.getUTCDay() !== 6; // sgt's UTC getters hold the SGT wall-clock value
-  if (!isWeekday) return;
-  const hourDecimal = sgt.getUTCHours() + sgt.getUTCMinutes() / 60;
-  if (hourDecimal < 8.5 || hourDecimal >= 12) return; // same 8:30am-noon window as the in-app reminder
-
   const reminderTitle = "You haven't clocked in yet";
   try {
     const staffUsers = await db.query(
-      `SELECT user_id, full_name, email FROM users
+      `SELECT user_id, full_name, email, home_office_country FROM users
        WHERE account_status = 'active' AND NOT is_hidden AND email IS NOT NULL
          AND (user_role = 'staff' OR 'staff' = ANY(user_roles))`
     );
 
     let sent = 0;
     for (const row of staffUsers.rows) {
+      const timeZone = timeZoneForCountry(row.home_office_country);
+      const local = zonedWallClock(new Date(), timeZone); // UTC getters hold the local wall-clock value
+      const isWeekday = local.getUTCDay() !== 0 && local.getUTCDay() !== 6;
+      const hourDecimal = local.getUTCHours() + local.getUTCMinutes() / 60;
+      if (!isWeekday || hourDecimal < 8.5 || hourDecimal >= 12) continue; // same 8:30am-noon window as the in-app reminder
+
       const clockedInToday = await db.query(
         `SELECT 1 FROM attendance_logs
-         WHERE user_id = $1 AND (clock_in_time AT TIME ZONE 'Asia/Singapore')::date = (NOW() AT TIME ZONE 'Asia/Singapore')::date
+         WHERE user_id = $1 AND (clock_in_time AT TIME ZONE $2::text)::date = (NOW() AT TIME ZONE $2::text)::date
          LIMIT 1`,
-        [row.user_id]
+        [row.user_id, timeZone]
       );
       if (clockedInToday.rows.length > 0) continue;
 
       const alreadyReminded = await db.query(
         `SELECT 1 FROM notifications
-         WHERE user_id = $1 AND title = $2 AND created_at::date = (NOW() AT TIME ZONE 'Asia/Singapore')::date
+         WHERE user_id = $1 AND title = $2 AND (created_at AT TIME ZONE $3::text)::date = (NOW() AT TIME ZONE $3::text)::date
          LIMIT 1`,
-        [row.user_id, reminderTitle]
+        [row.user_id, reminderTitle, timeZone]
       );
       if (alreadyReminded.rows.length > 0) continue;
 
