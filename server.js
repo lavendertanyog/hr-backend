@@ -4542,6 +4542,35 @@ app.patch('/api/v1/hr/set-job-details', async (req, res) => {
   }
 });
 
+// HR: delete a department from the department chart. A department is just the name on people's accounts, so
+// this takes the name off everyone: their department is cleared, they stop heading it, and a title that was
+// only the default "Head of {department}" is cleared too. Nobody's reporting line is touched.
+app.patch('/api/v1/hr/delete-department', async (req, res) => {
+  const { requesterId } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  const name = String(req.body.department || '').trim();
+  if (!name) return res.status(400).json({ error: 'Choose the department to delete.' });
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+    const members = await client.query(
+      'UPDATE users SET department = NULL, is_department_head = false WHERE lower(trim(department)) = lower($1) RETURNING user_id', [name]);
+    const heads = await client.query(
+      `UPDATE users SET also_head_of = ARRAY(SELECT d FROM unnest(also_head_of) AS d WHERE lower(trim(d)) <> lower($1))
+       WHERE EXISTS (SELECT 1 FROM unnest(also_head_of) AS d WHERE lower(trim(d)) = lower($1)) RETURNING user_id`, [name]);
+    const titles = await client.query('UPDATE users SET job_position = NULL WHERE lower(trim(job_position)) = lower($1) RETURNING user_id', [`Head of ${name}`]);
+    await client.query('COMMIT');
+    await auditInterceptor('users', requesterId, requesterId, { department: name }, {
+      department_deleted: name, people_removed_from_it: members.rowCount, also_heads_removed: heads.rowCount, default_titles_cleared: titles.rowCount });
+    return res.status(200).json({ success: true, data: { people: members.rowCount, alsoHeads: heads.rowCount, titles: titles.rowCount } });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    return res.status(500).json({ error: 'Failed to delete the department.', detail: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // Set or clear who a person reports to inside one project (the project line). It does not touch the
 // department line (users.supervisor_id), so leave, claims and weekly reports don't move. HR can do this for
 // any project. A project's own Manager or Account Manager can do it for that project, but only to put
