@@ -485,6 +485,8 @@ async function ensureOperationalTables() {
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS department TEXT');
   // Marks the head of a department on the department chart (a department can have more than one).
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_department_head BOOLEAN NOT NULL DEFAULT false');
+  // Other departments this person heads, besides their own (e.g. one person heading two departments).
+  await db.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS also_head_of TEXT[] NOT NULL DEFAULT '{}'");
   // The CEO on the department chart. Only one person is the CEO. The first time the column is added it is set
   // to Sean Tan; after that HR changes it from the chart.
   const ceoColumn = await db.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'is_ceo'");
@@ -4514,10 +4516,11 @@ app.patch('/api/v1/hr/set-job-details', async (req, res) => {
   const hasDepartment = Object.prototype.hasOwnProperty.call(req.body, 'department');
   const hasHead = typeof req.body.isDepartmentHead === 'boolean';
   const hasCeo = typeof req.body.isCeo === 'boolean';
-  if (!hasTitle && !hasDepartment && !hasHead && !hasCeo) return res.status(400).json({ error: 'Send a title, a department, isDepartmentHead or isCeo.' });
+  const hasAlso = Array.isArray(req.body.alsoHeadOf);
+  if (!hasTitle && !hasDepartment && !hasHead && !hasCeo && !hasAlso) return res.status(400).json({ error: 'Send a title, a department, isDepartmentHead, isCeo or alsoHeadOf.' });
   const clean = (v) => { const t = String(v ?? '').trim(); return t ? t.slice(0, 100) : null; };
   try {
-    const before = await db.query('SELECT job_position, department, is_department_head, is_ceo FROM users WHERE user_id = $1', [userId]);
+    const before = await db.query('SELECT job_position, department, is_department_head, is_ceo, also_head_of FROM users WHERE user_id = $1', [userId]);
     if (before.rows.length === 0) return res.status(404).json({ error: 'Person not found.' });
     const was = before.rows[0];
     const jobPosition = hasTitle ? clean(req.body.jobPosition) : was.job_position;
@@ -4525,11 +4528,15 @@ app.patch('/api/v1/hr/set-job-details', async (req, res) => {
     // Someone with no department can't head one.
     const isHead = department ? (hasHead ? req.body.isDepartmentHead : was.is_department_head) : false;
     const isCeo = hasCeo ? req.body.isCeo : was.is_ceo;
-    await db.query('UPDATE users SET job_position = $1, department = $2, is_department_head = $3, is_ceo = $4 WHERE user_id = $5', [jobPosition, department, isHead, isCeo, userId]);
+    // Other departments they head: trimmed, no repeats, and never their own department (that is is_department_head).
+    const alsoHeadOf = hasAlso
+      ? [...new Set(req.body.alsoHeadOf.map((d) => clean(d)).filter((d) => d && (!department || d.toLowerCase() !== department.toLowerCase())))].slice(0, 20)
+      : (was.also_head_of || []);
+    await db.query('UPDATE users SET job_position = $1, department = $2, is_department_head = $3, is_ceo = $4, also_head_of = $5 WHERE user_id = $6', [jobPosition, department, isHead, isCeo, alsoHeadOf, userId]);
     // There is only one CEO: making someone the CEO takes it from whoever had it.
     if (isCeo && !was.is_ceo) await db.query('UPDATE users SET is_ceo = false WHERE is_ceo AND user_id <> $1', [userId]);
-    await auditInterceptor('users', userId, requesterId, was, { job_position: jobPosition, department, is_department_head: isHead, is_ceo: isCeo });
-    return res.status(200).json({ success: true, data: { job_position: jobPosition, department, is_department_head: isHead, is_ceo: isCeo } });
+    await auditInterceptor('users', userId, requesterId, was, { job_position: jobPosition, department, is_department_head: isHead, is_ceo: isCeo, also_head_of: alsoHeadOf });
+    return res.status(200).json({ success: true, data: { job_position: jobPosition, department, is_department_head: isHead, is_ceo: isCeo, also_head_of: alsoHeadOf } });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to save the job details.', detail: error.message });
   }
@@ -5851,7 +5858,7 @@ app.get('/api/v1/hr/active-users', async (req, res) => {
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   try {
     const result = await db.query(
-      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at, leave_entitlement_days, supervisor_id, job_position, department, is_department_head, is_ceo
+      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at, leave_entitlement_days, supervisor_id, job_position, department, is_department_head, is_ceo, also_head_of
        FROM users
        WHERE account_status = 'active' AND NOT is_hidden
        ORDER BY full_name ASC`
