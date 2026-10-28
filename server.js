@@ -480,6 +480,28 @@ async function ensureOperationalTables() {
   // Values: 'account_manager' | 'manager' | 'staff' (independent of global user_roles)
   await db.query(`ALTER TABLE project_assignments ADD COLUMN IF NOT EXISTS project_role TEXT NOT NULL DEFAULT 'staff';`);
 
+  // Job details shown on the department line: the person's position (job title and level) and department.
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS job_position TEXT');
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS department TEXT');
+
+  // The project line: who a person reports to inside one project. It is separate from the department
+  // line (users.supervisor_id), which decides leave, claims and weekly reports. The first time the
+  // column is added it is filled from the existing line managers, where that manager is also a Manager
+  // on the same project, so the project trees look the same as before; after that it is only changed on purpose.
+  const projectManagerColumn = await db.query(
+    "SELECT 1 FROM information_schema.columns WHERE table_name = 'project_assignments' AND column_name = 'project_manager_id'"
+  );
+  if (projectManagerColumn.rows.length === 0) {
+    await db.query('ALTER TABLE project_assignments ADD COLUMN project_manager_id UUID REFERENCES users(user_id) ON DELETE SET NULL');
+    await db.query(
+      `UPDATE project_assignments pa SET project_manager_id = u.supervisor_id
+       FROM users u
+       WHERE u.user_id = pa.user_id AND pa.project_role = 'staff' AND u.supervisor_id IS NOT NULL
+         AND EXISTS (SELECT 1 FROM project_assignments m
+                     WHERE m.project_code = pa.project_code AND m.user_id = u.supervisor_id AND m.project_role = 'manager')`
+    );
+  }
+
   // Budget requests table
   await db.query(`
     CREATE TABLE IF NOT EXISTS budget_requests (
@@ -4472,6 +4494,67 @@ app.post('/api/v1/projects/create', async (req, res) => {
   }
 });
 
+// This route must stay above PATCH /projects/:projectCode, which would otherwise take its path.
+// HR: set a person's position (job title and level) and department. They are shown on the department line.
+app.patch('/api/v1/hr/set-job-details', async (req, res) => {
+  const { requesterId, userId } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  if (!UUID_RE.test(String(userId || ''))) return res.status(400).json({ error: 'userId must be a valid id.' });
+  const clean = (v) => { const t = String(v ?? '').trim(); return t ? t.slice(0, 100) : null; };
+  const jobPosition = clean(req.body.jobPosition);
+  const department = clean(req.body.department);
+  try {
+    const before = await db.query('SELECT job_position, department FROM users WHERE user_id = $1', [userId]);
+    if (before.rows.length === 0) return res.status(404).json({ error: 'Person not found.' });
+    await db.query('UPDATE users SET job_position = $1, department = $2 WHERE user_id = $3', [jobPosition, department, userId]);
+    await auditInterceptor('users', userId, requesterId, before.rows[0], { job_position: jobPosition, department });
+    return res.status(200).json({ success: true, data: { job_position: jobPosition, department } });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to save the job details.', detail: error.message });
+  }
+});
+
+// Set or clear who a person reports to inside one project (the project line). It does not touch the
+// department line (users.supervisor_id), so leave, claims and weekly reports don't move. HR can do this for
+// any project. A project's own Manager or Account Manager can do it for that project, but only to put
+// someone under themselves or to take someone off their own list.
+app.patch('/api/v1/projects/set-project-manager', async (req, res) => {
+  const { requesterId, projectCode, userId, managerId } = req.body;
+  const code = String(projectCode || '').toUpperCase().trim();
+  const newManager = managerId ? String(managerId) : null;
+  if (!UUID_RE.test(String(requesterId || '')) || !UUID_RE.test(String(userId || '')) || !code || (newManager && !UUID_RE.test(newManager))) {
+    return res.status(400).json({ error: 'requesterId, projectCode and userId are required, and ids must be valid.' });
+  }
+  if (newManager === userId) return res.status(400).json({ error: "A person can't report to themselves." });
+  try {
+    const requester = await db.query('SELECT user_role, user_roles, is_admin FROM users WHERE user_id = $1', [requesterId]);
+    if (requester.rows.length === 0) return res.status(403).json({ error: 'Requester not found.' });
+    const isHr = userHasRole(requester.rows[0], 'hr') || Boolean(requester.rows[0].is_admin);
+    if (!isHr) {
+      const lead = await db.query(
+        "SELECT 1 FROM project_assignments WHERE user_id = $1 AND project_code = $2 AND project_role IN ('manager', 'account_manager') LIMIT 1",
+        [requesterId, code]
+      );
+      if (lead.rows.length === 0) return res.status(403).json({ error: 'Only HR or a Manager of this project can change who reports to whom on it.' });
+    }
+    const person = await db.query('SELECT assignment_id, project_manager_id FROM project_assignments WHERE user_id = $1 AND project_code = $2', [userId, code]);
+    if (person.rows.length === 0) return res.status(404).json({ error: 'That person is not assigned to this project.' });
+    if (newManager) {
+      const mgr = await db.query("SELECT 1 FROM project_assignments WHERE user_id = $1 AND project_code = $2 AND project_role = 'manager'", [newManager, code]);
+      if (mgr.rows.length === 0) return res.status(400).json({ error: 'The person they report to must be a Manager on this project.' });
+    }
+    if (!isHr && !(newManager === requesterId || (newManager === null && person.rows[0].project_manager_id === requesterId))) {
+      return res.status(403).json({ error: 'You can only add people to your own team on a project, or remove people from it.' });
+    }
+    await db.query('UPDATE project_assignments SET project_manager_id = $1 WHERE user_id = $2 AND project_code = $3', [newManager, userId, code]);
+    await auditInterceptor('project_assignments', person.rows[0].assignment_id, requesterId,
+      { project_manager_id: person.rows[0].project_manager_id }, { project_manager_id: newManager });
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to set who they report to on this project.', detail: error.message });
+  }
+});
+
 // PATCH /api/v1/projects/:projectCode - edit an existing project
 app.patch('/api/v1/projects/:projectCode', async (req, res) => {
   const { projectCode } = req.params;
@@ -5747,7 +5830,7 @@ app.get('/api/v1/hr/active-users', async (req, res) => {
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   try {
     const result = await db.query(
-      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at, leave_entitlement_days
+      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at, leave_entitlement_days, supervisor_id, job_position, department
        FROM users
        WHERE account_status = 'active' AND NOT is_hidden
        ORDER BY full_name ASC`
@@ -6157,7 +6240,7 @@ app.get('/api/v1/account-manager/:userId/my-projects', async (req, res) => {
     const projectsWithTeam = await Promise.all(projectsRes.rows.map(async (p) => {
       const members = await db.query(
         `SELECT u.user_id, u.full_name, u.email, u.user_role, u.user_roles, u.supervisor_id,
-                pa.project_role, pa.assignment_id
+                pa.project_role, pa.assignment_id, pa.project_manager_id
          FROM project_assignments pa
          JOIN users u ON u.user_id = pa.user_id
          WHERE pa.project_code = $1 AND u.account_status = 'active'
@@ -6540,6 +6623,44 @@ app.patch('/api/v1/hr/remove-supervisor', async (req, res) => {
   }
 });
 
+// HR: set, change or clear a person's line manager in the department hierarchy. Unlike
+// set-supervisor, the manager doesn't need a manager role (the department line follows the company
+// chart, where a Sales Manager can hold the staff role), and a change that would make a loop is refused.
+app.patch('/api/v1/hr/set-line-manager', async (req, res) => {
+  const { requesterId, userId, supervisorId } = req.body;
+  if (!await requireRoleCheck(requesterId, 'hr', res)) return;
+  const supervisor = supervisorId ? String(supervisorId) : null;
+  if (!UUID_RE.test(String(userId || '')) || (supervisor && !UUID_RE.test(supervisor))) {
+    return res.status(400).json({ error: 'userId and supervisorId must be valid ids.' });
+  }
+  if (supervisor === userId) return res.status(400).json({ error: "A person can't be their own line manager." });
+  try {
+    const person = await db.query('SELECT full_name, supervisor_id FROM users WHERE user_id = $1', [userId]);
+    if (person.rows.length === 0) return res.status(404).json({ error: 'Person not found.' });
+    if (supervisor) {
+      const manager = await db.query("SELECT full_name FROM users WHERE user_id = $1 AND account_status = 'active'", [supervisor]);
+      if (manager.rows.length === 0) return res.status(404).json({ error: 'That line manager was not found or is not active.' });
+      // Walk up from the new manager; reaching this person means they would end up reporting to themselves.
+      const loop = await db.query(
+        `WITH RECURSIVE above AS (
+           SELECT user_id, supervisor_id FROM users WHERE user_id = $1
+           UNION
+           SELECT u.user_id, u.supervisor_id FROM users u JOIN above a ON u.user_id = a.supervisor_id
+         ) SELECT 1 FROM above WHERE user_id = $2 LIMIT 1`,
+        [supervisor, userId]
+      );
+      if (loop.rows.length > 0) {
+        return res.status(400).json({ error: `${manager.rows[0].full_name} already reports to ${person.rows[0].full_name}, so this would make a loop. Move ${manager.rows[0].full_name} first.` });
+      }
+    }
+    await db.query('UPDATE users SET supervisor_id = $1 WHERE user_id = $2', [supervisor, userId]);
+    await auditInterceptor('users', userId, requesterId, { supervisor_id: person.rows[0].supervisor_id }, { supervisor_id: supervisor });
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to set the line manager.', detail: error.message });
+  }
+});
+
 // GET /api/v1/projects/utilisation-detail - weighted utilisation per project (for HR/manager portals)
 app.get('/api/v1/projects/utilisation-detail', async (req, res) => {
   try {
@@ -6684,7 +6805,7 @@ app.get('/api/v1/projects/:projectCode/members', async (req, res) => {
     const result = await db.query(
       `SELECT
          u.user_id, u.full_name, u.email, u.user_role, u.user_roles, u.supervisor_id,
-         pa.project_role, pa.assignment_id
+         pa.project_role, pa.assignment_id, pa.project_manager_id
        FROM project_assignments pa
        JOIN users u ON u.user_id = pa.user_id
        WHERE pa.project_code = $1
