@@ -609,6 +609,9 @@ async function ensureOperationalTables() {
   await db.query(`CREATE INDEX IF NOT EXISTS claims_status_idx ON claims (status);`);
   await db.query(`CREATE INDEX IF NOT EXISTS claim_items_claim_idx ON claim_items (claim_id);`);
   await db.query(`CREATE INDEX IF NOT EXISTS claim_scans_created_idx ON claim_scans (created_at);`);
+  // A follow-up scan reads one receipt cropped out of a file that held several. It counts toward
+  // the monthly cost cap, but not the per-person daily limit (the file already counted once).
+  await db.query(`ALTER TABLE claim_scans ADD COLUMN IF NOT EXISTS parent_scan_id UUID;`);
 
   // Generic audit trail — every edit to user-facing data (attendance times, allocation
   // project/hours, progress %, leave requests, budget/project approvals, ...) is recorded here
@@ -4830,8 +4833,11 @@ const GEMINI_PRICE_OUT_PER_M = Number(process.env.GEMINI_PRICE_OUT_PER_M || 1.5)
 const CLAIM_SCAN_MONTHLY_CAP_USD = Number(process.env.CLAIM_SCAN_MONTHLY_CAP_USD || 19);
 const CLAIM_SCAN_DAILY_LIMIT = Number(process.env.CLAIM_SCAN_DAILY_LIMIT_PER_USER || 20);
 const CLAIM_SCAN_TIMEOUT_MS = 45_000;
-const RECEIPT_MAX_CHARS = 4_000_000; // a base64 image of about 3 MB; the portal sends ~300 KB
-const RECEIPT_DATA_URL_RE = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/;
+// A receipt is a photo (the portal shrinks it to ~300 KB) or a PDF (sent as is), kept as a data
+// URL. Either can hold several receipts; the scan returns each one.
+const RECEIPT_MAX_CHARS = 4_000_000; // a base64 file of about 3 MB
+const RECEIPT_DATA_URL_RE = /^data:(image\/(?:jpeg|png|webp)|application\/pdf);base64,([A-Za-z0-9+/=]+)$/;
+const RECEIPT_MAX_PER_SCAN = 10;
 const SGT_MONTH_START_SQL = `(date_trunc('month', now() AT TIME ZONE 'Asia/Singapore') AT TIME ZONE 'Asia/Singapore')`;
 const SGT_DAY_START_SQL = `(date_trunc('day', now() AT TIME ZONE 'Asia/Singapore') AT TIME ZONE 'Asia/Singapore')`;
 
@@ -4844,8 +4850,13 @@ function getGeminiClient() {
 
 function parseReceiptImage(value) {
   const match = RECEIPT_DATA_URL_RE.exec(String(value || ''));
-  if (!match) return { error: 'Please attach a photo of the receipt (JPEG, PNG or WebP).' };
-  if (value.length > RECEIPT_MAX_CHARS) return { error: 'The receipt photo is too large. Please use a smaller photo.' };
+  if (!match) return { error: 'Please attach a photo (JPEG, PNG or WebP) or a PDF of the receipt.' };
+  const isPdf = match[1] === 'application/pdf';
+  if (value.length > RECEIPT_MAX_CHARS) {
+    return { error: isPdf ? 'The receipt PDF is too large (3 MB at most).' : 'The receipt photo is too large. Please use a smaller photo.' };
+  }
+  // Every PDF starts with "%PDF-", which is "JVBERi0" in base64.
+  if (isPdf && !match[2].startsWith('JVBERi0')) return { error: 'This PDF could not be read. Please attach the receipt again.' };
   return { mimeType: match[1], data: match[2] };
 }
 
@@ -5109,25 +5120,35 @@ async function saveClaimCharges(client, claimId, charges) {
 }
 
 const RECEIPT_SCAN_PROMPT = [
-  'You read a photo of a receipt for a staff expense claim in Singapore or Malaysia.',
-  'Extract only what is printed on the receipt. Never guess an amount; use null for anything you cannot read.',
+  'You read a photo or PDF of receipts for staff expense claims in Singapore or Malaysia.',
+  'It can hold more than one receipt: several laid out in one photo, or one per page of a PDF.',
+  `Return one entry in receipts for each separate receipt, in the order they appear (at most ${RECEIPT_MAX_PER_SCAN}).`,
+  'Never merge two receipts into one entry. One receipt that runs over several pages is still one entry.',
+  'If nothing in it is a receipt, return a single entry with readable false.',
+  'For each receipt, extract only what is printed on it. Never guess an amount; use null for anything you cannot read.',
+  '- page: the PDF page the receipt is on, starting at 1 (1 for a photo).',
+  '- box_2d: where the whole receipt is on that page or photo, as [ymin, xmin, ymax, xmax] scaled 0 to 1000.',
   '- document_type: RECEIPT for a receipt, tax invoice or invoice; QUOTATION for a quotation, estimate or proforma; OTHER if it is not a bill.',
   '- purchase_date: the date on the receipt as YYYY-MM-DD.',
   '- merchant: the shop, restaurant or company name.',
   '- currency: ISO 4217 code. "RM" means MYR. Use SGD when the receipt shows only "$" with no other currency.',
   '- items: each line purchased, with its quantity and line amount. Leave out subtotal, tax, service charge, rounding, discount, change, payment and tax-summary lines.',
+  '  List every item line separately as printed, even when two lines are the same; never combine lines into one with a bigger quantity.',
+  '  Leave out indented sub-lines that only describe the parts of a set or combo and have no price of their own.',
+  '  The amount is the line price before any discount; when a line shows a price and a discounted amount, use the price and list the discount under charges.',
   '- charges: every line between the items and the total that changes the amount, once each:',
   '  SERVICE_CHARGE for a service charge; TAX for GST, SST, service tax, sales tax or government tax (one line per tax rate);',
   '  ROUNDING for a rounding adjustment (negative if it lowers the total); DISCOUNT for a discount or voucher (as a positive amount); OTHER for anything else.',
   '  Give the label as printed and the rate as a percentage when printed. Skip tax summary tables that repeat a tax line already listed.',
   '- tax_inclusive: true when the item prices already include the tax (for example "prices include GST"), so the tax was not added on top.',
+  '  A tax summary table does not mean the prices include tax: if the subtotal plus the tax line makes the total, tax_inclusive is false.',
   '- total: the final amount paid.',
   `- category: the best fit from ${CLAIM_CATEGORY_CODES.join(', ')}.`,
-  '- readable: false if the photo is not a receipt or the total cannot be read.',
+  '- readable: false if it is not a receipt or the total cannot be read.',
 ].join('\n');
 
 const nullable = (type) => ({ anyOf: [{ type }, { type: 'null' }] });
-const RECEIPT_SCAN_SCHEMA = {
+const RECEIPT_SCHEMA = {
   type: 'object',
   properties: {
     readable: { type: 'boolean' },
@@ -5159,12 +5180,57 @@ const RECEIPT_SCAN_SCHEMA = {
     },
     tax_inclusive: { type: 'boolean' },
     total: nullable('number'),
+    page: { type: 'integer' },
+    box_2d: { type: 'array', items: { type: 'integer' } },
   },
-  required: ['readable', 'document_type', 'purchase_date', 'merchant', 'currency', 'category', 'items', 'charges', 'tax_inclusive', 'total'],
+  required: ['readable', 'document_type', 'purchase_date', 'merchant', 'currency', 'category', 'items', 'charges', 'tax_inclusive', 'total', 'page', 'box_2d'],
 };
+const RECEIPT_SCAN_SCHEMA = {
+  type: 'object',
+  properties: { receipts: { type: 'array', items: RECEIPT_SCHEMA } },
+  required: ['receipts'],
+};
+
+// The receipts in a scan, oldest scans (one receipt, no array) included.
+const scanReceipts = (raw) => (Array.isArray(raw?.receipts) ? raw.receipts : raw ? [raw] : []);
 
 // Turns Gemini's JSON into the form fields the portal fills in, dropping anything malformed.
 function normalizeReceiptScan(raw) {
+  return reconcileReceipt(readReceiptScan(raw));
+}
+
+// Gemini sometimes misjudges two things the printed total settles: whether the tax was added on
+// top (a tax summary table can make it say prices include tax), and whether a discount printed
+// under an item was already taken off that item's amount (so it would be taken off twice). When
+// the lines don't add up to the total as read, but do with the other tax setting, or without the
+// discount lines, that reading is used. The sums match the portal's check (chargeEffect).
+function reconcileReceipt(r) {
+  if (r.totalAmount === null || r.items.length === 0 || r.items.some((it) => it.amount === null)) return r;
+  const itemsTotal = r.items.reduce((s, it) => s + it.amount, 0);
+  const chargesTotal = (charges, inclusive) => charges.reduce((s, ch) => (
+    s + (ch.kind === 'DISCOUNT' ? -ch.amount : ch.kind === 'TAX' && inclusive ? 0 : ch.amount)
+  ), 0);
+  const fits = (charges, inclusive) => Math.abs(roundMoney(itemsTotal + chargesTotal(charges, inclusive)) - r.totalAmount) < 0.005;
+  if (fits(r.charges, r.taxInclusive)) return r;
+  const hasTax = r.charges.some((ch) => ch.kind === 'TAX');
+  if (hasTax && fits(r.charges, !r.taxInclusive)) return { ...r, taxInclusive: !r.taxInclusive };
+  const discounts = r.charges.filter((ch) => ch.kind === 'DISCOUNT');
+  if (discounts.length === 0) return r;
+  const rest = r.charges.filter((ch) => ch.kind !== 'DISCOUNT');
+  for (const inclusive of hasTax ? [r.taxInclusive, !r.taxInclusive] : [r.taxInclusive]) {
+    if (!fits(rest, inclusive)) continue;
+    // With one item the discount is clearly its own: show the item at its price before the
+    // discount, as printed, and keep the discount line. Otherwise drop the discount lines.
+    if (r.items.length === 1) {
+      const off = discounts.reduce((s, ch) => s + ch.amount, 0);
+      return { ...r, taxInclusive: inclusive, items: [{ ...r.items[0], amount: roundMoney(r.items[0].amount + off) }] };
+    }
+    return { ...r, taxInclusive: inclusive, charges: rest };
+  }
+  return r;
+}
+
+function readReceiptScan(raw) {
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? roundMoney(v) : null);
   const date = isRealYmd(raw?.purchase_date) && raw.purchase_date <= sgtTodayYmd() ? raw.purchase_date : null;
   const currency = /^[A-Z]{3}$/.test(String(raw?.currency || '').toUpperCase()) ? String(raw.currency).toUpperCase() : 'SGD';
@@ -5193,14 +5259,24 @@ function normalizeReceiptScan(raw) {
     taxInclusive: raw?.tax_inclusive === true,
     documentType: ['RECEIPT', 'QUOTATION', 'OTHER'].includes(raw?.document_type) ? raw.document_type : 'RECEIPT',
     totalAmount: num(raw?.total) !== null && num(raw?.total) > 0 ? num(raw.total) : null,
+    // Where the receipt is, so the portal can crop it out and read it on its own when one photo
+    // or page holds several: [ymin, xmin, ymax, xmax] on a 0-1000 scale, or null if unusable.
+    page: Number.isInteger(raw?.page) && raw.page >= 1 ? raw.page : 1,
+    box: receiptBox(raw?.box_2d),
   };
 }
 
-async function logClaimScan(userId, outcome, { inputTokens = 0, outputTokens = 0, cost = 0, extraction = null } = {}) {
+function receiptBox(b) {
+  if (!Array.isArray(b) || b.length !== 4 || !b.every((n) => Number.isFinite(n))) return null;
+  const [ymin, xmin, ymax, xmax] = b.map((n) => Math.min(1000, Math.max(0, Math.round(n))));
+  return ymax - ymin >= 20 && xmax - xmin >= 20 ? [ymin, xmin, ymax, xmax] : null;
+}
+
+async function logClaimScan(userId, outcome, { inputTokens = 0, outputTokens = 0, cost = 0, extraction = null, parentScanId = null } = {}) {
   const r = await db.query(
-    `INSERT INTO claim_scans (user_id, input_tokens, output_tokens, cost_usd, outcome, extraction)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING scan_id`,
-    [userId, inputTokens, outputTokens, cost, outcome, extraction ? JSON.stringify(extraction) : null]
+    `INSERT INTO claim_scans (user_id, input_tokens, output_tokens, cost_usd, outcome, extraction, parent_scan_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING scan_id`,
+    [userId, inputTokens, outputTokens, cost, outcome, extraction ? JSON.stringify(extraction) : null, parentScanId]
   );
   return r.rows[0].scan_id;
 }
@@ -5227,7 +5303,8 @@ app.get('/api/v1/claims/fx-rate', async (req, res) => {
   }
 });
 
-// Reads a receipt photo with Gemini and returns the fields for the staff member to check.
+// Reads a receipt photo or PDF with Gemini and returns the fields of each receipt in it for the
+// staff member to check.
 // Nothing is saved except the scan log. Expected "can't scan" cases answer 200 with
 // available:false and a message, so the portal simply switches to manual entry.
 app.post('/api/v1/claims/scan', async (req, res) => {
@@ -5240,17 +5317,35 @@ app.post('/api/v1/claims/scan', async (req, res) => {
     const client = getGeminiClient();
     if (!client) return manual('Receipt scanning is not set up yet. Please fill in the details yourself.');
 
+    // A follow-up read of one receipt cropped from an earlier scan of this person's, made in the
+    // last hour (at most two per receipt it found, so "Read again" works). Anything else counts
+    // as a new scan.
+    let parentScanId = null;
+    if (req.body.parentScanId && UUID_RE.test(String(req.body.parentScanId))) {
+      const parent = await db.query(
+        `SELECT p.extraction, (SELECT COUNT(*)::int FROM claim_scans c WHERE c.parent_scan_id = p.scan_id) AS followups
+         FROM claim_scans p
+         WHERE p.scan_id = $1 AND p.user_id = $2 AND p.parent_scan_id IS NULL AND p.outcome = 'ok'
+           AND p.created_at > CURRENT_TIMESTAMP - INTERVAL '1 hour'`,
+        [req.body.parentScanId, session.user_id]
+      );
+      const p = parent.rows[0];
+      if (p && p.followups < 2 * scanReceipts(p.extraction).length) parentScanId = req.body.parentScanId;
+    }
+    const log = (outcome, extra = {}) => logClaimScan(session.user_id, outcome, { ...extra, parentScanId });
+
     const month = await db.query(`SELECT COALESCE(SUM(cost_usd), 0) AS cost FROM claim_scans WHERE created_at >= ${SGT_MONTH_START_SQL}`);
     if (Number(month.rows[0].cost) >= CLAIM_SCAN_MONTHLY_CAP_USD) {
-      await logClaimScan(session.user_id, 'blocked');
+      await log('blocked');
       return manual("Receipt scanning has reached this month's limit. Please fill in the details yourself.");
     }
     const today = await db.query(
-      `SELECT COUNT(*)::int AS n FROM claim_scans WHERE user_id = $1 AND outcome <> 'blocked' AND created_at >= ${SGT_DAY_START_SQL}`,
+      `SELECT COUNT(*)::int AS n FROM claim_scans
+       WHERE user_id = $1 AND outcome <> 'blocked' AND parent_scan_id IS NULL AND created_at >= ${SGT_DAY_START_SQL}`,
       [session.user_id]
     );
-    if (today.rows[0].n >= CLAIM_SCAN_DAILY_LIMIT) {
-      await logClaimScan(session.user_id, 'blocked');
+    if (!parentScanId && today.rows[0].n >= CLAIM_SCAN_DAILY_LIMIT) {
+      await log('blocked');
       return manual(`You've used today's ${CLAIM_SCAN_DAILY_LIMIT} receipt scans. Please fill in the details yourself.`);
     }
 
@@ -5271,7 +5366,7 @@ app.post('/api/v1/claims/scan', async (req, res) => {
       ]);
     } catch (err) {
       console.error('[claims] Receipt scan failed:', err.message);
-      await logClaimScan(session.user_id, 'error');
+      await log('error');
       return manual("We couldn't read the receipt right now. Please fill in the details yourself.");
     }
 
@@ -5281,17 +5376,21 @@ app.post('/api/v1/claims/scan', async (req, res) => {
     const cost = (inputTokens * GEMINI_PRICE_IN_PER_M + outputTokens * GEMINI_PRICE_OUT_PER_M) / 1e6;
     let raw = null;
     try { raw = JSON.parse(response.text || ''); } catch (_) {}
-    const scanId = await logClaimScan(session.user_id, raw ? 'ok' : 'error', { inputTokens, outputTokens, cost, extraction: raw });
+    const scanId = await log(raw ? 'ok' : 'error', { inputTokens, outputTokens, cost, extraction: raw });
     if (!raw) return manual("We couldn't read the receipt. Please fill in the details yourself.");
-    const fields = normalizeReceiptScan(raw);
-    if (!fields.readable) {
-      return res.status(200).json({ success: true, available: true, scanId, data: fields, message: "This photo doesn't look like a readable receipt. Check the details or retake the photo." });
-    }
-    // A quotation or estimate isn't proof of payment; the details are still filled in.
-    if (fields.documentType === 'QUOTATION') {
-      return res.status(200).json({ success: true, available: true, scanId, data: fields, message: 'This looks like a quotation or estimate, not a receipt. Claims need the final receipt or tax invoice, so upload that instead if you have it.' });
-    }
-    return res.status(200).json({ success: true, available: true, scanId, data: fields });
+    // One entry per receipt found. Unreadable entries are dropped when others were read; if none
+    // were, the first comes back so the card still shows why. Each entry carries its index in
+    // the scan, which the claim sends back so it keeps only its own receipt's extraction.
+    const all = scanReceipts(raw).slice(0, RECEIPT_MAX_PER_SCAN).map((r, scanIndex) => ({ ...normalizeReceiptScan(r), scanIndex }));
+    const readable = all.filter((r) => r.readable);
+    const receipts = (readable.length ? readable : all.slice(0, 1)).map((fields) => {
+      if (!fields.readable) return { ...fields, message: "This doesn't look like a readable receipt. Check the details or attach a clearer photo or PDF." };
+      // A quotation or estimate isn't proof of payment; the details are still filled in.
+      if (fields.documentType === 'QUOTATION') return { ...fields, message: 'This looks like a quotation or estimate, not a receipt. Claims need the final receipt or tax invoice, so upload that instead if you have it.' };
+      return fields;
+    });
+    if (receipts.length === 0) return manual("We couldn't find a receipt in this file. Please fill in the details yourself.");
+    return res.status(200).json({ success: true, available: true, scanId, data: { receipts } });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to scan the receipt.', detail: error.message });
   }
@@ -5326,7 +5425,10 @@ app.post('/api/v1/claims', async (req, res) => {
     let aiExtraction = null;
     if (req.body.scanId && UUID_RE.test(String(req.body.scanId))) {
       const scan = await db.query('SELECT extraction FROM claim_scans WHERE scan_id = $1 AND user_id = $2', [req.body.scanId, session.user_id]);
-      aiExtraction = scan.rows[0]?.extraction || null;
+      // A scan can hold several receipts; keep only the one this claim is for.
+      const found = scanReceipts(scan.rows[0]?.extraction);
+      const scanIndex = Number.isInteger(req.body.scanIndex) ? req.body.scanIndex : 0;
+      aiExtraction = found[scanIndex] || null;
     }
 
     const fx = await claimFxFields(v);
