@@ -483,6 +483,15 @@ async function ensureOperationalTables() {
   // Job details shown on the department line: the person's position (job title and level) and department.
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS job_position TEXT');
   await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS department TEXT');
+  // Marks the head of a department on the department chart (a department can have more than one).
+  await db.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS is_department_head BOOLEAN NOT NULL DEFAULT false');
+  // The CEO on the department chart. Only one person is the CEO. The first time the column is added it is set
+  // to Sean Tan; after that HR changes it from the chart.
+  const ceoColumn = await db.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'is_ceo'");
+  if (ceoColumn.rows.length === 0) {
+    await db.query('ALTER TABLE users ADD COLUMN is_ceo BOOLEAN NOT NULL DEFAULT false');
+    await db.query("UPDATE users SET is_ceo = true WHERE lower(email) = 'sean.tan@nextan.com.sg'");
+  }
 
   // The project line: who a person reports to inside one project. It is separate from the department
   // line (users.supervisor_id), which decides leave, claims and weekly reports. The first time the
@@ -4495,20 +4504,32 @@ app.post('/api/v1/projects/create', async (req, res) => {
 });
 
 // This route must stay above PATCH /projects/:projectCode, which would otherwise take its path.
-// HR: set a person's position (job title and level) and department. They are shown on the department line.
+// HR: set a person's title (job title and level), department and whether they head their department. They
+// are shown on the department chart. Send only the fields to change; the others are left as they are.
 app.patch('/api/v1/hr/set-job-details', async (req, res) => {
   const { requesterId, userId } = req.body;
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   if (!UUID_RE.test(String(userId || ''))) return res.status(400).json({ error: 'userId must be a valid id.' });
+  const hasTitle = Object.prototype.hasOwnProperty.call(req.body, 'jobPosition');
+  const hasDepartment = Object.prototype.hasOwnProperty.call(req.body, 'department');
+  const hasHead = typeof req.body.isDepartmentHead === 'boolean';
+  const hasCeo = typeof req.body.isCeo === 'boolean';
+  if (!hasTitle && !hasDepartment && !hasHead && !hasCeo) return res.status(400).json({ error: 'Send a title, a department, isDepartmentHead or isCeo.' });
   const clean = (v) => { const t = String(v ?? '').trim(); return t ? t.slice(0, 100) : null; };
-  const jobPosition = clean(req.body.jobPosition);
-  const department = clean(req.body.department);
   try {
-    const before = await db.query('SELECT job_position, department FROM users WHERE user_id = $1', [userId]);
+    const before = await db.query('SELECT job_position, department, is_department_head, is_ceo FROM users WHERE user_id = $1', [userId]);
     if (before.rows.length === 0) return res.status(404).json({ error: 'Person not found.' });
-    await db.query('UPDATE users SET job_position = $1, department = $2 WHERE user_id = $3', [jobPosition, department, userId]);
-    await auditInterceptor('users', userId, requesterId, before.rows[0], { job_position: jobPosition, department });
-    return res.status(200).json({ success: true, data: { job_position: jobPosition, department } });
+    const was = before.rows[0];
+    const jobPosition = hasTitle ? clean(req.body.jobPosition) : was.job_position;
+    const department = hasDepartment ? clean(req.body.department) : was.department;
+    // Someone with no department can't head one.
+    const isHead = department ? (hasHead ? req.body.isDepartmentHead : was.is_department_head) : false;
+    const isCeo = hasCeo ? req.body.isCeo : was.is_ceo;
+    await db.query('UPDATE users SET job_position = $1, department = $2, is_department_head = $3, is_ceo = $4 WHERE user_id = $5', [jobPosition, department, isHead, isCeo, userId]);
+    // There is only one CEO: making someone the CEO takes it from whoever had it.
+    if (isCeo && !was.is_ceo) await db.query('UPDATE users SET is_ceo = false WHERE is_ceo AND user_id <> $1', [userId]);
+    await auditInterceptor('users', userId, requesterId, was, { job_position: jobPosition, department, is_department_head: isHead, is_ceo: isCeo });
+    return res.status(200).json({ success: true, data: { job_position: jobPosition, department, is_department_head: isHead, is_ceo: isCeo } });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to save the job details.', detail: error.message });
   }
@@ -5830,7 +5851,7 @@ app.get('/api/v1/hr/active-users', async (req, res) => {
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   try {
     const result = await db.query(
-      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at, leave_entitlement_days, supervisor_id, job_position, department
+      `SELECT user_id, full_name, email, user_role, user_roles, account_status, created_at, leave_entitlement_days, supervisor_id, job_position, department, is_department_head, is_ceo
        FROM users
        WHERE account_status = 'active' AND NOT is_hidden
        ORDER BY full_name ASC`
