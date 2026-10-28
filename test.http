@@ -98,3 +98,61 @@ Content-Type: application/json
   "requestId": "<request_id>",
   "reviewerId": "<manager user_id>"
 }
+
+### Claims: scan a receipt photo (returns fields to check; nothing saved)
+POST http://localhost:5000/api/v1/claims/scan
+Content-Type: application/json
+Authorization: Bearer <session.token>
+
+{
+  "receiptImage": "data:image/jpeg;base64,<base64>"
+}
+
+### Claims: submit
+POST http://localhost:5000/api/v1/claims
+Content-Type: application/json
+Authorization: Bearer <session.token>
+
+{
+  "purchaseDate": "2026-10-04",
+  "merchant": "Oracle Symphony (Tropicana) Sdn Bhd",
+  "category": "MEALS",
+  "currency": "MYR",
+  "totalAmount": 70.8,
+  "items": [{ "description": "Head charges (WK) A5", "quantity": 2, "amount": 60 }],
+  "charges": [
+    { "kind": "SERVICE_CHARGE", "label": "Service charge", "rate": 10, "amount": 6 },
+    { "kind": "TAX", "label": "SST 8%", "rate": 8, "amount": 4.8 }
+  ],
+  "taxInclusive": false,
+  "receiptImage": "data:image/jpeg;base64,<base64>",
+  "scanId": "<scanId from the scan, optional>"
+}
+
+### Claims: exchange rate into SGD for a purchase date (ECB reference rate; weekends use the last business day)
+GET http://localhost:5000/api/v1/claims/fx-rate?currency=MYR&date=2026-10-04
+Authorization: Bearer <session.token>
+
+### Claims: manager decision (reason required to reject)
+PATCH http://localhost:5000/api/v1/claims/<claim_id>/manager-review
+Content-Type: application/json
+Authorization: Bearer <session.token>
+
+{
+  "action": "APPROVED"
+}
+
+### Claims: HR marks approved claims paid
+PATCH http://localhost:5000/api/v1/claims/mark-paid
+Content-Type: application/json
+Authorization: Bearer <session.token>
+
+{
+  "claimIds": ["<claim_id>"],
+  "paidDate": "2026-10-31",
+  "paidReference": "Oct payroll"
+}
+
+### Claims: this month's scan cost vs the cap (HR)
+GET http://localhost:5000/api/v1/claims/scan-usage
+Authorization: Bearer <session.token>

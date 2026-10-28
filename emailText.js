@@ -31,6 +31,15 @@ const TEXT = {
       button: 'Clock in now',
       footer: 'Already clocked in? You can ignore this.',
     },
+    weeklyReport: {
+      subject: 'Your weekly report is waiting',
+      heading: 'Your weekly report is due',
+      body: (which) => (which === 'monday'
+        ? "Hi, your weekly report for last week is still missing. It was due on Friday. Please add it this morning."
+        : "Hi, your weekly report for this week hasn't been submitted yet. It was due on Friday. It only takes a few minutes."),
+      button: 'Write my report',
+      footer: 'Already submitted? You can ignore this.',
+    },
     accountActive: {
       subject: 'Your Nextan Portal account is active',
       heading: 'Your Nextan Portal account is active',
@@ -59,6 +68,15 @@ const TEXT = {
       body: '您好，现在已过上午 8:30，您今天还没有打卡。请前往员工门户打卡。',
       button: '立即打卡',
       footer: '已经打卡了？请忽略此邮件。',
+    },
+    weeklyReport: {
+      subject: '您的周报还没有提交',
+      heading: '该提交周报了',
+      body: (which) => (which === 'monday'
+        ? '您好，您上周的周报还没有提交，截止时间是周五。请今天上午补交。'
+        : '您好，您本周的周报还没有提交，截止时间是周五。只需要几分钟。'),
+      button: '填写周报',
+      footer: '已经提交了？请忽略此邮件。',
     },
     accountActive: {
       subject: '您的 Nextan 门户账户已激活',
