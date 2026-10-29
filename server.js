@@ -249,6 +249,42 @@ function deployedProjectError(projectCode) {
 }
 
 // Standard date format used across all notification/inbox text (matches the "DD Mon YYYY" TO_CHAR format used elsewhere)
+// Hourly leave: 1 to 4 hours of one day, in half-hour steps, for Annual or Emergency leave (sick
+// leave stays full-day, as it goes with an MC). Balances count it as hours / LEAVE_DAY_HOURS days.
+const LEAVE_DAY_HOURS = 8;
+const LEAVE_HOURS_MIN = 1;
+const LEAVE_HOURS_MAX = 4;
+const HOURLY_LEAVE_CATEGORIES = ['ANNUAL', 'EMERGENCY'];
+// Days a leave counts for, in SQL: hours as a fraction of a day, otherwise every calendar day.
+const LEAVE_DAYS_SQL = `(CASE WHEN leave_hours IS NOT NULL THEN leave_hours / ${LEAVE_DAY_HOURS}.0 ELSE (end_date::date - start_date::date + 1) END)`;
+
+// Checks the hours on a leave request: null for a full-day request, or { hours } / { error }.
+function parseLeaveHours(hours, category, startDate, endDate) {
+  if (hours === undefined || hours === null || hours === '') return null;
+  const h = Number(hours);
+  if (!HOURLY_LEAVE_CATEGORIES.includes(String(category || '').toUpperCase())) {
+    return { error: 'Leave by the hour is only for annual or emergency leave.' };
+  }
+  if (!Number.isFinite(h) || h < LEAVE_HOURS_MIN || h > LEAVE_HOURS_MAX || Math.round(h * 2) !== h * 2) {
+    return { error: `Choose between ${LEAVE_HOURS_MIN} and ${LEAVE_HOURS_MAX} hours, in half hours.` };
+  }
+  if (startDate !== endDate) return { error: 'Leave by the hour is for a single day.' };
+  return { hours: h };
+}
+
+const formatLeaveHours = (h) => `${Number(h)} h`;
+
+// "on 12 Nov 2026 (2 h)" or "from 12 Nov 2026 to 14 Nov 2026", for notification text.
+function leavePeriodText(start, end, hours) {
+  if (hours !== null && hours !== undefined) return `on ${formatDateDMY(start)} (${formatLeaveHours(hours)})`;
+  return `from ${formatDateDMY(start)} to ${formatDateDMY(end)}`;
+}
+// "12 Nov 2026 • 2 h" or "12 Nov 2026 → 14 Nov 2026", for the short notification lines.
+function leaveRangeShort(start, end, hours) {
+  if (hours !== null && hours !== undefined) return `${formatDateDMY(start)} • ${formatLeaveHours(hours)}`;
+  return `${formatDateDMY(start)} → ${formatDateDMY(end)}`;
+}
+
 function formatDateDMY(dateLike) {
   if (!dateLike) return '';
   const d = dateLike instanceof Date ? dateLike : new Date(dateLike);
@@ -447,6 +483,8 @@ async function ensureOperationalTables() {
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reviewer_remarks TEXT;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS workflow_status TEXT NOT NULL DEFAULT 'PENDING';`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reason TEXT;`);
+  // Hourly leave: part of one day, in hours (start_date = end_date). Empty for full-day leave.
+  await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS leave_hours NUMERIC(3,1);`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;`);
   await db.query(`ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reviewed_by UUID REFERENCES users(user_id);`);
   // start_date/end_date were created as TIMESTAMPTZ instead of DATE. A leave request's dates
@@ -2102,7 +2140,8 @@ app.get('/api/v1/users/:userId/inbox', async (req, res) => {
              WHEN 'REJECTED' THEN 'Leave request rejected'
              ELSE CONCAT('Leave request ', la.workflow_status::TEXT)
            END AS title,
-           CONCAT(la.category::TEXT, ' leave \u2022 ', TO_CHAR(la.start_date, 'DD Mon YYYY'), ' \u2192 ', TO_CHAR(la.end_date, 'DD Mon YYYY'), ' \u2022 ', CASE la.workflow_status::TEXT WHEN 'PENDING' THEN 'Pending manager approval' WHEN 'APPROVED' THEN 'Approved' WHEN 'REJECTED' THEN 'Rejected' ELSE la.workflow_status::TEXT END) AS subtitle,
+           CONCAT(la.category::TEXT, ' leave \u2022 ', TO_CHAR(la.start_date, 'DD Mon YYYY'),
+             CASE WHEN la.leave_hours IS NOT NULL THEN CONCAT(' \u2022 ', RTRIM(TO_CHAR(la.leave_hours, 'FM90.9'), '.'), ' h') ELSE CONCAT(' \u2192 ', TO_CHAR(la.end_date, 'DD Mon YYYY')) END, ' \u2022 ', CASE la.workflow_status::TEXT WHEN 'PENDING' THEN 'Pending manager approval' WHEN 'APPROVED' THEN 'Approved' WHEN 'REJECTED' THEN 'Rejected' ELSE la.workflow_status::TEXT END) AS subtitle,
            la.workflow_status::TEXT AS status,
            la.created_at AS created_at,
            NULL::UUID AS notification_id
@@ -2139,7 +2178,7 @@ app.get('/api/v1/leave/my-requests/:userId', async (req, res) => {
 
   try {
     const result = await db.query(
-      `SELECT leave_id, category, start_date, end_date, workflow_status, reviewer_remarks, reason, mc_file_url, created_at
+      `SELECT leave_id, category, start_date, end_date, leave_hours, workflow_status, reviewer_remarks, reason, mc_file_url, created_at
        FROM leave_applications
        WHERE user_id = $1
        ORDER BY created_at DESC`,
@@ -3659,7 +3698,7 @@ app.get('/api/v1/manager/:supervisorId/leave-all', async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized.' });
     }
     const result = await db.query(
-      `SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date,
+      `SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date, la.leave_hours,
               la.workflow_status, la.reviewer_remarks, la.is_late_submission, la.updated_at, la.mc_file_url,
               r.full_name AS reviewer_name
        FROM leave_applications la
@@ -3687,7 +3726,7 @@ app.get('/api/v1/manager/:supervisorId/leave-pending', async (req, res) => {
     }
 
     const fetchPendingQuery = `
-      SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date, la.is_late_submission, la.workflow_status, la.mc_file_url
+      SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date, la.leave_hours, la.is_late_submission, la.workflow_status, la.mc_file_url
       FROM leave_applications la
       JOIN users u ON la.user_id = u.user_id
       WHERE u.supervisor_id = $1 AND la.workflow_status = 'PENDING'
@@ -3705,7 +3744,7 @@ app.get('/api/v1/manager/:supervisorId/leave-pending', async (req, res) => {
 // ROUTE: SUBMIT LEAVE REQUEST (Staff Interface Core Endpoint) 
 // ========================================================================
 app.post('/api/v1/leave/apply', async (req, res) => {
-  const { userId, category, startDate, endDate, mcFileUrl, reason } = req.body;
+  const { userId, category, startDate, endDate, mcFileUrl, reason, hours } = req.body;
 
   const validCategories = ['ANNUAL', 'EMERGENCY', 'SICK'];
   if (!validCategories.includes(category?.toUpperCase())) {
@@ -3724,6 +3763,9 @@ app.post('/api/v1/leave/apply', async (req, res) => {
   if (endDate < startDate) {
     return res.status(400).json({ error: 'The end date cannot be before the start date.' });
   }
+  const hourly = parseLeaveHours(hours, category, startDate, endDate);
+  if (hourly?.error) return res.status(400).json({ error: hourly.error });
+  const leaveHours = hourly ? hourly.hours : null;
 
   try {
     const applicant = await db.query('SELECT 1 FROM users WHERE user_id = $1', [userId]);
@@ -3749,21 +3791,21 @@ app.post('/api/v1/leave/apply', async (req, res) => {
 
     const leaveInsertQuery = `
       INSERT INTO leave_applications (
-        leave_id, user_id, category, start_date, end_date, mc_file_url, is_late_submission, workflow_status, reviewer_remarks, reason, created_at
-      ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'PENDING', NULL, $7, CURRENT_TIMESTAMP)
-      RETURNING leave_id, user_id, category, start_date, end_date, is_late_submission, workflow_status;
+        leave_id, user_id, category, start_date, end_date, mc_file_url, is_late_submission, workflow_status, reviewer_remarks, reason, leave_hours, created_at
+      ) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'PENDING', NULL, $7, $8, CURRENT_TIMESTAMP)
+      RETURNING leave_id, user_id, category, start_date, end_date, is_late_submission, workflow_status, leave_hours;
     `;
 
     const result = await db.query(leaveInsertQuery, [
       userId, category.toUpperCase(), startDate, endDate,
       category.toUpperCase() === 'SICK' ? mcFileUrl : null,
-      isLateSubmission, reason || null
+      isLateSubmission, reason || null, leaveHours
     ]);
 
     // Notify the requester
     try {
       const notifTitle = 'Leave Request Submitted';
-      const notifBody = `You have just submitted a ${category.toLowerCase()} leave request from ${formatDateDMY(startDate)} to ${formatDateDMY(endDate)}. It is pending manager review.`;
+      const notifBody = `You have just submitted a ${category.toLowerCase()} leave request ${leavePeriodText(startDate, endDate, leaveHours)}. It is pending manager review.`;
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, notifTitle, notifBody]);
       await sendPushToUser(userId, notifTitle, notifBody);
     } catch (_) {}
@@ -3855,7 +3897,7 @@ app.patch('/api/v1/leave/undo-review', async (req, res) => {
     await auditInterceptor('leave_applications', leaveId, reviewerId, before.rows[0], updated);
     try {
       const notifTitle = 'Leave Decision Withdrawn';
-      const notifBody = `${updated.category} • ${formatDateDMY(updated.start_date)} → ${formatDateDMY(updated.end_date)} • Back to pending manager review.`;
+      const notifBody = `${updated.category} • ${leaveRangeShort(updated.start_date, updated.end_date, updated.leave_hours)} • Back to pending manager review.`;
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updated.user_id, notifTitle, notifBody]);
       await sendPushToUser(updated.user_id, notifTitle, notifBody);
     } catch (_) {}
@@ -3924,11 +3966,12 @@ app.patch('/api/v1/leave/review', async (req, res) => {
         ? new Date(updatedLeave.end_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Singapore' })
         : '';
       const category = updatedLeave.category || 'ANNUAL';
+      const period = updatedLeave.leave_hours != null ? `${startStr} • ${formatLeaveHours(updatedLeave.leave_hours)}` : `${startStr} → ${endStr}`;
       const hasCustomRemark = reviewerRemarks && reviewerRemarks !== 'Processed via Manager Dashboard.';
       const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Application Approved' : 'Leave Application Rejected';
       const notifBody = action.toUpperCase() === 'APPROVED'
-        ? `${category} • ${startStr} → ${endStr} • Approved${hasCustomRemark ? '\nNote: ' + reviewerRemarks : ''}`
-        : `${category} • ${startStr} → ${endStr} • Rejected${hasCustomRemark ? '\nReason: ' + reviewerRemarks : ''}`;
+        ? `${category} • ${period} • Approved${hasCustomRemark ? '\nNote: ' + reviewerRemarks : ''}`
+        : `${category} • ${period} • Rejected${hasCustomRemark ? '\nReason: ' + reviewerRemarks : ''}`;
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [updatedLeave.user_id, notifTitle, notifBody]);
       await sendPushToUser(updatedLeave.user_id, notifTitle, notifBody);
     } catch (_) {}
@@ -3947,10 +3990,12 @@ app.patch('/api/v1/leave/review', async (req, res) => {
 // ========================================================================
 app.patch('/api/v1/leave/:leaveId', async (req, res) => {
   const { leaveId } = req.params;
-  const { userId, requesterId, category, startDate, endDate, reason, mcFileUrl } = req.body;
+  const { userId, requesterId, category, startDate, endDate, reason, mcFileUrl, hours } = req.body;
   if (!userId || !category || !startDate || !endDate) {
     return res.status(400).json({ error: 'userId, category, startDate, and endDate are required.' });
   }
+  const hourly = parseLeaveHours(hours, category, startDate, endDate);
+  if (hourly?.error) return res.status(400).json({ error: hourly.error });
   try {
     const check = await db.query(
       'SELECT * FROM leave_applications WHERE leave_id = $1 AND user_id = $2',
@@ -3982,9 +4027,9 @@ app.patch('/api/v1/leave/:leaveId', async (req, res) => {
     const updated = await db.query(
       `UPDATE leave_applications SET category = $1, start_date = $2, end_date = $3, reason = $4,
        mc_file_url = CASE WHEN $6::text = 'SICK' THEN COALESCE($7, mc_file_url) ELSE NULL END,
-       updated_at = CURRENT_TIMESTAMP WHERE leave_id = $5
+       leave_hours = $8, updated_at = CURRENT_TIMESTAMP WHERE leave_id = $5
        RETURNING *`,
-      [categoryUpper, startDate, endDate, reason || null, leaveId, categoryUpper, mcFileUrl || null]
+      [categoryUpper, startDate, endDate, reason || null, leaveId, categoryUpper, mcFileUrl || null, hourly ? hourly.hours : null]
     );
     await auditInterceptor('leave_applications', leaveId, actingId, check.rows[0], updated.rows[0]);
     return res.status(200).json({ success: true });
@@ -4048,7 +4093,7 @@ app.delete('/api/v1/leave/:leaveId', async (req, res) => {
 
     try {
       const cancelled = result.rows[0];
-      const message = `Your leave request from ${formatDateDMY(cancelled.start_date)} to ${formatDateDMY(cancelled.end_date)} has been deleted.`;
+      const message = `Your leave request ${leavePeriodText(cancelled.start_date, cancelled.end_date, cancelled.leave_hours)} has been deleted.`;
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, 'Leave Request Deleted', message]);
     } catch (_) {}
 
@@ -4067,7 +4112,7 @@ app.get('/api/v1/leave/balance/:userId', async (req, res) => {
     const { userId } = req.params;
     const [usageResult, entitlementResult] = await Promise.all([
       db.query(
-        `SELECT COALESCE(SUM(end_date::date - start_date::date + 1), 0) AS used_days
+        `SELECT COALESCE(SUM(${LEAVE_DAYS_SQL}), 0) AS used_days
          FROM leave_applications
          WHERE user_id = $1
            AND category::TEXT IN ('ANNUAL', 'EMERGENCY')
@@ -4076,9 +4121,10 @@ app.get('/api/v1/leave/balance/:userId', async (req, res) => {
       ),
       db.query('SELECT leave_entitlement_days FROM users WHERE user_id = $1', [userId]),
     ]);
-    const usedDays = parseInt(usageResult.rows[0]?.used_days || 0);
+    // Hourly leave makes this a fraction of a day (2 h = 0.25 days at 8 h a day).
+    const usedDays = Math.round(Number(usageResult.rows[0]?.used_days || 0) * 100) / 100;
     const totalDays = entitlementResult.rows[0]?.leave_entitlement_days ?? 12;
-    const remainingDays = Math.max(0, totalDays - usedDays);
+    const remainingDays = Math.max(0, Math.round((totalDays - usedDays) * 100) / 100);
     return res.status(200).json({ success: true, data: { totalDays, usedDays, remainingDays } });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to calculate leave balance.', detail: error.message });
@@ -5797,7 +5843,7 @@ app.get('/api/v1/hr/leave-balances', async (req, res) => {
   if (!await requireRoleCheck(requesterId, 'hr', res)) return;
   try {
     const result = await db.query(
-      `SELECT user_id, COALESCE(SUM(end_date::date - start_date::date + 1), 0)::int AS used_days
+      `SELECT user_id, ROUND(COALESCE(SUM(${LEAVE_DAYS_SQL}), 0), 2)::float AS used_days
        FROM leave_applications
        WHERE category::TEXT IN ('ANNUAL', 'EMERGENCY') AND workflow_status::TEXT = 'APPROVED'
        GROUP BY user_id`
@@ -5861,7 +5907,7 @@ app.get('/api/v1/calendar/leave', async (req, res) => {
       return res.status(403).json({ error: 'Access Denied.' });
     }
     const result = await db.query(
-      `SELECT la.leave_id, la.user_id, u.full_name, la.start_date, la.end_date
+      `SELECT la.leave_id, la.user_id, u.full_name, la.start_date, la.end_date, la.leave_hours
        FROM leave_applications la
        JOIN users u ON u.user_id = la.user_id
        WHERE la.workflow_status = 'APPROVED'
@@ -7146,7 +7192,7 @@ app.get('/api/v1/hr/leave-requests', async (req, res) => {
 
   try {
     const result = await db.query(
-      `SELECT la.leave_id, la.user_id, u.full_name, u.email, la.category, la.start_date, la.end_date,
+      `SELECT la.leave_id, la.user_id, u.full_name, u.email, la.category, la.start_date, la.end_date, la.leave_hours,
               la.reason, la.workflow_status, la.reviewer_remarks, la.is_late_submission, la.mc_file_url,
               la.created_at, la.updated_at, r.full_name AS reviewer_name
        FROM leave_applications la
