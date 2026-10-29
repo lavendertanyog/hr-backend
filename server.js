@@ -3840,7 +3840,7 @@ app.get('/api/v1/manager/:supervisorId/leave-all', async (req, res) => {
        FROM leave_applications la
        JOIN users u ON la.user_id = u.user_id
        LEFT JOIN users r ON r.user_id = la.reviewed_by
-       WHERE u.supervisor_id = $1
+       WHERE u.supervisor_id = $1 AND u.user_id <> $1
          AND la.workflow_status != 'PENDING'
        ORDER BY la.created_at DESC`,
       [supervisorId]
@@ -3865,7 +3865,7 @@ app.get('/api/v1/manager/:supervisorId/leave-pending', async (req, res) => {
       SELECT la.leave_id, la.user_id, u.full_name, la.category, la.start_date, la.end_date, la.leave_hours, la.is_late_submission, la.workflow_status, la.mc_file_url
       FROM leave_applications la
       JOIN users u ON la.user_id = u.user_id
-      WHERE u.supervisor_id = $1 AND la.workflow_status = 'PENDING'
+      WHERE u.supervisor_id = $1 AND u.user_id <> $1 AND la.workflow_status = 'PENDING'
       ORDER BY la.created_at ASC;
     `;
 
@@ -3945,6 +3945,20 @@ app.post('/api/v1/leave/apply', async (req, res) => {
       await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [userId, notifTitle, notifBody]);
       await sendPushToUser(userId, notifTitle, notifBody);
     } catch (_) {}
+    // No supervisor of their own: HR decides it, so tell every HR user (except the applicant).
+    try {
+      const who = (await db.query('SELECT full_name, supervisor_id FROM users WHERE user_id = $1', [userId])).rows[0];
+      if (who && (!who.supervisor_id || String(who.supervisor_id) === String(userId))) {
+        const hrUsers = await db.query(
+          `SELECT user_id FROM users WHERE account_status = 'active' AND (user_role = 'hr' OR 'hr' = ANY(user_roles)) AND user_id <> $1`,
+          [userId]
+        );
+        const body = `${who.full_name} has no supervisor, so their ${category.toLowerCase()} leave ${leavePeriodText(startDate, endDate, leaveHours)} needs your approval under Approvals > Leave Requests.`;
+        for (const hr of hrUsers.rows) {
+          await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [hr.user_id, 'Leave needs HR approval', body]);
+        }
+      }
+    } catch (_) {}
 
     res.status(201).json({ success: true, data: result.rows[0] });
   } catch (error) {
@@ -3960,6 +3974,35 @@ app.post('/api/v1/leave/apply', async (req, res) => {
 // Express matches routes in registration order, and ":leaveId" is a wildcard that would
 // otherwise swallow "review" and "re-review" as if they were literal leave IDs, making
 // these handlers permanently unreachable.
+// Who decides a leave request: the applicant's own supervisor (a manager's leave goes to their
+// supervisor, e.g. Justin -> Sean); HR when the applicant has none (no supervisor, or themselves
+// set as their own). Nobody decides their own leave, whatever roles they have.
+const SELF_LEAVE_ERROR = "You can't approve or change a decision on your own leave. It goes to your supervisor, or to HR if you don't have one.";
+async function leaveReviewAccess(leaveId, reviewerId) {
+  const r = await db.query(
+    `SELECT la.user_id, u.supervisor_id FROM leave_applications la JOIN users u ON u.user_id = la.user_id WHERE la.leave_id = $1`,
+    [leaveId]
+  );
+  const leave = r.rows[0];
+  if (!leave) return { status: 404, error: 'Leave request not found.' };
+  if (String(leave.user_id) === String(reviewerId)) return { status: 403, error: SELF_LEAVE_ERROR };
+  const reviewer = (await db.query('SELECT user_id, user_role, user_roles, is_admin FROM users WHERE user_id = $1', [reviewerId])).rows[0];
+  if (!reviewer) return { status: 404, error: 'Reviewer not found.' };
+  const hasSupervisor = Boolean(leave.supervisor_id) && String(leave.supervisor_id) !== String(leave.user_id);
+  const isHr = Boolean(reviewer.is_admin) || userHasRole(reviewer, 'hr');
+  if (hasSupervisor && String(leave.supervisor_id) === String(reviewerId)) return { reviewer, isHr, viaHr: false };
+  if (!hasSupervisor && isHr) return { reviewer, isHr, viaHr: true };
+  return {
+    status: 403,
+    error: hasSupervisor
+      ? "This leave request goes to the staff member's own supervisor."
+      : 'This staff member has no supervisor, so HR approves their leave.',
+    reviewer, isHr,
+  };
+}
+// SQL: the applicant (users u) has no supervisor of their own, so HR decides their leave.
+const NO_SUPERVISOR_SQL = '(u.supervisor_id IS NULL OR u.supervisor_id = u.user_id)';
+
 // PATCH /api/v1/leave/re-review - re-review an already-reviewed leave request
 app.patch('/api/v1/leave/re-review', async (req, res) => {
   const { leaveId, reviewerId, action, reviewerRemarks } = req.body;
@@ -3975,10 +4018,12 @@ app.patch('/api/v1/leave/re-review', async (req, res) => {
     // Only the applicant's own manager (or HR/admin) may change a past decision — previously any
     // non-staff user could override any team's leave from their History tab.
     const isHrReviewer = Boolean(reviewerProfile.rows[0].is_admin) || userHasRole(reviewerProfile.rows[0], 'hr');
+    const own = await db.query('SELECT 1 FROM leave_applications WHERE leave_id = $1 AND user_id = $2', [leaveId, reviewerId]);
+    if (own.rows.length > 0) return res.status(403).json({ error: SELF_LEAVE_ERROR });
     if (!isHrReviewer) {
       const ownership = await db.query(
         `SELECT 1 FROM leave_applications la JOIN users u ON u.user_id = la.user_id
-         WHERE la.leave_id = $1 AND u.supervisor_id = $2`,
+         WHERE la.leave_id = $1 AND u.supervisor_id = $2 AND u.user_id <> $2`,
         [leaveId, reviewerId]
       );
       if (ownership.rows.length === 0) {
@@ -4012,12 +4057,9 @@ app.patch('/api/v1/leave/undo-review', async (req, res) => {
   const { leaveId, reviewerId } = req.body;
   if (!leaveId || !reviewerId) return res.status(400).json({ error: 'leaveId and reviewerId are required.' });
   try {
-    const before = await db.query(
-      `SELECT la.* FROM leave_applications la JOIN users u ON u.user_id = la.user_id
-       WHERE la.leave_id = $1 AND u.supervisor_id = $2`,
-      [leaveId, reviewerId]
-    );
-    if (!before.rows[0]) return res.status(403).json({ error: 'This leave request does not belong to a member of your team.' });
+    const access = await leaveReviewAccess(leaveId, reviewerId);
+    if (access.error) return res.status(access.status).json({ error: access.error });
+    const before = await db.query('SELECT * FROM leave_applications WHERE leave_id = $1', [leaveId]);
     const result = await db.query(
       `UPDATE leave_applications
        SET workflow_status = 'PENDING', reviewer_remarks = NULL, reviewed_by = NULL, updated_at = CURRENT_TIMESTAMP
@@ -4054,25 +4096,12 @@ app.patch('/api/v1/leave/review', async (req, res) => {
   }
 
   try {
-    const reviewerProfile = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [reviewerId]);
-    if (reviewerProfile.rows.length === 0) {
-      return res.status(404).json({ error: 'Reviewer profile not found in system directory.' });
-    }
-
-    // Block staff from approving leave; HR staff may not approve direct leave either
-    if (!userIsManagerial(reviewerProfile.rows[0])) {
-      return res.status(403).json({ error: `Access Denied: Only manager-level users can process workflow leave decisions.` });
-    }
-
-    // Verify the leave belongs to a staff member in this manager's team
-    const ownershipCheck = await db.query(
-      `SELECT la.leave_id FROM leave_applications la
-       JOIN users u ON la.user_id = u.user_id
-       WHERE la.leave_id = $1 AND u.supervisor_id = $2`,
-      [leaveId, reviewerId]
-    );
-    if (ownershipCheck.rows.length === 0) {
-      return res.status(403).json({ error: 'This leave request does not belong to a member of your team. Use the Approvals page to manage it, or first add this staff member to your team via My Team on the Dashboard.' });
+    // The applicant's supervisor decides (and must be manager-level); HR decides when the applicant
+    // has no supervisor. Nobody decides their own leave.
+    const access = await leaveReviewAccess(leaveId, reviewerId);
+    if (access.error) return res.status(access.status).json({ error: access.error });
+    if (!access.viaHr && !userIsManagerial(access.reviewer)) {
+      return res.status(403).json({ error: 'Access Denied: Only manager-level users can process workflow leave decisions.' });
     }
 
     const beforeLeave = await db.query('SELECT * FROM leave_applications WHERE leave_id = $1', [leaveId]);
@@ -4084,7 +4113,7 @@ app.patch('/api/v1/leave/review', async (req, res) => {
       RETURNING *;
     `;
 
-    const result = await db.query(reviewQuery, [action.toUpperCase(), reviewerRemarks || 'Processed via Manager Dashboard.', reviewerId, leaveId]);
+    const result = await db.query(reviewQuery, [action.toUpperCase(), reviewerRemarks || (access.viaHr ? 'Processed by HR.' : 'Processed via Manager Dashboard.'), reviewerId, leaveId]);
     const updatedLeave = result.rows[0];
 
     if (!updatedLeave) {
@@ -4103,7 +4132,7 @@ app.patch('/api/v1/leave/review', async (req, res) => {
         : '';
       const category = updatedLeave.category || 'ANNUAL';
       const period = updatedLeave.leave_hours != null ? `${startStr} • ${formatLeaveHours(updatedLeave.leave_hours)}` : `${startStr} → ${endStr}`;
-      const hasCustomRemark = reviewerRemarks && reviewerRemarks !== 'Processed via Manager Dashboard.';
+      const hasCustomRemark = reviewerRemarks && reviewerRemarks !== 'Processed via Manager Dashboard.' && reviewerRemarks !== 'Processed by HR.';
       const notifTitle = action.toUpperCase() === 'APPROVED' ? 'Leave Application Approved' : 'Leave Application Rejected';
       const notifBody = action.toUpperCase() === 'APPROVED'
         ? `${category} • ${period} • Approved${hasCustomRemark ? '\nNote: ' + reviewerRemarks : ''}`
@@ -6702,6 +6731,9 @@ app.patch('/api/v1/users/set-supervisor', async (req, res) => {
   if (!managerId || !Array.isArray(staffIds) || staffIds.length === 0) {
     return res.status(400).json({ error: 'managerId and staffIds (array) are required.' });
   }
+  if (staffIds.map(String).includes(String(managerId))) {
+    return res.status(400).json({ error: "Someone can't be their own supervisor; their leave would have no one else to approve it." });
+  }
   try {
     const managerCheck = await db.query('SELECT user_role, user_roles FROM users WHERE user_id = $1', [managerId]);
     if (managerCheck.rows.length === 0) {
@@ -7329,6 +7361,7 @@ app.get('/api/v1/hr/leave-requests', async (req, res) => {
   try {
     const result = await db.query(
       `SELECT la.leave_id, la.user_id, u.full_name, u.email, la.category, la.start_date, la.end_date, la.leave_hours,
+              ${NO_SUPERVISOR_SQL} AS needs_hr_approval,
               la.reason, la.workflow_status, la.reviewer_remarks, la.is_late_submission, la.mc_file_url,
               la.created_at, la.updated_at, r.full_name AS reviewer_name
        FROM leave_applications la
