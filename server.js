@@ -868,6 +868,53 @@ async function applyDailyProgressBaselineForManagerTeam(managerId) {
   }
 }
 
+// ── Sign-up from any email address ──
+// Anyone can sign up with any email. A Nextan email (@nextan.com.sg) is active once verified; any
+// other email (e.g. Gmail) then waits for HR approval (account_status 'pending', approved under
+// HR Approvals > Pending Accounts), since sign-up lets people pick their own roles. HR hears about
+// every sign-up: an Inbox notification to each HR user and an email to HR_NOTIFY_EMAIL.
+const COMPANY_EMAIL_DOMAIN = '@nextan.com.sg';
+const HR_NOTIFY_EMAIL = process.env.HR_NOTIFY_EMAIL || 'hr.admin@nextan.com.sg';
+const HR_PORTAL_URL = process.env.HR_PORTAL_URL || 'https://hr.nextantech.com';
+const SIGNUP_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const isCompanyEmail = (email) => String(email || '').toLowerCase().endsWith(COMPANY_EMAIL_DOMAIN);
+const escapeHtml = (v) => String(v ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+
+// Tells HR about an account: `stage` is 'signed_up' (just created) or 'awaiting_approval' (a
+// non-Nextan email has been verified and needs approving). Never blocks the sign-up itself.
+async function notifyHrOfSignup({ email, roles, stage }) {
+  const roleText = (roles || []).map((r) => String(r).replace('_', ' ')).join(', ') || 'staff';
+  const company = isCompanyEmail(email);
+  const title = stage === 'awaiting_approval' ? 'Account waiting for approval' : 'New sign-up';
+  const body = stage === 'awaiting_approval'
+    ? `${email} (${roleText}) has verified their email and is waiting for approval. Approve or reject it under Approvals > Pending Accounts.`
+    : company
+      ? `${email} signed up as ${roleText}. It becomes active once they verify their email.`
+      : `${email} signed up as ${roleText} with a non-Nextan email. Once they verify it, the account waits for your approval under Approvals > Pending Accounts.`;
+  try {
+    const hrUsers = await db.query(
+      `SELECT user_id FROM users WHERE account_status = 'active' AND (user_role = 'hr' OR 'hr' = ANY(user_roles))`
+    );
+    for (const hr of hrUsers.rows) {
+      await db.query('INSERT INTO notifications (user_id, title, body) VALUES ($1, $2, $3)', [hr.user_id, title, body]);
+    }
+  } catch (err) {
+    console.error('[signup] HR notification failed:', err.message);
+  }
+  try {
+    const html = brandedEmailHtml({
+      linkOrigin: HR_PORTAL_URL,
+      heading: title,
+      bodyHtml: escapeHtml(body),
+      buttonText: 'Open HR portal',
+      buttonUrl: `${HR_PORTAL_URL}/admin`,
+    });
+    await sendEmail(HR_NOTIFY_EMAIL, `${title}: ${email}`, html, 'hr-signup-notice');
+  } catch (err) {
+    console.error('[signup] HR email failed:', err.message);
+  }
+}
+
 // ========================================================================
 // ROUTE: EMAIL/PASSWORD SIGNUP
 // ========================================================================
@@ -875,10 +922,8 @@ app.post('/api/v1/auth/signup', async (req, res) => {
   const { email, password, portalUrl } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
   const normalized = email.trim().toLowerCase();
-  // Temporary allowance for testing the SES email flow end-to-end — remove once done.
-  const SIGNUP_DOMAIN_EXCEPTIONS = ['unicorntanyongnie@gmail.com', 'unicorntanyongnie+verifytest@gmail.com'];
-  if (!normalized.endsWith('@nextan.com.sg') && !SIGNUP_DOMAIN_EXCEPTIONS.includes(normalized)) {
-    return res.status(403).json({ error: 'Please enter a valid email address.' });
+  if (!SIGNUP_EMAIL_RE.test(normalized) || normalized.length > 254) {
+    return res.status(400).json({ error: 'Please enter a valid email address.' });
   }
   try {
     const columns = await getUsersTableColumns();
@@ -946,11 +991,16 @@ app.post('/api/v1/auth/signup', async (req, res) => {
     } catch (emailError) {
       console.error('[signup] verification email failed for', normalized, emailError);
     }
+    await notifyHrOfSignup({ email: normalized, roles: allRoles, stage: 'signed_up' });
 
+    const needsApproval = !isCompanyEmail(normalized);
     return res.status(201).json({
       success: true,
       unverified: true,
-      message: 'Account created. Check your email for a link to verify your account before signing in.',
+      needsApproval,
+      message: needsApproval
+        ? 'Account created. Check your email for a link to verify it. As this isn\'t a Nextan email, HR will then approve your account before you can sign in.'
+        : 'Account created. Check your email for a link to verify your account before signing in.',
       data: result.rows[0],
     });
   } catch (error) {
@@ -976,8 +1026,24 @@ app.post('/api/v1/auth/verify-email', async (req, res) => {
       return res.status(400).json({ error: 'This verification link is invalid or has expired. Request a new one.' });
     }
 
-    await db.query(`UPDATE users SET account_status = 'active' WHERE user_id = $1 AND account_status = 'unverified'`, [row.user_id]);
+    const account = (await db.query('SELECT email, user_role, user_roles, account_status FROM users WHERE user_id = $1', [row.user_id])).rows[0];
+    const needsApproval = account && !isCompanyEmail(account.email);
+    const updated = await db.query(
+      `UPDATE users SET account_status = $2 WHERE user_id = $1 AND account_status = 'unverified' RETURNING user_id`,
+      [row.user_id, needsApproval ? 'pending' : 'active']
+    );
     await db.query('UPDATE email_verification_tokens SET used_at = CURRENT_TIMESTAMP WHERE token_id = $1', [row.token_id]);
+    if (needsApproval) {
+      if (updated.rows.length > 0) {
+        const roles = Array.isArray(account.user_roles) && account.user_roles.length ? account.user_roles : [account.user_role];
+        await notifyHrOfSignup({ email: account.email, roles, stage: 'awaiting_approval' });
+      }
+      return res.status(200).json({
+        success: true,
+        pendingApproval: true,
+        message: 'Email verified. HR will now approve your account, and you\'ll get an email when you can sign in.',
+      });
+    }
     return res.status(200).json({ success: true, message: 'Email verified. You can now log in.' });
   } catch (error) {
     console.error('[verify-email] failed', error);
@@ -6122,8 +6188,8 @@ app.patch('/api/v1/hr/users/:userId', async (req, res) => {
   if (!fullName || !fullName.trim()) return res.status(400).json({ error: 'Full name is required.' });
   if (!email || !email.trim()) return res.status(400).json({ error: 'Email is required.' });
   const normalizedEmail = email.trim().toLowerCase();
-  if (!normalizedEmail.endsWith('@nextan.com.sg')) {
-    return res.status(400).json({ error: 'Only @nextan.com.sg emails are allowed.' });
+  if (!SIGNUP_EMAIL_RE.test(normalizedEmail)) {
+    return res.status(400).json({ error: 'Please enter a valid email address.' });
   }
   const country = homeOfficeCountry === undefined ? null : String(homeOfficeCountry).toUpperCase();
   if (country !== null && !OFFICE_TIME_ZONES[country]) {
