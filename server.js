@@ -792,6 +792,18 @@ async function ensureOperationalTables() {
     );
   `);
   await db.query(`CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions (user_id);`);
+  // One-time codes for "Switch portal": a signed-in user gets one for another portal they have the
+  // role for, and that portal's login page trades it for its own session. Only the hash is kept.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS portal_handoffs (
+      code_hash TEXT PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+      portal TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used_at TIMESTAMPTZ
+    );
+  `);
 }
 
 const STANDARD_WORKDAY_HOURS = 8;
@@ -1407,6 +1419,64 @@ app.post('/api/v1/auth/resume', async (req, res) => {
     return res.status(200).json({ success: true, data: sessionUserPayload(session), session: next });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to resume sign-in.', detail: error.message });
+  }
+});
+
+// ── Switch portal ──
+// The four portals are separate sites, so a session can't be shared. A signed-in user asks for a
+// one-time code for another portal they have the role for (the Staff portal is open to every
+// role, as its login page is); the code works once, for that portal only, within a minute.
+const PORTAL_HANDOFF_SECONDS = 60;
+
+function canUsePortal(user, portal) {
+  if (portal === 'staff') return ['staff', 'manager', 'account_manager', 'hr'].some((r) => userHasRole(user, r));
+  return userHasRole(user, portal);
+}
+
+app.post('/api/v1/auth/handoff', async (req, res) => {
+  const session = await requireSession(req, res);
+  if (!session) return;
+  const portal = String(req.body.portal || '');
+  if (!SESSION_PORTALS.includes(portal)) return res.status(400).json({ error: 'Choose a portal to switch to.' });
+  if (!canUsePortal(session, portal)) return res.status(403).json({ error: "Your account doesn't have access to that portal." });
+  try {
+    const code = randomBytes(32).toString('base64url');
+    await db.query(
+      `INSERT INTO portal_handoffs (code_hash, user_id, portal, expires_at)
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP + make_interval(secs => $4))`,
+      [hashSessionToken(code), session.user_id, portal, PORTAL_HANDOFF_SECONDS]
+    );
+    await db.query('DELETE FROM portal_handoffs WHERE expires_at < CURRENT_TIMESTAMP - INTERVAL \'1 day\'');
+    return res.status(200).json({ success: true, code, expiresInSeconds: PORTAL_HANDOFF_SECONDS });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to switch portal.', detail: error.message });
+  }
+});
+
+// The target portal's login page trades the code for a session there (same response as login).
+app.post('/api/v1/auth/handoff/exchange', async (req, res) => {
+  const { code, portal } = req.body;
+  if (!code || !SESSION_PORTALS.includes(String(portal || ''))) return res.status(400).json({ error: 'code and portal are required.' });
+  const expired = () => res.status(401).json({ error: 'That link has expired. Please sign in.' });
+  try {
+    // Marking it used in the same statement means a code can only ever be spent once.
+    const used = await db.query(
+      `UPDATE portal_handoffs SET used_at = CURRENT_TIMESTAMP
+       WHERE code_hash = $1 AND portal = $2 AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+       RETURNING user_id`,
+      [hashSessionToken(code), portal]
+    );
+    if (used.rows.length === 0) return expired();
+    const userRes = await db.query(
+      'SELECT user_id, full_name, user_role, user_roles, email, password_hash, account_status, is_admin, tours_completed, home_office_country FROM users WHERE user_id = $1',
+      [used.rows[0].user_id]
+    );
+    const user = userRes.rows[0];
+    if (!user || String(user.account_status || 'active').toLowerCase() !== 'active' || !canUsePortal(user, portal)) return expired();
+    const session = await createAuthSession(user, { trusted: false, portal, deviceLabel: deviceLabelFrom(req) });
+    return res.status(200).json({ success: true, data: sessionUserPayload(user), session });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to switch portal.', detail: error.message });
   }
 });
 
