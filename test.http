@@ -165,3 +165,14 @@ Authorization: Bearer <session.token>
 ### Claims: this month's scan cost vs the cap (HR)
 GET http://localhost:5000/api/v1/claims/scan-usage
 Authorization: Bearer <session.token>
+
+### HR: set a user's office country (SG, MY, CN or LK) — sets the time zone their attendance uses
+PATCH http://localhost:5000/api/v1/hr/users/<user_id>
+Content-Type: application/json
+
+{
+  "requesterId": "<hr_user_id>",
+  "fullName": "Test Staff",
+  "email": "test.staff@nextan.com.sg",
+  "homeOfficeCountry": "LK"
+}
